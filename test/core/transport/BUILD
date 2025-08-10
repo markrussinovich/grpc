@@ -121,6 +121,32 @@ grpc_cc_benchmark(
     ],
 )
 
+grpc_cc_benchmark(
+    name = "bm_shmem",
+    srcs = ["benchmarks/bm_shmem.cc"],
+    monitoring = HISTORY,
+    deps = [
+        "//:grpc",
+        "//src/core:default_event_engine",
+        "//src/core:grpc_transport_shmem",
+        "//test/core/call:call_spine_benchmarks",
+    ],
+)
+
+grpc_cc_test(
+    name = "shmem_fixture_test",
+    srcs = ["test_suite/shmem_fixture.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        "//:grpc",
+        "//src/core:grpc_transport_shmem",
+        "//test/core/test_util:grpc_test_util",
+        "//test/core/test_util:grpc_test_util_base",
+    ],
+)
+
 grpc_cc_test(
     name = "auth_context_test",
     srcs = ["auth_context_test.cc"],
@@ -135,5 +161,27 @@ grpc_cc_test(
         "//:grpc",
         "//test/core/test_util:grpc_test_util",
         "//test/core/test_util:grpc_test_util_base",
+    ],
+)
+
+grpc_cc_test(
+    name = "shmem_memory_test",
+    srcs = ["shmem_memory_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        "//src/core:grpc_transport_shmem",
+    ],
+)
+
+grpc_cc_test(
+    name = "shmem_segment_test",
+    srcs = ["shmem_segment_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        "//src/core:grpc_transport_shmem",
     ],
 )
