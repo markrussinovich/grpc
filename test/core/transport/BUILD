@@ -185,3 +185,14 @@ grpc_cc_test(
         "//src/core:grpc_transport_shmem",
     ],
 )
+
+grpc_cc_test(
+    name = "shmem_queue_test",
+    srcs = ["shmem_queue_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        "//src/core:grpc_transport_shmem",
+    ],
+)

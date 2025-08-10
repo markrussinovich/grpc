@@ -23,8 +23,8 @@ TEST(ShmemMemoryTest, ControlBlockDefaults) {
   EXPECT_EQ(cb.transport_version, 1u);
   EXPECT_EQ(cb.server_state.load(), 0u);
   EXPECT_EQ(cb.client_state.load(), 0u);
-  EXPECT_EQ(cb.c2s_queue_offset, 0u);
-  EXPECT_EQ(cb.s2c_queue_offset, 0u);
+  EXPECT_EQ(cb.c2s_queue.get(), nullptr);
+  EXPECT_EQ(cb.s2c_queue.get(), nullptr);
 }
 
 TEST(ShmemMemoryTest, RingBufferPointersAdvance) {

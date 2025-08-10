@@ -8572,12 +8572,14 @@ grpc_cc_library(
     srcs = [
         "ext/transport/shmem/shmem_transport.cc",
     "ext/transport/shmem/shmem_segment.cc",
+    "ext/transport/shmem/shmem_queue.cc",
     ],
     hdrs = [
         "ext/transport/shmem/shmem_transport.h",
         "ext/transport/shmem/shmem_memory.h",
         "ext/transport/shmem/shmem_protocol.h",
     "ext/transport/shmem/shmem_segment.h",
+    "ext/transport/shmem/shmem_queue.h",
     ],
     external_deps = [
         "absl/status",
