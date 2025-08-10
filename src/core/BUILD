@@ -8567,6 +8567,49 @@ grpc_cc_library(
     ],
 )
 
+grpc_cc_library(
+    name = "grpc_transport_shmem",
+    srcs = [
+        "ext/transport/shmem/shmem_transport.cc",
+    "ext/transport/shmem/shmem_segment.cc",
+    ],
+    hdrs = [
+        "ext/transport/shmem/shmem_transport.h",
+        "ext/transport/shmem/shmem_memory.h",
+        "ext/transport/shmem/shmem_protocol.h",
+    "ext/transport/shmem/shmem_segment.h",
+    ],
+    external_deps = [
+        "absl/status",
+    ],
+    deps = [
+        "channel_args",
+        "connectivity_state",
+        "closure",
+        "error",
+        "iomgr_fwd",
+        "slice",
+        "slice_buffer",
+        "status_helper",
+        "time",
+        "//:channel",
+        "//:channel_arg_names",
+        "//:channel_create",
+        "//:channelz",
+        "//:config",
+        "//:debug_location",
+        "//:exec_ctx",
+        "//:gpr",
+        "//:grpc_base",
+        "//:grpc_public_hdrs",
+        "//:grpc_trace",
+        "//:iomgr",
+        "//:promise",
+        "//:ref_counted_ptr",
+        "//:server",
+    ],
+)
+
 grpc_internal_proto_library(
     name = "chaotic_good_frame_proto",
     srcs = ["ext/transport/chaotic_good/chaotic_good_frame.proto"],

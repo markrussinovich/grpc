@@ -2344,6 +2344,10 @@ add_library(grpc
   src/core/ext/transport/chttp2/transport/writing.cc
   src/core/ext/transport/inproc/inproc_transport.cc
   src/core/ext/transport/inproc/legacy_inproc_transport.cc
+  src/core/ext/transport/shmem/shmem_transport.cc
+  src/core/ext/transport/shmem/shmem_segment.cc
+# TODO(shmem): add proper find_package(Boost COMPONENTS interprocess) and
+# target_link_libraries once the transport wires into a dedicated target.
   src/core/ext/upb-gen/envoy/admin/v3/certs.upb_minitable.c
   src/core/ext/upb-gen/envoy/admin/v3/clusters.upb_minitable.c
   src/core/ext/upb-gen/envoy/admin/v3/config_dump.upb_minitable.c
