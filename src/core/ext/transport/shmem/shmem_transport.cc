@@ -526,6 +526,26 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                       });
                 };
                 (*schedule_pump)(pump_handler);
+
+                 // Observe client-side cancellation and emit a C2S_CANCEL frame
+                 // to notify the server. This covers explicit API cancel and
+                 // deadline-triggered cancellation.
+                 child_call_handler.SpawnInfallible(
+                     "emit-cancel",
+                     [h = child_call_handler, writer_ctrl, stream_id]() mutable {
+                       return Map(h.WasCancelled(), [writer_ctrl, stream_id](bool cancelled) {
+                         if (cancelled && writer_ctrl != nullptr) {
+                           grpc_shmem::FrameHeader c{};
+                           c.stream_id = stream_id;
+                           c.flags = grpc_shmem::FrameFlags::NONE;
+                           c.reserved = 0;
+                           c.type = grpc_shmem::FrameType::C2S_CANCEL;
+                           c.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+                           grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, c, nullptr, 0);
+                         }
+                         return Empty{};
+                       });
+                     });
                }
                // For the shared-memory unary prototype path, don't forward the
                // call via inproc. We'll rely on server->client frames.

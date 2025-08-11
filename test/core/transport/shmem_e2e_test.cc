@@ -442,6 +442,84 @@ TEST(ShmemE2E, UnaryCancelViaPayloadThenCancelled) {
   server.reset();
 }
 
+TEST(ShmemE2E, UnaryCancelViaApiThenCancelled) {
+  ExecCtx exec_ctx;
+
+  ChannelArgs args = CoreConfiguration::Get()
+                         .channel_args_preconditioning()
+                         .PreconditionChannelArgs(nullptr);
+
+  auto pair = MakeShmemTransportPair(args);
+  auto client = std::move(pair.first);
+  auto server = std::move(pair.second);
+
+  class ServerCallDestination : public UnstartedCallDestination {
+   public:
+    void StartCall(UnstartedCallHandler handler) override { (void)handler.StartCall(); }
+    void Orphaned() override {}
+  } dest;
+  server->server_transport()->SetCallDestination(MakeRefCounted<ServerCallDestination>());
+
+  auto rq = MakeResourceQuota("shmem-e2e");
+  auto allocator = rq->memory_quota()->CreateMemoryAllocator("shmem-e2e-alloc");
+  auto call_arena_allocator = MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+  auto arena = call_arena_allocator->MakeArena();
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+
+  auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+  md->Set(HttpPathMetadata(), Slice::FromExternalString("/api_cancel"));
+  auto call = MakeCallPair(std::move(md), std::move(arena));
+
+  call.handler.SpawnInfallible(
+      "start-call", [c = client.get(), h = call.handler]() mutable {
+        c->client_transport()->StartCall(h.StartCall());
+        return Empty{};
+      });
+
+  // Await initial metadata first to ensure the server-side is active.
+  Notification got_imd;
+  call.initiator.SpawnInfallible("await-imd", [i = call.initiator, &got_imd]() mutable {
+    return Seq(i.PullServerInitialMetadata(), [&got_imd](auto) {
+      got_imd.Notify();
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 20000 && !got_imd.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_imd.HasBeenNotified());
+
+  // Trigger API-driven cancellation on the initiator without directly pushing
+  // trailing metadata (so it goes through the transport path).
+  call.initiator.SpawnInfallible("cancel", [i = call.initiator]() mutable {
+    i.SpawnCancel();
+    return Empty{};
+  });
+
+  // Expect trailing CANCELLED delivered from server via shmem.
+  std::optional<ServerMetadataHandle> trailing;
+  Notification got_tr;
+  call.initiator.SpawnInfallible("await-trailing", [i = call.initiator, &trailing, &got_tr]() mutable {
+    return Seq(i.PullServerTrailingMetadata(), [&trailing, &got_tr](ServerMetadataHandle md) {
+      trailing = std::move(md);
+      got_tr.Notify();
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 20000 && !got_tr.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_tr.HasBeenNotified());
+  ASSERT_TRUE(trailing.has_value());
+  EXPECT_EQ(*trailing.value()->get_pointer(GrpcStatusMetadata()), GRPC_STATUS_CANCELLED);
+
+  client.reset();
+  server.reset();
+}
+
 }  // namespace grpc_core
 
 int main(int argc, char** argv) {
