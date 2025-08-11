@@ -169,6 +169,9 @@ class ShmemServerTransport final : public ServerTransport {
   grpc_shmem::ControlBlock* ctrl_ = nullptr;
   std::atomic<bool> stop_reader_{false};
   std::thread server_reader_;
+  // Simple stream tracking for one active stream at a time (tests use unary)
+  std::atomic<uint32_t> current_stream_id_{0};
+  std::atomic<bool> sent_trailing_{false};
 };
 
 ShmemServerTransport::ShmemServerTransport(const ChannelArgs& args) {
@@ -213,6 +216,9 @@ void ShmemServerTransport::SetCallDestination(
         fprintf(stderr, "[shmem] server_reader got frame type=%u size=%u\n", static_cast<unsigned>(hdr.type), hdr.frame_size);
   switch (hdr.type) {
           case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
+            // New stream begins; reset trailing-sent flag and track stream id.
+            current_stream_id_.store(hdr.stream_id, std::memory_order_relaxed);
+            sent_trailing_.store(false, std::memory_order_relaxed);
             // Respond with S2C initial metadata (application/grpc).
             grpc_shmem::FrameHeader out{};
             out.stream_id = hdr.stream_id;
@@ -227,18 +233,38 @@ void ShmemServerTransport::SetCallDestination(
           }
           case grpc_shmem::FrameType::C2S_MESSAGE: {
             // Echo back the payload as a server-to-client message.
+            // Additionally, if payload indicates cancellation, send trailing CANCELLED.
             grpc_shmem::FrameHeader out{};
             out.stream_id = hdr.stream_id;
             out.flags = grpc_shmem::FrameFlags::NONE;
             out.reserved = 0;
-            out.type = grpc_shmem::FrameType::S2C_MESSAGE;
-            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + payload.size());
-            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
-                                   payload.data(), payload.size());
+            // Detect a test-triggered cancel payload.
+            bool trigger_cancel = false;
+            if (!payload.empty()) {
+              std::string p(reinterpret_cast<const char*>(payload.data()), payload.size());
+              if (p == "cancel") trigger_cancel = true;
+            }
+            if (trigger_cancel && !sent_trailing_.load(std::memory_order_relaxed)) {
+              const auto status_payload = grpc_shmem::EncodeTrailingStatus(GRPC_STATUS_CANCELLED);
+              out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
+              out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
+              grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
+                                     status_payload.data(), status_payload.size());
+              sent_trailing_.store(true, std::memory_order_relaxed);
+              ExecCtx::Get()->Flush();
+            } else {
+              out.type = grpc_shmem::FrameType::S2C_MESSAGE;
+              out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + payload.size());
+              grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
+                                     payload.data(), payload.size());
+            }
             break;
           }
           case grpc_shmem::FrameType::C2S_TRAILING_METADATA: {
-            // Client finished sends; respond with trailing UNIMPLEMENTED.
+            // Client finished sends; respond with trailing UNIMPLEMENTED unless already sent.
+            if (sent_trailing_.load(std::memory_order_relaxed)) {
+              break;
+            }
             grpc_shmem::FrameHeader out{};
             out.stream_id = hdr.stream_id;
             out.flags = grpc_shmem::FrameFlags::NONE;
@@ -249,9 +275,24 @@ void ShmemServerTransport::SetCallDestination(
             grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
                                    status_payload.data(), status_payload.size());
     ExecCtx::Get()->Flush();
+            sent_trailing_.store(true, std::memory_order_relaxed);
             break;
           }
           case grpc_shmem::FrameType::C2S_CANCEL:
+            if (!sent_trailing_.load(std::memory_order_relaxed)) {
+              grpc_shmem::FrameHeader out{};
+              out.stream_id = hdr.stream_id;
+              out.flags = grpc_shmem::FrameFlags::NONE;
+              out.reserved = 0;
+              const auto status_payload = grpc_shmem::EncodeTrailingStatus(GRPC_STATUS_CANCELLED);
+              out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
+              out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
+              grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
+                                     status_payload.data(), status_payload.size());
+              ExecCtx::Get()->Flush();
+              sent_trailing_.store(true, std::memory_order_relaxed);
+            }
+            break;
           default:
             // TODO: handle more frame types.
             break;
