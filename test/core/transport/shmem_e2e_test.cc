@@ -237,6 +237,129 @@ TEST(ShmemE2E, UnaryEchoMessageThenUnimplemented) {
   server.reset();
 }
 
+TEST(ShmemE2E, UnaryEchoTwoMessagesThenUnimplemented) {
+  ExecCtx exec_ctx;
+
+  ChannelArgs args = CoreConfiguration::Get()
+                         .channel_args_preconditioning()
+                         .PreconditionChannelArgs(nullptr);
+
+  auto pair = MakeShmemTransportPair(args);
+  auto client = std::move(pair.first);
+  auto server = std::move(pair.second);
+
+  class ServerCallDestination : public UnstartedCallDestination {
+   public:
+    void StartCall(UnstartedCallHandler handler) override { (void)handler.StartCall(); }
+    void Orphaned() override {}
+  } dest;
+  server->server_transport()->SetCallDestination(MakeRefCounted<ServerCallDestination>());
+
+  auto rq = MakeResourceQuota("shmem-e2e");
+  auto allocator = rq->memory_quota()->CreateMemoryAllocator("shmem-e2e-alloc");
+  auto call_arena_allocator = MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+  auto arena = call_arena_allocator->MakeArena();
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+
+  auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+  md->Set(HttpPathMetadata(), Slice::FromExternalString("/echo2"));
+  auto call = MakeCallPair(std::move(md), std::move(arena));
+
+  call.handler.SpawnInfallible(
+      "start-call", [c = client.get(), h = call.handler]() mutable {
+        c->client_transport()->StartCall(h.StartCall());
+        return Empty{};
+      });
+
+  // Send two messages, then finish sends
+  const char* p1 = "one";
+  const char* p2 = "two";
+  call.initiator.SpawnInfallible("send-two", [i = call.initiator, p1, p2]() mutable {
+    return Seq(i.PushMessage(Arena::MakePooled<Message>(
+                   SliceBuffer(Slice::FromCopiedString(p1)), 0)),
+               [i, p2](StatusFlag) mutable {
+                 return Seq(i.PushMessage(Arena::MakePooled<Message>(
+                                SliceBuffer(Slice::FromCopiedString(p2)), 0)),
+                            [i](StatusFlag) mutable {
+                              i.FinishSends();
+                              return Empty{};
+                            });
+               });
+  });
+
+  // Wait for initial md
+  Notification got_imd;
+  call.initiator.SpawnInfallible("await-imd", [i = call.initiator, &got_imd]() mutable {
+    return Seq(i.PullServerInitialMetadata(), [&got_imd](auto) {
+      got_imd.Notify();
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 20000 && !got_imd.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_imd.HasBeenNotified());
+
+  // Expect two echoed messages in order
+  std::vector<std::string> echoed;
+  Notification got_msg1, got_msg2;
+  call.initiator.SpawnInfallible("await-msg1", [i = call.initiator, &echoed, &got_msg1]() mutable {
+    return Seq(i.PullMessage(), [&echoed, &got_msg1](ServerToClientNextMessage m) {
+      if (m.ok() && m.has_value()) {
+        echoed.push_back(m.value().payload()->JoinIntoString());
+        got_msg1.Notify();
+      }
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 20000 && !got_msg1.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_msg1.HasBeenNotified());
+
+  call.initiator.SpawnInfallible("await-msg2", [i = call.initiator, &echoed, &got_msg2]() mutable {
+    return Seq(i.PullMessage(), [&echoed, &got_msg2](ServerToClientNextMessage m) {
+      if (m.ok() && m.has_value()) {
+        echoed.push_back(m.value().payload()->JoinIntoString());
+        got_msg2.Notify();
+      }
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 20000 && !got_msg2.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_msg2.HasBeenNotified());
+  ASSERT_EQ(echoed.size(), 2u);
+  EXPECT_EQ(echoed[0], "one");
+  EXPECT_EQ(echoed[1], "two");
+
+  // Trailing UNIMPLEMENTED
+  std::optional<ServerMetadataHandle> trailing;
+  Notification got_tr;
+  call.initiator.SpawnInfallible("await-trailing", [i = call.initiator, &trailing, &got_tr]() mutable {
+    return Seq(i.PullServerTrailingMetadata(), [&trailing, &got_tr](ServerMetadataHandle md) {
+      trailing = std::move(md);
+      got_tr.Notify();
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 20000 && !got_tr.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_tr.HasBeenNotified());
+  ASSERT_TRUE(trailing.has_value());
+  EXPECT_EQ(*trailing.value()->get_pointer(GrpcStatusMetadata()), GRPC_STATUS_UNIMPLEMENTED);
+
+  client.reset();
+  server.reset();
+}
+
 }  // namespace grpc_core
 
 int main(int argc, char** argv) {
