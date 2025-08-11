@@ -152,6 +152,30 @@ grpc_cc_test(
     ],
 )
 
+# Standalone gtest E2E for shmem transport without fuzztest/yodel deps.
+grpc_cc_test(
+    name = "shmem_e2e_test",
+    srcs = [
+        "shmem_e2e_test.cc",
+    ],
+    external_deps = [
+        "gtest",
+        "absl/strings",
+    ],
+    deps = [
+    "//:gpr",
+    "//:grpc",
+        "//src/core:grpc_transport_shmem",
+    "//src/core:default_event_engine",
+        "//src/core:resource_quota",
+        "//src/core:channel_args",
+        "//src/core:metadata",
+        "//src/core:call_spine",
+    "//src/core:call_arena_allocator",
+        "//src/core:promise_factory",
+    ],
+)
+
 grpc_cc_test(
     name = "shmem_segment_test",
     srcs = ["shmem_segment_test.cc"],

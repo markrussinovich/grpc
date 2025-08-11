@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <memory>
+#include <thread>
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -25,6 +26,7 @@
 #include "src/core/lib/event_engine/event_engine_context.h"
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/promise/try_seq.h"
+#include "src/core/lib/iomgr/exec_ctx.h"
 #include "src/core/lib/resource_quota/resource_quota.h"
 #include "src/core/lib/surface/channel_create.h"
 #include "src/core/lib/transport/transport.h"
@@ -34,6 +36,7 @@
 
 // Prepare shared memory backing for the transport pair (datapath WIP).
 #include "src/core/ext/transport/shmem/shmem_segment.h"
+#include "src/core/ext/transport/shmem/shmem_framer.h"
 #include <unistd.h>
 
 namespace grpc_core {
@@ -68,7 +71,9 @@ class ShmemClientTransport final : public ClientTransport {
   ~ShmemClientTransport() override;
 
   const RefCountedPtr<ShmemServerTransport> server_transport_;
-    grpc_shmem::ControlBlock* ctrl_ = nullptr;  // not yet used
+  grpc_shmem::ControlBlock* ctrl_ = nullptr;  // shared memory control block
+  std::atomic<bool> stop_reader_{false};
+  std::thread client_reader_;
 };
 
 class ShmemServerTransport final : public ServerTransport {
@@ -150,22 +155,28 @@ class ShmemServerTransport final : public ServerTransport {
   Mutex connected_state_mu_;
   RefCountedPtr<ConnectedState> connected_state_
       ABSL_GUARDED_BY(connected_state_mu_) = MakeRefCounted<ConnectedState>();
-  const std::shared_ptr<grpc_event_engine::experimental::EventEngine>
-      event_engine_;
-  const RefCountedPtr<CallArenaAllocator> call_arena_allocator_;
+  std::shared_ptr<grpc_event_engine::experimental::EventEngine> event_engine_;
+  // If no ResourceQuota was provided in ChannelArgs, keep a fallback alive.
+  RefCountedPtr<ResourceQuota> fallback_rq_;
+  RefCountedPtr<CallArenaAllocator> call_arena_allocator_;
   // Shared memory state (datapath under construction)
   std::unique_ptr<grpc_shmem::ShmemSegment> segment_;
   grpc_shmem::ControlBlock* ctrl_ = nullptr;
+  std::atomic<bool> stop_reader_{false};
+  std::thread server_reader_;
 };
 
-ShmemServerTransport::ShmemServerTransport(const ChannelArgs& args)
-    : event_engine_(
-          args.GetObjectRef<grpc_event_engine::experimental::EventEngine>()),
-      call_arena_allocator_(MakeRefCounted<CallArenaAllocator>(
-          args.GetObject<ResourceQuota>()
-              ->memory_quota()
-              ->CreateMemoryAllocator("shmem_server"),
-          1024)) {}
+ShmemServerTransport::ShmemServerTransport(const ChannelArgs& args) {
+  event_engine_ = args.GetObjectRef<grpc_event_engine::experimental::EventEngine>();
+  // Use provided ResourceQuota if available; otherwise create one and retain it.
+  ResourceQuota* rq = args.GetObject<ResourceQuota>();
+  if (rq == nullptr) {
+    fallback_rq_ = MakeResourceQuota("shmem_server_fallback");
+    rq = fallback_rq_.get();
+  }
+  call_arena_allocator_ = MakeRefCounted<CallArenaAllocator>(
+      rq->memory_quota()->CreateMemoryAllocator("shmem_server"), 1024);
+}
 
 void ShmemServerTransport::SetCallDestination(
     RefCountedPtr<UnstartedCallDestination> unstarted_call_handler) {
@@ -175,11 +186,76 @@ void ShmemServerTransport::SetCallDestination(
                                  std::memory_order_acq_rel,
                                  std::memory_order_acquire);
   connected_state()->SetReady();
+  // Start a background reader that consumes client->server frames and
+  // (for now) responds with minimal initial+trailing metadata frames to
+  // exercise the unary path over shared memory.
+  if (ctrl_ != nullptr && !server_reader_.joinable()) {
+    stop_reader_.store(false, std::memory_order_relaxed);
+    server_reader_ = std::thread([this] {
+  ExecCtx exec_ctx;
+      fprintf(stderr, "[shmem] server_reader start\n");
+      while (!stop_reader_.load(std::memory_order_relaxed)) {
+        grpc_shmem::FrameHeader hdr;
+        // Blocking read; will wait until a frame is available.
+        std::vector<uint8_t> payload;
+        try {
+          payload = grpc_shmem::ReadFrame(ctrl_, grpc_shmem::QueueKind::kC2S, &hdr);
+        } catch (...) {
+          // If any exception occurs (shouldn't in our C++ setup), break loop.
+          fprintf(stderr, "[shmem] server_reader exception, exiting\n");
+          break;
+        }
+        fprintf(stderr, "[shmem] server_reader got frame type=%u size=%u\n", static_cast<unsigned>(hdr.type), hdr.frame_size);
+        switch (hdr.type) {
+          case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
+            // Respond with S2C initial metadata (application/grpc) and then
+            // immediately send trailing metadata UNIMPLEMENTED to complete
+            // a minimal unary path.
+            grpc_shmem::FrameHeader out{};
+            out.stream_id = hdr.stream_id;
+            out.flags = grpc_shmem::FrameFlags::NONE;
+            out.reserved = 0;
+            // Initial metadata (no payload; client assumes application/grpc)
+            out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
+            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out, nullptr, 0);
+            // Trailing metadata with UNIMPLEMENTED status code
+            const auto status_payload = grpc_shmem::EncodeTrailingStatus(GRPC_STATUS_UNIMPLEMENTED);
+            out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
+            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
+            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
+                                   status_payload.data(), status_payload.size());
+    ExecCtx::Get()->Flush();
+            fprintf(stderr, "[shmem] server_reader responded initial+trailing\n");
+            break;
+          }
+          case grpc_shmem::FrameType::C2S_MESSAGE:
+          case grpc_shmem::FrameType::C2S_TRAILING_METADATA:
+          case grpc_shmem::FrameType::C2S_CANCEL:
+          default:
+            // TODO: handle more frame types.
+            break;
+        }
+      }
+    });
+  }
 }
 
 void ShmemServerTransport::Orphan() {
   LOG(INFO) << "ShmemServerTransport::Orphan(): " << this;
   Disconnect(absl::UnavailableError("Server transport closed"));
+  stop_reader_.store(true, std::memory_order_relaxed);
+  // Wake the server reader if it's blocked on C2S by writing a dummy frame.
+  if (ctrl_ != nullptr) {
+    grpc_shmem::FrameHeader wake{};
+    wake.stream_id = 0;
+    wake.flags = grpc_shmem::FrameFlags::NONE;
+    wake.reserved = 0;
+    wake.type = grpc_shmem::FrameType::C2S_MESSAGE;
+    wake.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+    grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kC2S, wake, nullptr, 0);
+  }
+  if (server_reader_.joinable()) server_reader_.join();
   Unref();
 }
 
@@ -233,27 +309,108 @@ OrphanablePtr<ShmemClientTransport> ShmemServerTransport::MakeClientTransport() 
 }
 
 ShmemClientTransport::~ShmemClientTransport() {
+  stop_reader_.store(true, std::memory_order_relaxed);
+  // Wake the client reader if it's blocked on S2C by writing a dummy frame.
+  if (ctrl_ != nullptr) {
+    grpc_shmem::FrameHeader wake{};
+    wake.stream_id = 0;
+    wake.flags = grpc_shmem::FrameFlags::NONE;
+    wake.reserved = 0;
+    wake.type = grpc_shmem::FrameType::S2C_MESSAGE;
+    wake.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+    grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, wake, nullptr, 0);
+  }
+  if (client_reader_.joinable()) client_reader_.join();
   server_transport_->Disconnect(
       absl::UnavailableError("Client transport closed"));
 }
 
 void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
+  auto self_ref = RefAsSubclass<ShmemClientTransport>();
   child_call_handler.SpawnGuarded(
       "pull_initial_metadata",
       TrySeq(child_call_handler.PullClientInitialMetadata(),
              [server_transport = server_transport_,
+              ctrl = ctrl_,
+              self = std::move(self_ref),
               connected_state = server_transport_->connected_state(),
               child_call_handler](ClientMetadataHandle md) mutable {
-               auto server_call_initiator =
-                   server_transport->AcceptCall(std::move(md));
-               if (!server_call_initiator.ok()) {
-                 return server_call_initiator.status();
+               // Unary path (step 1): emit initial metadata to shared memory
+               // without altering behavior. We'll evolve to consume these
+               // frames on the server side in a later step.
+               if (ctrl != nullptr) {
+                 // Extract HTTP path if present and encode payload.
+                 std::string path;
+                 if (auto* p = md->get_pointer(HttpPathMetadata()); p) {
+                   path = std::string(p->as_string_view());
+                 }
+                 const auto payload = grpc_shmem::EncodeInitialMdPath(path);
+                 grpc_shmem::FrameHeader hdr{};
+                 hdr.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + payload.size());
+                 hdr.stream_id = 1;  // TODO: assign real stream ids
+                 hdr.type = grpc_shmem::FrameType::C2S_INITIAL_METADATA;
+                 hdr.flags = grpc_shmem::FrameFlags::NONE;
+                 hdr.reserved = 0;
+                 grpc_shmem::WriteFrame(ctrl, grpc_shmem::QueueKind::kC2S, hdr,
+                                        payload.data(), payload.size());
+                 // Start a background reader to receive server->client frames
+                 // and deliver them into the call handler.
+                 auto reader_ctrl = ctrl;
+                 self->stop_reader_.store(false, std::memory_order_relaxed);
+                 self->client_reader_ = std::thread([self, reader_ctrl, handler = std::move(child_call_handler)]() mutable {
+       ExecCtx exec_ctx;
+                   fprintf(stderr, "[shmem] client_reader start\n");
+                   while (!self->stop_reader_.load(std::memory_order_relaxed)) {
+                     grpc_shmem::FrameHeader rh;
+                     std::vector<uint8_t> bytes;
+                     try {
+                       bytes = grpc_shmem::ReadFrame(reader_ctrl, grpc_shmem::QueueKind::kS2C, &rh);
+                     } catch (...) {
+                       fprintf(stderr, "[shmem] client_reader exception, exiting\n");
+                       break;
+                     }
+                     fprintf(stderr, "[shmem] client_reader got frame type=%u size=%u\n", static_cast<unsigned>(rh.type), rh.frame_size);
+                     switch (rh.type) {
+                       case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
+                         auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
+                         md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+                         handler.SpawnPushServerInitialMetadata(std::move(md));
+         ExecCtx::Get()->Flush();
+                         fprintf(stderr, "[shmem] client_reader pushed initial md\n");
+                         break;
+                       }
+                       case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
+                         auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
+                         uint32_t code = grpc_shmem::DecodeTrailingStatus(bytes);
+                         md->Set(GrpcStatusMetadata(), static_cast<grpc_status_code>(code));
+                         handler.SpawnPushServerTrailingMetadata(std::move(md));
+         ExecCtx::Get()->Flush();
+                         fprintf(stderr, "[shmem] client_reader pushed trailing md\n");
+                         break;
+                       }
+                       case grpc_shmem::FrameType::S2C_MESSAGE:
+                       default:
+                         // TODO: handle messages in future steps.
+                         break;
+                     }
+                   }
+                 });
                }
-               ForwardCall(
-                   child_call_handler, std::move(*server_call_initiator),
-                   [connected_state = std::move(connected_state)](
-                       ServerMetadata& md) { md.Set(GrpcStatusFromWire(), true);
-                   });
+               // For the shared-memory unary prototype path, don't forward the
+               // call via inproc. We'll rely on server->client frames.
+               if (ctrl == nullptr) {
+                 // Fallback to inproc bridging if shared memory not enabled.
+                 auto server_call_initiator =
+                     server_transport->AcceptCall(std::move(md));
+                 if (!server_call_initiator.ok()) {
+                   return server_call_initiator.status();
+                 }
+                 ForwardCall(
+                     child_call_handler, std::move(*server_call_initiator),
+                     [connected_state = std::move(connected_state)](
+                         ServerMetadata& md) { md.Set(GrpcStatusFromWire(), true);
+                     });
+               }
                return absl::OkStatus();
              }));
 }

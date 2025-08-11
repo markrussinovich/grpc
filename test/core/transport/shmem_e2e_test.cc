@@ -1,0 +1,145 @@
+// Copyright 2025 gRPC authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//     http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+#include <gtest/gtest.h>
+ #include <thread>
+ #include <chrono>
+
+#include "absl/strings/string_view.h"
+#include "src/core/call/call_arena_allocator.h"
+#include "src/core/call/call_spine.h"
+#include "src/core/config/core_configuration.h"
+#include "src/core/ext/transport/shmem/shmem_transport.h"
+#include "include/grpc/event_engine/event_engine.h"
+#include "src/core/lib/resource_quota/memory_quota.h"
+#include "src/core/lib/resource_quota/resource_quota.h"
+#include "src/core/lib/transport/transport.h"
+#include "src/core/lib/promise/seq.h"
+#include "src/core/util/notification.h"
+
+namespace grpc_core {
+
+// Minimal E2E test that uses the shmem transport directly without the yodel
+// test suite (to avoid pulling in fuzztest).
+TEST(ShmemE2E, MetadataOnlyUnaryReturnsUnimplemented) {
+  ExecCtx exec_ctx;
+
+  // Build channel args with a ResourceQuota and EventEngine.
+  ChannelArgs args = CoreConfiguration::Get()
+                         .channel_args_preconditioning()
+                         .PreconditionChannelArgs(nullptr);
+
+  // Create a transport pair.
+  auto pair = MakeShmemTransportPair(args);
+  auto client = std::move(pair.first);
+  auto server = std::move(pair.second);
+
+  // Set a simple server call destination to satisfy the server transport.
+  class ServerCallDestination : public UnstartedCallDestination {
+   public:
+    void StartCall(UnstartedCallHandler handler) override {
+      // For this minimal E2E, we don't need to process the server-side call.
+      // Just start it so the pipeline is consistent.
+      (void)handler.StartCall();
+    }
+    void Orphaned() override {}
+
+   private:
+  } dest;
+
+  server->server_transport()->SetCallDestination(MakeRefCounted<ServerCallDestination>());
+
+  // Create a call with a path.
+  auto rq = MakeResourceQuota("shmem-e2e");
+  auto allocator = rq->memory_quota()->CreateMemoryAllocator("shmem-e2e-alloc");
+  auto call_arena_allocator = MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+  auto arena = call_arena_allocator->MakeArena();
+  // Set the EventEngine context on the arena explicitly.
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+
+  auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+  md->Set(HttpPathMetadata(), Slice::FromExternalString("/foo/bar"));
+
+  auto call = MakeCallPair(std::move(md), std::move(arena));
+
+  // Start the client call on the transport.
+  call.handler.SpawnInfallible(
+      "start-call", [c = client.get(), h = call.handler]() mutable {
+        c->client_transport()->StartCall(h.StartCall());
+        return Empty{};
+      });
+  // Indicate no payloads will be sent (half-close) to help completion.
+  call.initiator.SpawnFinishSends();
+
+  // Client waits for initial metadata and then trailing metadata.
+  // Await server initial metadata inside the party and notify this thread.
+  std::optional<ServerMetadataHandle> got_initial;
+  Notification initial_ready;
+  call.initiator.SpawnInfallible(
+      "await-initial",
+      [i = call.initiator, &got_initial, &initial_ready]() mutable {
+  fprintf(stderr, "[shmem] await-initial spawned on party\n");
+  return Seq(i.PullServerInitialMetadata(),
+       [&got_initial, &initial_ready](
+           std::optional<ServerMetadataHandle> md) {
+         fprintf(stderr, "[shmem] await-initial got md: %s\n",
+           md.has_value() ? "yes" : "no");
+         got_initial = std::move(md);
+         initial_ready.Notify();
+         return Empty{};
+       });
+      });
+  for (int i = 0; i < 20000 && !initial_ready.HasBeenNotified(); ++i) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_initial.has_value());
+  ASSERT_NE(got_initial.value(), nullptr);
+  EXPECT_EQ(*got_initial.value()->get_pointer(ContentTypeMetadata()),
+            ContentTypeMetadata::kApplicationGrpc);
+
+  // Await server trailing metadata inside the party and notify this thread.
+  std::optional<ServerMetadataHandle> got_trailing;
+  Notification trailing_ready;
+  call.initiator.SpawnInfallible(
+      "await-trailing",
+      [i = call.initiator, &got_trailing, &trailing_ready]() mutable {
+        fprintf(stderr, "[shmem] await-trailing spawned on party\n");
+        return Seq(i.PullServerTrailingMetadata(),
+                   [&got_trailing, &trailing_ready](
+                       ServerMetadataHandle md) {
+                     fprintf(stderr, "[shmem] await-trailing got md\n");
+                     got_trailing = std::move(md);
+                     trailing_ready.Notify();
+                     return Empty{};
+                   });
+      });
+  for (int i = 0; i < 20000 && !trailing_ready.HasBeenNotified(); ++i) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_trailing.has_value());
+  EXPECT_EQ(*got_trailing.value()->get_pointer(GrpcStatusMetadata()),
+            GRPC_STATUS_UNIMPLEMENTED);
+
+  // Explicitly destroy transports to help shutdown reader threads quickly.
+  client.reset();
+  server.reset();
+}
+
+}  // namespace grpc_core
+
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  grpc_init();
+  int r = RUN_ALL_TESTS();
+  grpc_shutdown();
+  return r;
+}
