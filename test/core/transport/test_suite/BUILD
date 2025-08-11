@@ -172,6 +172,21 @@ grpc_cc_library(
 )
 
 grpc_fuzz_test(
+    name = "shmem_test",
+    external_deps = [
+        "fuzztest",
+        "fuzztest_main",
+    ],
+    deps = [
+        ":call_content",
+        ":call_shapes",
+        ":shmem_fixture",
+        ":no_op",
+        ":stress",
+    ],
+)
+
+grpc_fuzz_test(
     name = "inproc_test",
     external_deps = [
         "fuzztest",

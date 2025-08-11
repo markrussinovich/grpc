@@ -17,8 +17,20 @@
 #include <atomic>
 #include <memory>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "src/core/call/metadata.h"
+#include "src/core/config/core_configuration.h"
+#include "src/core/lib/event_engine/event_engine_context.h"
+#include "src/core/lib/promise/promise.h"
+#include "src/core/lib/promise/try_seq.h"
+#include "src/core/lib/resource_quota/resource_quota.h"
+#include "src/core/lib/surface/channel_create.h"
 #include "src/core/lib/transport/transport.h"
+#include "src/core/server/server.h"
+#include "src/core/util/crash.h"
+#include "src/core/util/debug_location.h"
 
 namespace grpc_core {
 namespace {
@@ -27,11 +39,11 @@ class ShmemServerTransport;
 
 class ShmemClientTransport final : public ClientTransport {
  public:
-  explicit ShmemClientTransport() {}
+  explicit ShmemClientTransport(
+      RefCountedPtr<ShmemServerTransport> server_transport)
+      : server_transport_(std::move(server_transport)) {}
 
-  void StartCall(CallHandler /*child_call_handler*/) override {
-    // TODO(shmem): implement
-  }
+  void StartCall(CallHandler child_call_handler) override;
   void Orphan() override { Unref(); }
   FilterStackTransport* filter_stack_transport() override { return nullptr; }
   ClientTransport* client_transport() override { return this; }
@@ -42,21 +54,22 @@ class ShmemClientTransport final : public ClientTransport {
   }
   void SetPollset(grpc_stream*, grpc_pollset*) override {}
   void SetPollsetSet(grpc_stream*, grpc_pollset_set*) override {}
-  void PerformOp(grpc_transport_op*) override {}
+  void PerformOp(grpc_transport_op*) override { Crash("unimplemented"); }
 
  private:
-  ~ShmemClientTransport() override = default;
+  ~ShmemClientTransport() override;
+
+  const RefCountedPtr<ShmemServerTransport> server_transport_;
 };
 
 class ShmemServerTransport final : public ServerTransport {
  public:
-  explicit ShmemServerTransport(const ChannelArgs& /*args*/) {}
+  explicit ShmemServerTransport(const ChannelArgs& args);
 
   void SetCallDestination(
-      RefCountedPtr<UnstartedCallDestination> /*unstarted_call_handler*/)
-      override {}
+      RefCountedPtr<UnstartedCallDestination> unstarted_call_handler) override;
 
-  void Orphan() override { Unref(); }
+  void Orphan() override;
   FilterStackTransport* filter_stack_transport() override { return nullptr; }
   ClientTransport* client_transport() override { return nullptr; }
   ServerTransport* server_transport() override { return this; }
@@ -66,13 +79,165 @@ class ShmemServerTransport final : public ServerTransport {
   }
   void SetPollset(grpc_stream*, grpc_pollset*) override {}
   void SetPollsetSet(grpc_stream*, grpc_pollset_set*) override {}
-  void PerformOp(grpc_transport_op* op) override {
-    ExecCtx::Run(DEBUG_LOCATION, op->on_consumed, absl::OkStatus());
+  void PerformOp(grpc_transport_op* op) override;
+
+  // Accept a new call initiated by the client side.
+  absl::StatusOr<CallInitiator> AcceptCall(ClientMetadataHandle md);
+
+  class ConnectedState : public RefCounted<ConnectedState> {
+   public:
+    ~ConnectedState() override {
+      state_tracker_.SetState(GRPC_CHANNEL_SHUTDOWN, disconnect_error_,
+                              "shmem transport disconnected");
+    }
+
+    void SetReady() {
+      MutexLock lock(&state_tracker_mu_);
+      state_tracker_.SetState(GRPC_CHANNEL_READY, absl::OkStatus(),
+                              "accept function set");
+    }
+
+    void Disconnect(absl::Status error) { disconnect_error_ = std::move(error); }
+
+    void AddWatcher(grpc_connectivity_state initial_state,
+                    OrphanablePtr<ConnectivityStateWatcherInterface> watcher) {
+      MutexLock lock(&state_tracker_mu_);
+      state_tracker_.AddWatcher(initial_state, std::move(watcher));
+    }
+
+    void RemoveWatcher(ConnectivityStateWatcherInterface* watcher) {
+      MutexLock lock(&state_tracker_mu_);
+      state_tracker_.RemoveWatcher(watcher);
+    }
+
+   private:
+    absl::Status disconnect_error_;
+    Mutex state_tracker_mu_;
+    ConnectivityStateTracker state_tracker_ ABSL_GUARDED_BY(state_tracker_mu_){
+        "shmem_server_transport", GRPC_CHANNEL_CONNECTING};
+  };
+
+  RefCountedPtr<ConnectedState> connected_state() {
+    MutexLock lock(&connected_state_mu_);
+    return connected_state_;
   }
 
+  OrphanablePtr<ShmemClientTransport> MakeClientTransport();
+
+  void Disconnect(absl::Status error);
+
  private:
-  ~ShmemServerTransport() override = default;
+  enum class ConnectionState : uint8_t { kInitial, kReady, kDisconnected };
+
+  std::atomic<ConnectionState> state_{ConnectionState::kInitial};
+  RefCountedPtr<UnstartedCallDestination> unstarted_call_handler_;
+  Mutex connected_state_mu_;
+  RefCountedPtr<ConnectedState> connected_state_
+      ABSL_GUARDED_BY(connected_state_mu_) = MakeRefCounted<ConnectedState>();
+  const std::shared_ptr<grpc_event_engine::experimental::EventEngine>
+      event_engine_;
+  const RefCountedPtr<CallArenaAllocator> call_arena_allocator_;
 };
+
+ShmemServerTransport::ShmemServerTransport(const ChannelArgs& args)
+    : event_engine_(
+          args.GetObjectRef<grpc_event_engine::experimental::EventEngine>()),
+      call_arena_allocator_(MakeRefCounted<CallArenaAllocator>(
+          args.GetObject<ResourceQuota>()
+              ->memory_quota()
+              ->CreateMemoryAllocator("shmem_server"),
+          1024)) {}
+
+void ShmemServerTransport::SetCallDestination(
+    RefCountedPtr<UnstartedCallDestination> unstarted_call_handler) {
+  unstarted_call_handler_ = std::move(unstarted_call_handler);
+  ConnectionState expect = ConnectionState::kInitial;
+  state_.compare_exchange_strong(expect, ConnectionState::kReady,
+                                 std::memory_order_acq_rel,
+                                 std::memory_order_acquire);
+  connected_state()->SetReady();
+}
+
+void ShmemServerTransport::Orphan() {
+  LOG(INFO) << "ShmemServerTransport::Orphan(): " << this;
+  Disconnect(absl::UnavailableError("Server transport closed"));
+  Unref();
+}
+
+void ShmemServerTransport::PerformOp(grpc_transport_op* op) {
+  if (op->start_connectivity_watch != nullptr) {
+    connected_state()->AddWatcher(op->start_connectivity_watch_state,
+                                  std::move(op->start_connectivity_watch));
+  }
+  if (op->stop_connectivity_watch != nullptr) {
+    connected_state()->RemoveWatcher(op->stop_connectivity_watch);
+  }
+  if (op->set_accept_stream) {
+    Crash("set_accept_stream not supported on shmem transport");
+  }
+  ExecCtx::Run(DEBUG_LOCATION, op->on_consumed, absl::OkStatus());
+}
+
+void ShmemServerTransport::Disconnect(absl::Status error) {
+  RefCountedPtr<ConnectedState> cs;
+  {
+    MutexLock lock(&connected_state_mu_);
+    cs = std::move(connected_state_);
+  }
+  if (cs == nullptr) return;
+  cs->Disconnect(std::move(error));
+  state_.store(ConnectionState::kDisconnected, std::memory_order_relaxed);
+}
+
+absl::StatusOr<CallInitiator> ShmemServerTransport::AcceptCall(
+    ClientMetadataHandle md) {
+  switch (state_.load(std::memory_order_acquire)) {
+    case ConnectionState::kInitial:
+      return absl::InternalError(
+          "shmem transport hasn't started accepting calls");
+    case ConnectionState::kDisconnected:
+      return absl::UnavailableError("shmem transport is disconnected");
+    case ConnectionState::kReady:
+      break;
+  }
+  auto arena = call_arena_allocator_->MakeArena();
+  arena->SetContext<grpc_event_engine::experimental::EventEngine>(
+      event_engine_.get());
+  auto server_call = MakeCallPair(std::move(md), std::move(arena));
+  unstarted_call_handler_->StartCall(std::move(server_call.handler));
+  return std::move(server_call.initiator);
+}
+
+OrphanablePtr<ShmemClientTransport> ShmemServerTransport::MakeClientTransport() {
+  return MakeOrphanable<ShmemClientTransport>(
+      RefAsSubclass<ShmemServerTransport>());
+}
+
+ShmemClientTransport::~ShmemClientTransport() {
+  server_transport_->Disconnect(
+      absl::UnavailableError("Client transport closed"));
+}
+
+void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
+  child_call_handler.SpawnGuarded(
+      "pull_initial_metadata",
+      TrySeq(child_call_handler.PullClientInitialMetadata(),
+             [server_transport = server_transport_,
+              connected_state = server_transport_->connected_state(),
+              child_call_handler](ClientMetadataHandle md) mutable {
+               auto server_call_initiator =
+                   server_transport->AcceptCall(std::move(md));
+               if (!server_call_initiator.ok()) {
+                 return server_call_initiator.status();
+               }
+               ForwardCall(
+                   child_call_handler, std::move(*server_call_initiator),
+                   [connected_state = std::move(connected_state)](
+                       ServerMetadata& md) { md.Set(GrpcStatusFromWire(), true);
+                   });
+               return absl::OkStatus();
+             }));
+}
 
 }  // namespace
 
