@@ -7113,7 +7113,9 @@ grpc_cc_library(
         "absl/log:check",
         "absl/types:span",
     ],
-    deps = ["//:gpr"],
+    deps = [
+        "//:gpr",
+    ],
 )
 
 grpc_cc_library(
@@ -8549,53 +8551,6 @@ grpc_cc_library(
         "status_helper",
         "time",
         "try_seq",
-        "//:channel",
-        "//:channel_arg_names",
-        "//:channel_create",
-        "//:channelz",
-        "//:config",
-        "//:debug_location",
-        "//:exec_ctx",
-        "//:gpr",
-        "//:grpc_base",
-        "//:grpc_public_hdrs",
-        "//:grpc_trace",
-        "//:iomgr",
-        "//:promise",
-        "//:ref_counted_ptr",
-        "//:server",
-    ],
-)
-
-grpc_cc_library(
-    name = "grpc_transport_shmem",
-    srcs = [
-        "ext/transport/shmem/shmem_transport.cc",
-    "ext/transport/shmem/shmem_segment.cc",
-    "ext/transport/shmem/shmem_queue.cc",
-    "ext/transport/shmem/shmem_framer.cc",
-    ],
-    hdrs = [
-        "ext/transport/shmem/shmem_transport.h",
-        "ext/transport/shmem/shmem_memory.h",
-        "ext/transport/shmem/shmem_protocol.h",
-    "ext/transport/shmem/shmem_segment.h",
-    "ext/transport/shmem/shmem_queue.h",
-    "ext/transport/shmem/shmem_framer.h",
-    ],
-    external_deps = [
-        "absl/status",
-    ],
-    deps = [
-        "channel_args",
-        "connectivity_state",
-        "closure",
-        "error",
-        "iomgr_fwd",
-        "slice",
-        "slice_buffer",
-        "status_helper",
-        "time",
         "//:channel",
         "//:channel_arg_names",
         "//:channel_create",

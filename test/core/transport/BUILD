@@ -146,9 +146,9 @@ grpc_cc_test(
         "gtest",
     ],
     deps = [
-    "//src/core:grpc_transport_shmem",
-    "//test/core/test_util:grpc_test_util",
-    "//test/core/test_util:grpc_test_util_base",
+        "//:grpc_transport_shmem",
+        "//test/core/test_util:grpc_test_util",
+        "//test/core/test_util:grpc_test_util_base",
     ],
 )
 
@@ -163,15 +163,15 @@ grpc_cc_test(
         "absl/strings",
     ],
     deps = [
-    "//:gpr",
-    "//:grpc",
-        "//src/core:grpc_transport_shmem",
-    "//src/core:default_event_engine",
+        "//:gpr",
+        "//:grpc",
+        "//:grpc_transport_shmem",
+        "//src/core:default_event_engine",
         "//src/core:resource_quota",
         "//src/core:channel_args",
         "//src/core:metadata",
         "//src/core:call_spine",
-    "//src/core:call_arena_allocator",
+        "//src/core:call_arena_allocator",
         "//src/core:promise_factory",
     ],
 )
@@ -187,7 +187,7 @@ grpc_cc_test(
     deps = [
         "//:gpr",
         "//:grpc",
-        "//src/core:grpc_transport_shmem",
+        "//:grpc_transport_shmem",
         "//src/core:default_event_engine",
         "//src/core:resource_quota",
         "//src/core:channel_args",
@@ -205,9 +205,9 @@ grpc_cc_test(
         "gtest",
     ],
     deps = [
-    "//src/core:grpc_transport_shmem",
-    "//test/core/test_util:grpc_test_util",
-    "//test/core/test_util:grpc_test_util_base",
+        "//:grpc_transport_shmem",
+        "//test/core/test_util:grpc_test_util",
+        "//test/core/test_util:grpc_test_util_base",
     ],
 )
 
@@ -218,9 +218,9 @@ grpc_cc_test(
         "gtest",
     ],
     deps = [
-    "//src/core:grpc_transport_shmem",
-    "//test/core/test_util:grpc_test_util",
-    "//test/core/test_util:grpc_test_util_base",
+        "//:grpc_transport_shmem",
+        "//test/core/test_util:grpc_test_util",
+        "//test/core/test_util:grpc_test_util_base",
     ],
 )
 
@@ -231,7 +231,7 @@ grpc_cc_test(
         "gtest",
     ],
     deps = [
-        "//src/core:grpc_transport_shmem",
+        "//:grpc_transport_shmem",
         "//test/core/test_util:grpc_test_util",
         "//test/core/test_util:grpc_test_util_base",
     ],

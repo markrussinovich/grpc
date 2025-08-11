@@ -102,6 +102,7 @@ grpc_cc_library(
     ],
     deps = [
         "//:grpc++",
+        "//:grpc_transport_shmem",
         "//src/proto/grpc/testing:echo_cc_grpc",
         "//test/core/test_util:grpc_test_util",
         "//test/core/test_util:grpc_test_util_base",
@@ -125,6 +126,7 @@ grpc_cc_library(
     ],
     deps = [
         "//:grpc++",
+        "//:grpc_transport_shmem",
         "//src/proto/grpc/testing:echo_cc_grpc",
         "//test/core/test_util:grpc_test_util",
         "//test/core/test_util:grpc_test_util_base",

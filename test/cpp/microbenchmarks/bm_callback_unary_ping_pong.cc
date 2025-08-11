@@ -47,6 +47,12 @@ BENCHMARK_TEMPLATE(BM_CallbackUnaryPingPong, InProcess, NoOpMutator,
 BENCHMARK_TEMPLATE(BM_CallbackUnaryPingPong, MinInProcess, NoOpMutator,
                    NoOpMutator)
     ->Apply(SweepSizesArgs);
+BENCHMARK_TEMPLATE(BM_CallbackUnaryPingPong, ShmemTransport, NoOpMutator,
+                   NoOpMutator)
+    ->Apply(SweepSizesArgs);
+BENCHMARK_TEMPLATE(BM_CallbackUnaryPingPong, MinShmemTransport, NoOpMutator,
+                   NoOpMutator)
+    ->Apply(SweepSizesArgs);
 
 // Client context with different metadata
 BENCHMARK_TEMPLATE(BM_CallbackUnaryPingPong, InProcess,

@@ -58,6 +58,12 @@ BENCHMARK_TEMPLATE(BM_CallbackBidiStreaming, InProcess, NoOpMutator,
 BENCHMARK_TEMPLATE(BM_CallbackBidiStreaming, MinInProcess, NoOpMutator,
                    NoOpMutator)
     ->Apply(StreamingPingPongArgs);
+BENCHMARK_TEMPLATE(BM_CallbackBidiStreaming, ShmemTransport, NoOpMutator,
+                   NoOpMutator)
+    ->Apply(StreamingPingPongArgs);
+BENCHMARK_TEMPLATE(BM_CallbackBidiStreaming, MinShmemTransport, NoOpMutator,
+                   NoOpMutator)
+    ->Apply(StreamingPingPongArgs);
 
 // Client context with different metadata
 BENCHMARK_TEMPLATE(BM_CallbackBidiStreaming, InProcess,

@@ -56,21 +56,30 @@ BENCHMARK_TEMPLATE(BM_StreamingPingPong, TCP, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, InProcess, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
+BENCHMARK_TEMPLATE(BM_StreamingPingPong, ShmemTransport, NoOpMutator, NoOpMutator)
+    ->Apply(StreamingPingPongArgs);
 
 BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, TCP, NoOpMutator, NoOpMutator)
     ->Range(0, kMaxMessageSize);
 BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, InProcess, NoOpMutator,
                    NoOpMutator)
     ->Range(0, kMaxMessageSize);
+BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, ShmemTransport, NoOpMutator, NoOpMutator)
+    ->Range(0, kMaxMessageSize);
 
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, MinTCP, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, MinInProcess, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
+BENCHMARK_TEMPLATE(BM_StreamingPingPong, MinShmemTransport, NoOpMutator, NoOpMutator)
+    ->Apply(StreamingPingPongArgs);
 
 BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, MinTCP, NoOpMutator, NoOpMutator)
     ->Range(0, kMaxMessageSize);
 BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, MinInProcess, NoOpMutator,
+                   NoOpMutator)
+    ->Range(0, kMaxMessageSize);
+BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, MinShmemTransport, NoOpMutator,
                    NoOpMutator)
     ->Range(0, kMaxMessageSize);
 
@@ -98,6 +107,12 @@ BENCHMARK_TEMPLATE(BM_StreamingPingPongWithCoalescingApi, InProcess,
                    NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongWithCoalescingApiArgs);
 BENCHMARK_TEMPLATE(BM_StreamingPingPongWithCoalescingApi, MinInProcess,
+                   NoOpMutator, NoOpMutator)
+    ->Apply(StreamingPingPongWithCoalescingApiArgs);
+BENCHMARK_TEMPLATE(BM_StreamingPingPongWithCoalescingApi, ShmemTransport,
+                   NoOpMutator, NoOpMutator)
+    ->Apply(StreamingPingPongWithCoalescingApiArgs);
+BENCHMARK_TEMPLATE(BM_StreamingPingPongWithCoalescingApi, MinShmemTransport,
                    NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongWithCoalescingApiArgs);
 

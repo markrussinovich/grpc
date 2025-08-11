@@ -23,6 +23,8 @@
 #include <grpc/support/atm.h>
 #include <grpcpp/channel.h>
 #include <grpcpp/create_channel.h>
+#include <chrono>
+#include <thread>
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/security/server_credentials.h>
 #include <grpcpp/server.h>
@@ -31,6 +33,7 @@
 #include "absl/log/check.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/chttp2/transport/chttp2_transport.h"
+#include "src/core/ext/transport/shmem/shmem_transport.h" // from grpc_transport_shmem
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/lib/iomgr/endpoint.h"
 #include "src/core/lib/iomgr/endpoint_pair.h"
@@ -161,6 +164,88 @@ class InProcess : public FullstackFixture {
   ~InProcess() override {}
 };
 
+class ShmemTransport : public BaseFixture {
+ public:
+  explicit ShmemTransport(Service* service,
+                         const FixtureConfiguration& fixture_configuration =
+                             FixtureConfiguration()) {
+    ServerBuilder b;
+    cq_ = b.AddCompletionQueue(true);
+    b.RegisterService(service);
+    fixture_configuration.ApplyCommonServerBuilderConfig(&b);
+    server_ = b.BuildAndStart();
+    
+    grpc_core::ExecCtx exec_ctx;
+    
+    // Get server args
+    grpc_core::Server* core_server = 
+        grpc_core::Server::FromC(server_->c_server());
+    grpc_core::ChannelArgs server_args = core_server->channel_args();
+    
+    // Create shmem transport pair
+    auto transport_pair = grpc_core::MakeShmemTransportPair(server_args);
+    
+    // Set up server transport
+    server_transport_ = transport_pair.second.get();
+    CHECK(GRPC_LOG_IF_ERROR(
+        "SetupTransport", 
+        core_server->SetupTransport(transport_pair.second.get(),
+                                   nullptr, server_args)));
+    std::ignore = transport_pair.second.release();  // consumed by SetupTransport
+    
+    // Create client channel with the client transport
+    grpc_core::ChannelArgs c_args;
+    {
+      ChannelArguments args;
+      args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "test.authority");
+      fixture_configuration.ApplyCommonChannelArguments(&args);
+      grpc_channel_args tmp_args;
+      args.SetChannelArgs(&tmp_args);
+      c_args = grpc_core::CoreConfiguration::Get()
+                   .channel_args_preconditioning()
+                   .PreconditionChannelArgs(&tmp_args);
+    }
+    
+    // Set v3 stack flag after preconditioning to avoid being overridden
+    c_args = c_args.Set(GRPC_ARG_USE_V3_STACK, 1);
+
+    client_transport_ = transport_pair.first.get();
+    
+    grpc_channel* channel =
+        grpc_core::ChannelCreate("shmem", c_args, GRPC_CLIENT_DIRECT_CHANNEL,
+                                 transport_pair.first.release())
+            ->release()
+            ->c_ptr();
+
+    channel_ = grpc::CreateChannelInternal(
+        "", channel,
+        std::vector<std::unique_ptr<
+            grpc::experimental::ClientInterceptorFactoryInterface>>());
+  }
+
+  ~ShmemTransport() override {
+    channel_.reset();
+    server_->Shutdown(grpc_timeout_milliseconds_to_deadline(0));
+    cq_->Shutdown();
+    void* tag;
+    bool ok;
+    while (cq_->Next(&tag, &ok)) {
+    }
+    server_.reset();
+    cq_.reset();
+  }
+
+  std::shared_ptr<Channel> channel() { return channel_; }
+  ServerCompletionQueue* cq() { return cq_.get(); }
+
+ private:
+  std::unique_ptr<Server> server_;
+  std::unique_ptr<ServerCompletionQueue> cq_;
+  std::shared_ptr<Channel> channel_;
+  grpc_core::Transport* client_transport_;
+  grpc_core::Transport* server_transport_;
+};
+
 class EndpointPairFixture : public BaseFixture {
  public:
   EndpointPairFixture(Service* service, grpc_endpoint_pair endpoints,
@@ -285,6 +370,7 @@ typedef MinStackize<TCP> MinTCP;
 typedef MinStackize<UDS> MinUDS;
 typedef MinStackize<InProcess> MinInProcess;
 typedef MinStackize<SockPair> MinSockPair;
+typedef MinStackize<ShmemTransport> MinShmemTransport;
 
 }  // namespace testing
 }  // namespace grpc
