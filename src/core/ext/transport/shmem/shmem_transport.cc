@@ -23,6 +23,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "src/core/lib/promise/seq.h"
+#include "src/core/lib/promise/loop.h"
 #include "src/core/call/metadata.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/lib/event_engine/event_engine_context.h"
@@ -76,6 +77,7 @@ class ShmemClientTransport final : public ClientTransport {
   grpc_shmem::ControlBlock* ctrl_ = nullptr;  // shared memory control block
   std::atomic<bool> stop_reader_{false};
   std::thread client_reader_;
+    std::atomic<uint32_t> next_stream_id_{1};
 };
 
 class ShmemServerTransport final : public ServerTransport {
@@ -352,6 +354,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
               self = std::move(self_ref),
               connected_state = server_transport_->connected_state(),
               child_call_handler](ClientMetadataHandle md) mutable {
+               const uint32_t stream_id = self->next_stream_id_.fetch_add(1, std::memory_order_relaxed);
                // Unary path (step 1): emit initial metadata to shared memory
                // without altering behavior. We'll evolve to consume these
                // frames on the server side in a later step.
@@ -364,7 +367,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  const auto payload = grpc_shmem::EncodeInitialMdPath(path);
                  grpc_shmem::FrameHeader hdr{};
                  hdr.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + payload.size());
-                 hdr.stream_id = 1;  // TODO: assign real stream ids
+                 hdr.stream_id = stream_id;
                  hdr.type = grpc_shmem::FrameType::C2S_INITIAL_METADATA;
                  hdr.flags = grpc_shmem::FrameFlags::NONE;
                  hdr.reserved = 0;
@@ -436,104 +439,117 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                      }
                    }
                  });
-                 // Pump messages from party: write C2S_MESSAGE frames for each message,
-                 // and when stream ends, write C2S_TRAILING_METADATA.
-         auto writer_ctrl = ctrl;
-         auto pump_handler = child_call_handler;  // copy for captures
-         pump_handler.SpawnInfallible(
-                     "pump-c2s",
-           [h = pump_handler, writer_ctrl]() mutable {
-                       return Seq(h.PullMessage(), [h, writer_ctrl](ClientToServerNextMessage msg) mutable {
-                         if (!msg.ok()) {
-                           return Empty{};
-                         }
-                         if (msg.has_value()) {
-                           std::string s = msg.value().payload()->JoinIntoString();
-                           grpc_shmem::FrameHeader wh{};
-                           wh.stream_id = 1;  // TODO: real stream ids
-                           wh.flags = grpc_shmem::FrameFlags::NONE;
-                           wh.reserved = 0;
-                           wh.type = grpc_shmem::FrameType::C2S_MESSAGE;
-                           wh.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s.size());
-               grpc_shmem::WriteFrame(
-                 writer_ctrl, grpc_shmem::QueueKind::kC2S, wh,
-                 reinterpret_cast<const uint8_t*>(s.data()),
-                 s.size());
-                           // Re-spawn to continue pumping
-                           h.SpawnInfallible("pump-c2s",
-                                             [h, writer_ctrl]() mutable {
-                                               return Seq(h.PullMessage(), [h, writer_ctrl](ClientToServerNextMessage msg2) mutable {
-                                                 if (!msg2.ok()) return Empty{};
-                                                 if (msg2.has_value()) {
-                                                   std::string s2 = msg2.value().payload()->JoinIntoString();
-                                                   grpc_shmem::FrameHeader wh2{};
-                                                   wh2.stream_id = 1;
-                                                   wh2.flags = grpc_shmem::FrameFlags::NONE;
-                                                   wh2.reserved = 0;
-                                                   wh2.type = grpc_shmem::FrameType::C2S_MESSAGE;
-                                                   wh2.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s2.size());
-                           grpc_shmem::WriteFrame(
-                             writer_ctrl, grpc_shmem::QueueKind::kC2S,
-                             wh2,
-                             reinterpret_cast<const uint8_t*>(s2.data()),
-                             s2.size());
-                                                   // and again...
-                                                   h.SpawnInfallible("pump-c2s", [h, writer_ctrl]() mutable {
-                                                     return Seq(h.PullMessage(), [h, writer_ctrl](ClientToServerNextMessage msg3) mutable {
-                                                       if (!msg3.ok()) return Empty{};
-                                                       if (msg3.has_value()) {
-                                                         std::string s3 = msg3.value().payload()->JoinIntoString();
-                                                         grpc_shmem::FrameHeader wh3{};
-                                                         wh3.stream_id = 1;
-                                                         wh3.flags = grpc_shmem::FrameFlags::NONE;
-                                                         wh3.reserved = 0;
-                                                         wh3.type = grpc_shmem::FrameType::C2S_MESSAGE;
-                                                         wh3.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s3.size());
-                             grpc_shmem::WriteFrame(
-                               writer_ctrl,
-                               grpc_shmem::QueueKind::kC2S, wh3,
-                               reinterpret_cast<const uint8_t*>(
-                                 s3.data()),
-                               s3.size());
-                                                       } else {
-                                                         grpc_shmem::FrameHeader t{};
-                                                         t.stream_id = 1;
-                                                         t.flags = grpc_shmem::FrameFlags::NONE;
-                                                         t.reserved = 0;
-                                                         t.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
-                                                         t.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
-                                                         grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t,
-                                                                                nullptr, 0);
-                                                       }
-                                                       return Empty{};
-                                                     });
-                                                   });
-                                                 } else {
-                                                   grpc_shmem::FrameHeader t{};
-                                                   t.stream_id = 1;
-                                                   t.flags = grpc_shmem::FrameFlags::NONE;
-                                                   t.reserved = 0;
-                                                   t.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
-                                                   t.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
-                                                   grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t,
-                                                                          nullptr, 0);
-                                                 }
-                                                 return Empty{};
-                                               });
-                                             });
-                         } else {
-                           grpc_shmem::FrameHeader t{};
-                           t.stream_id = 1;
-                           t.flags = grpc_shmem::FrameFlags::NONE;
-                           t.reserved = 0;
-                           t.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
-                           t.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
-                           grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t,
-                                                  nullptr, 0);
-                         }
-                         return Empty{};
-                       });
-                     });
+                // Pump messages from party: write C2S_MESSAGE frames for each message,
+                // and when stream ends, write C2S_TRAILING_METADATA.
+                auto writer_ctrl = ctrl;
+                auto pump_handler = child_call_handler;  // copy for captures
+                // Re-spawn pattern: pull one message, write it, then spawn again until EOS.
+                pump_handler.SpawnInfallible(
+                    "pump-c2s",
+                    [h = pump_handler, writer_ctrl, stream_id]() mutable {
+                      return Map(
+                          h.PullMessage(),
+                          [h, writer_ctrl, stream_id](ClientToServerNextMessage msg) mutable {
+                            if (!msg.ok()) {
+                              // Stop pumping on error.
+                              return Empty{};
+                            }
+                            if (msg.has_value()) {
+                              std::string s = msg.value().payload()->JoinIntoString();
+                              grpc_shmem::FrameHeader wh{};
+                              wh.stream_id = stream_id;
+                              wh.flags = grpc_shmem::FrameFlags::NONE;
+                              wh.reserved = 0;
+                              wh.type = grpc_shmem::FrameType::C2S_MESSAGE;
+                              wh.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s.size());
+                              grpc_shmem::WriteFrame(
+                                  writer_ctrl, grpc_shmem::QueueKind::kC2S, wh,
+                                  reinterpret_cast<const uint8_t*>(s.data()), s.size());
+                              // Schedule next iteration.
+                              h.SpawnInfallible(
+                                  "pump-c2s",
+                                  [h, writer_ctrl, stream_id]() mutable {
+                                    return Map(
+                                        h.PullMessage(),
+                                        [h, writer_ctrl, stream_id](ClientToServerNextMessage msg2) mutable {
+                                          if (!msg2.ok()) return Empty{};
+                                          if (msg2.has_value()) {
+                                            std::string s2 = msg2.value().payload()->JoinIntoString();
+                                            grpc_shmem::FrameHeader wh2{};
+                                            wh2.stream_id = stream_id;
+                                            wh2.flags = grpc_shmem::FrameFlags::NONE;
+                                            wh2.reserved = 0;
+                                            wh2.type = grpc_shmem::FrameType::C2S_MESSAGE;
+                                            wh2.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s2.size());
+                                            grpc_shmem::WriteFrame(
+                                                writer_ctrl, grpc_shmem::QueueKind::kC2S, wh2,
+                                                reinterpret_cast<const uint8_t*>(s2.data()), s2.size());
+                                            // Tail-recurse: spawn again.
+                                            h.SpawnInfallible(
+                                                "pump-c2s",
+                                                [h, writer_ctrl, stream_id]() mutable {
+                                                  // Kick off another cycle.
+                                                  return Map(
+                                                      h.PullMessage(),
+                                                      [h, writer_ctrl, stream_id](ClientToServerNextMessage msg3) mutable {
+                                                        if (!msg3.ok()) return Empty{};
+                                                        if (msg3.has_value()) {
+                                                          std::string s3 = msg3.value().payload()->JoinIntoString();
+                                                          grpc_shmem::FrameHeader wh3{};
+                                                          wh3.stream_id = stream_id;
+                                                          wh3.flags = grpc_shmem::FrameFlags::NONE;
+                                                          wh3.reserved = 0;
+                                                          wh3.type = grpc_shmem::FrameType::C2S_MESSAGE;
+                                                          wh3.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s3.size());
+                                                          grpc_shmem::WriteFrame(
+                                                              writer_ctrl, grpc_shmem::QueueKind::kC2S, wh3,
+                                                              reinterpret_cast<const uint8_t*>(s3.data()), s3.size());
+                                                          // And re-spawn again.
+                                                          h.SpawnInfallible(
+                                                              "pump-c2s",
+                                                              [h, writer_ctrl, stream_id]() mutable {
+                                                                // Next cycles continue similarly.
+                                                                return Empty{};
+                                                              });
+                                                        } else {
+                                                          // EOS: send trailing marker and stop.
+                                                          grpc_shmem::FrameHeader t3{};
+                                                          t3.stream_id = stream_id;
+                                                          t3.flags = grpc_shmem::FrameFlags::NONE;
+                                                          t3.reserved = 0;
+                                                          t3.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
+                                                          t3.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+                                                          grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t3, nullptr, 0);
+                                                        }
+                                                        return Empty{};
+                                                      });
+                                                });
+                                          } else {
+                                            // EOS: send trailing marker and stop.
+                                            grpc_shmem::FrameHeader t2{};
+                                            t2.stream_id = stream_id;
+                                            t2.flags = grpc_shmem::FrameFlags::NONE;
+                                            t2.reserved = 0;
+                                            t2.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
+                                            t2.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+                                            grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t2, nullptr, 0);
+                                          }
+                                          return Empty{};
+                                        });
+                                  });
+                            } else {
+                              // EOS: send trailing marker and stop.
+                              grpc_shmem::FrameHeader t{};
+                              t.stream_id = stream_id;
+                              t.flags = grpc_shmem::FrameFlags::NONE;
+                              t.reserved = 0;
+                              t.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
+                              t.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+                              grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t, nullptr, 0);
+                            }
+                            return Empty{};
+                          });
+                    });
                }
                // For the shared-memory unary prototype path, don't forward the
                // call via inproc. We'll rely on server->client frames.
