@@ -17,10 +17,12 @@
 #include <atomic>
 #include <memory>
 #include <thread>
+#include <vector>
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "src/core/lib/promise/seq.h"
 #include "src/core/call/metadata.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/lib/event_engine/event_engine_context.h"
@@ -194,7 +196,7 @@ void ShmemServerTransport::SetCallDestination(
     server_reader_ = std::thread([this] {
   ExecCtx exec_ctx;
       fprintf(stderr, "[shmem] server_reader start\n");
-      while (!stop_reader_.load(std::memory_order_relaxed)) {
+  while (!stop_reader_.load(std::memory_order_relaxed)) {
         grpc_shmem::FrameHeader hdr;
         // Blocking read; will wait until a frame is available.
         std::vector<uint8_t> payload;
@@ -206,11 +208,9 @@ void ShmemServerTransport::SetCallDestination(
           break;
         }
         fprintf(stderr, "[shmem] server_reader got frame type=%u size=%u\n", static_cast<unsigned>(hdr.type), hdr.frame_size);
-        switch (hdr.type) {
+  switch (hdr.type) {
           case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
-            // Respond with S2C initial metadata (application/grpc) and then
-            // immediately send trailing metadata UNIMPLEMENTED to complete
-            // a minimal unary path.
+            // Respond with S2C initial metadata (application/grpc).
             grpc_shmem::FrameHeader out{};
             out.stream_id = hdr.stream_id;
             out.flags = grpc_shmem::FrameFlags::NONE;
@@ -219,18 +219,35 @@ void ShmemServerTransport::SetCallDestination(
             out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
             out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
             grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out, nullptr, 0);
-            // Trailing metadata with UNIMPLEMENTED status code
+            ExecCtx::Get()->Flush();
+            break;
+          }
+          case grpc_shmem::FrameType::C2S_MESSAGE: {
+            // Echo back the payload as a server-to-client message.
+            grpc_shmem::FrameHeader out{};
+            out.stream_id = hdr.stream_id;
+            out.flags = grpc_shmem::FrameFlags::NONE;
+            out.reserved = 0;
+            out.type = grpc_shmem::FrameType::S2C_MESSAGE;
+            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + payload.size());
+            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
+                                   payload.data(), payload.size());
+            break;
+          }
+          case grpc_shmem::FrameType::C2S_TRAILING_METADATA: {
+            // Client finished sends; respond with trailing UNIMPLEMENTED.
+            grpc_shmem::FrameHeader out{};
+            out.stream_id = hdr.stream_id;
+            out.flags = grpc_shmem::FrameFlags::NONE;
+            out.reserved = 0;
             const auto status_payload = grpc_shmem::EncodeTrailingStatus(GRPC_STATUS_UNIMPLEMENTED);
             out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
             out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
             grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
                                    status_payload.data(), status_payload.size());
     ExecCtx::Get()->Flush();
-            fprintf(stderr, "[shmem] server_reader responded initial+trailing\n");
             break;
           }
-          case grpc_shmem::FrameType::C2S_MESSAGE:
-          case grpc_shmem::FrameType::C2S_TRAILING_METADATA:
           case grpc_shmem::FrameType::C2S_CANCEL:
           default:
             // TODO: handle more frame types.
@@ -357,7 +374,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  // and deliver them into the call handler.
                  auto reader_ctrl = ctrl;
                  self->stop_reader_.store(false, std::memory_order_relaxed);
-                 self->client_reader_ = std::thread([self, reader_ctrl, handler = std::move(child_call_handler)]() mutable {
+                 self->client_reader_ = std::thread([self, reader_ctrl, handler = child_call_handler]() mutable {
        ExecCtx exec_ctx;
                    fprintf(stderr, "[shmem] client_reader start\n");
                    while (!self->stop_reader_.load(std::memory_order_relaxed)) {
@@ -372,29 +389,151 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                      fprintf(stderr, "[shmem] client_reader got frame type=%u size=%u\n", static_cast<unsigned>(rh.type), rh.frame_size);
                      switch (rh.type) {
                        case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
-                         auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
-                         md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
-                         handler.SpawnPushServerInitialMetadata(std::move(md));
-         ExecCtx::Get()->Flush();
-                         fprintf(stderr, "[shmem] client_reader pushed initial md\n");
+                         // Create metadata on the call arena by spawning onto the party.
+                         handler.SpawnInfallible(
+                             "push-initial-md",
+                             [h = handler]() mutable {
+                               auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
+                               md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+                               h.SpawnPushServerInitialMetadata(std::move(md));
+                               return Empty{};
+                             });
+                         ExecCtx::Get()->Flush();
+                         fprintf(stderr, "[shmem] client_reader scheduled initial md push\n");
+                         break;
+                       }
+                       case grpc_shmem::FrameType::S2C_MESSAGE: {
+                         // Create message on the call arena by spawning onto the party.
+                         std::string payload(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                         handler.SpawnInfallible(
+                             "push-message",
+                             [h = handler, payload = std::move(payload)]() mutable {
+                               auto msg = Arena::MakePooled<Message>(
+                                   SliceBuffer(Slice::FromCopiedString(payload)), 0);
+                               h.SpawnPushMessage(std::move(msg));
+                               return Empty{};
+                             });
+                         ExecCtx::Get()->Flush();
                          break;
                        }
                        case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
-                         auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
                          uint32_t code = grpc_shmem::DecodeTrailingStatus(bytes);
-                         md->Set(GrpcStatusMetadata(), static_cast<grpc_status_code>(code));
-                         handler.SpawnPushServerTrailingMetadata(std::move(md));
-         ExecCtx::Get()->Flush();
-                         fprintf(stderr, "[shmem] client_reader pushed trailing md\n");
+                         handler.SpawnInfallible(
+                             "push-trailing-md",
+                             [h = handler, code]() mutable {
+                               auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
+                               md->Set(GrpcStatusMetadata(), static_cast<grpc_status_code>(code));
+                               h.SpawnPushServerTrailingMetadata(std::move(md));
+                               return Empty{};
+                             });
+                         ExecCtx::Get()->Flush();
+                         fprintf(stderr, "[shmem] client_reader scheduled trailing md push\n");
                          break;
                        }
-                       case grpc_shmem::FrameType::S2C_MESSAGE:
                        default:
                          // TODO: handle messages in future steps.
                          break;
                      }
                    }
                  });
+                 // Pump messages from party: write C2S_MESSAGE frames for each message,
+                 // and when stream ends, write C2S_TRAILING_METADATA.
+         auto writer_ctrl = ctrl;
+         auto pump_handler = child_call_handler;  // copy for captures
+         pump_handler.SpawnInfallible(
+                     "pump-c2s",
+           [h = pump_handler, writer_ctrl]() mutable {
+                       return Seq(h.PullMessage(), [h, writer_ctrl](ClientToServerNextMessage msg) mutable {
+                         if (!msg.ok()) {
+                           return Empty{};
+                         }
+                         if (msg.has_value()) {
+                           std::string s = msg.value().payload()->JoinIntoString();
+                           grpc_shmem::FrameHeader wh{};
+                           wh.stream_id = 1;  // TODO: real stream ids
+                           wh.flags = grpc_shmem::FrameFlags::NONE;
+                           wh.reserved = 0;
+                           wh.type = grpc_shmem::FrameType::C2S_MESSAGE;
+                           wh.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s.size());
+               grpc_shmem::WriteFrame(
+                 writer_ctrl, grpc_shmem::QueueKind::kC2S, wh,
+                 reinterpret_cast<const uint8_t*>(s.data()),
+                 s.size());
+                           // Re-spawn to continue pumping
+                           h.SpawnInfallible("pump-c2s",
+                                             [h, writer_ctrl]() mutable {
+                                               return Seq(h.PullMessage(), [h, writer_ctrl](ClientToServerNextMessage msg2) mutable {
+                                                 if (!msg2.ok()) return Empty{};
+                                                 if (msg2.has_value()) {
+                                                   std::string s2 = msg2.value().payload()->JoinIntoString();
+                                                   grpc_shmem::FrameHeader wh2{};
+                                                   wh2.stream_id = 1;
+                                                   wh2.flags = grpc_shmem::FrameFlags::NONE;
+                                                   wh2.reserved = 0;
+                                                   wh2.type = grpc_shmem::FrameType::C2S_MESSAGE;
+                                                   wh2.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s2.size());
+                           grpc_shmem::WriteFrame(
+                             writer_ctrl, grpc_shmem::QueueKind::kC2S,
+                             wh2,
+                             reinterpret_cast<const uint8_t*>(s2.data()),
+                             s2.size());
+                                                   // and again...
+                                                   h.SpawnInfallible("pump-c2s", [h, writer_ctrl]() mutable {
+                                                     return Seq(h.PullMessage(), [h, writer_ctrl](ClientToServerNextMessage msg3) mutable {
+                                                       if (!msg3.ok()) return Empty{};
+                                                       if (msg3.has_value()) {
+                                                         std::string s3 = msg3.value().payload()->JoinIntoString();
+                                                         grpc_shmem::FrameHeader wh3{};
+                                                         wh3.stream_id = 1;
+                                                         wh3.flags = grpc_shmem::FrameFlags::NONE;
+                                                         wh3.reserved = 0;
+                                                         wh3.type = grpc_shmem::FrameType::C2S_MESSAGE;
+                                                         wh3.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + s3.size());
+                             grpc_shmem::WriteFrame(
+                               writer_ctrl,
+                               grpc_shmem::QueueKind::kC2S, wh3,
+                               reinterpret_cast<const uint8_t*>(
+                                 s3.data()),
+                               s3.size());
+                                                       } else {
+                                                         grpc_shmem::FrameHeader t{};
+                                                         t.stream_id = 1;
+                                                         t.flags = grpc_shmem::FrameFlags::NONE;
+                                                         t.reserved = 0;
+                                                         t.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
+                                                         t.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+                                                         grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t,
+                                                                                nullptr, 0);
+                                                       }
+                                                       return Empty{};
+                                                     });
+                                                   });
+                                                 } else {
+                                                   grpc_shmem::FrameHeader t{};
+                                                   t.stream_id = 1;
+                                                   t.flags = grpc_shmem::FrameFlags::NONE;
+                                                   t.reserved = 0;
+                                                   t.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
+                                                   t.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+                                                   grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t,
+                                                                          nullptr, 0);
+                                                 }
+                                                 return Empty{};
+                                               });
+                                             });
+                         } else {
+                           grpc_shmem::FrameHeader t{};
+                           t.stream_id = 1;
+                           t.flags = grpc_shmem::FrameFlags::NONE;
+                           t.reserved = 0;
+                           t.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
+                           t.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+                           grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, t,
+                                                  nullptr, 0);
+                         }
+                         return Empty{};
+                       });
+                     });
                }
                // For the shared-memory unary prototype path, don't forward the
                // call via inproc. We'll rely on server->client frames.
