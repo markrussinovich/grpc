@@ -32,6 +32,10 @@
 #include "src/core/util/crash.h"
 #include "src/core/util/debug_location.h"
 
+// Prepare shared memory backing for the transport pair (datapath WIP).
+#include "src/core/ext/transport/shmem/shmem_segment.h"
+#include <unistd.h>
+
 namespace grpc_core {
 namespace {
 
@@ -40,8 +44,12 @@ class ShmemServerTransport;
 class ShmemClientTransport final : public ClientTransport {
  public:
   explicit ShmemClientTransport(
-      RefCountedPtr<ShmemServerTransport> server_transport)
-      : server_transport_(std::move(server_transport)) {}
+    RefCountedPtr<ShmemServerTransport> server_transport)
+    : server_transport_(std::move(server_transport)) {}
+
+  ShmemClientTransport(RefCountedPtr<ShmemServerTransport> server_transport,
+             grpc_shmem::ControlBlock* ctrl)
+    : server_transport_(std::move(server_transport)), ctrl_(ctrl) {}
 
   void StartCall(CallHandler child_call_handler) override;
   void Orphan() override { Unref(); }
@@ -60,11 +68,19 @@ class ShmemClientTransport final : public ClientTransport {
   ~ShmemClientTransport() override;
 
   const RefCountedPtr<ShmemServerTransport> server_transport_;
+    grpc_shmem::ControlBlock* ctrl_ = nullptr;  // not yet used
 };
 
 class ShmemServerTransport final : public ServerTransport {
  public:
   explicit ShmemServerTransport(const ChannelArgs& args);
+
+  ShmemServerTransport(const ChannelArgs& args,
+                       std::unique_ptr<grpc_shmem::ShmemSegment> segment)
+      : ShmemServerTransport(args) {
+    segment_ = std::move(segment);
+    ctrl_ = segment_ != nullptr ? segment_->control() : nullptr;
+  }
 
   void SetCallDestination(
       RefCountedPtr<UnstartedCallDestination> unstarted_call_handler) override;
@@ -137,6 +153,9 @@ class ShmemServerTransport final : public ServerTransport {
   const std::shared_ptr<grpc_event_engine::experimental::EventEngine>
       event_engine_;
   const RefCountedPtr<CallArenaAllocator> call_arena_allocator_;
+  // Shared memory state (datapath under construction)
+  std::unique_ptr<grpc_shmem::ShmemSegment> segment_;
+  grpc_shmem::ControlBlock* ctrl_ = nullptr;
 };
 
 ShmemServerTransport::ShmemServerTransport(const ChannelArgs& args)
@@ -243,9 +262,26 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
 
 std::pair<OrphanablePtr<Transport>, OrphanablePtr<Transport>>
 MakeShmemTransportPair(const ChannelArgs& server_channel_args) {
-  auto server_transport =
-      MakeOrphanable<ShmemServerTransport>(server_channel_args);
-  auto client_transport = MakeOrphanable<ShmemClientTransport>();
+  // Create a shared memory segment for this pair.
+  static std::atomic<uint64_t> pair_id{0};
+  grpc_shmem::SegmentConfig cfg;
+  cfg.name = std::string("grpc_shmem_") + std::to_string(getpid()) + "_" +
+       std::to_string(pair_id.fetch_add(1, std::memory_order_relaxed));
+  cfg.size = 8 * 1024 * 1024;          // 8 MiB segment
+  cfg.queue_capacity = 1 * 1024 * 1024;  // 1 MiB per-queue
+  grpc_shmem::ShmemSegment::RemoveIfExists(cfg.name);
+  auto segment = std::make_unique<grpc_shmem::ShmemSegment>(
+    grpc_shmem::ShmemSegment::Create(cfg));
+  auto ctrl = segment->control();
+
+  auto server_transport = MakeOrphanable<ShmemServerTransport>(
+    server_channel_args, std::move(segment));
+  // Create a client transport that references the server transport so it can
+  // AcceptCall() and coordinate connectivity state. Use a ref to share
+  // ownership safely between both ends of the pair. Also pass the control
+  // block for future datapath work.
+  auto client_transport = MakeOrphanable<ShmemClientTransport>(
+    server_transport->RefAsSubclass<ShmemServerTransport>(), ctrl);
   return std::pair(std::move(client_transport), std::move(server_transport));
 }
 

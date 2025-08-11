@@ -186,6 +186,33 @@ grpc_fuzz_test(
     ],
 )
 
+# GTest-based smoke test for shmem transport without fuzztest dependency.
+load("//bazel:grpc_build_system.bzl", "grpc_cc_test")
+
+grpc_cc_test(
+    name = "shmem_smoke_test",
+    srcs = [
+    "transport_test.h",
+        "transport_test.cc",
+        "call_content.cc",
+        "call_shapes.cc",
+        "no_op.cc",
+        "stress.cc",
+        "shmem_fixture.cc",
+    ],
+    external_deps = [
+        "absl/log:log",
+        "absl/random",
+        "absl/random:bit_gen_ref",
+        "gtest",
+    ],
+    deps = [
+        "//src/core:chaotic_good_config",
+        "//test/core/call/yodel:yodel_test",
+        "//src/core:grpc_transport_shmem",
+    ],
+)
+
 grpc_fuzz_test(
     name = "inproc_test",
     external_deps = [
