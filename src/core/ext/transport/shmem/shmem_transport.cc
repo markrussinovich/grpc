@@ -230,15 +230,21 @@ void ShmemServerTransport::SetCallDestination(
             // New stream begins; reset trailing-sent flag for this stream.
             stream_trailing_sent_[hdr.stream_id] = false;
             stream_message_accum_.erase(hdr.stream_id);
-            // Respond with S2C initial metadata (application/grpc).
+            // Decode any client initial md if present (currently path only) - ignored on server side.
+            (void)payload;
+            // Respond with S2C initial metadata. Include content-type and an echo header.
             grpc_shmem::FrameHeader out{};
             out.stream_id = hdr.stream_id;
             out.flags = grpc_shmem::FrameFlags::NONE;
             out.reserved = 0;
-            // Initial metadata (no payload; client assumes application/grpc)
+            // Initial metadata payload: content-type: application/grpc and x-shmem: 1
+            std::vector<grpc_shmem::KVPair> kvs;
+            kvs.push_back({"content-type", "application/grpc"});
+            kvs.push_back({"x-shmem", "1"});
+            auto md_payload = grpc_shmem::EncodeMetadataKVs(kvs);
             out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
-            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
-            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out, nullptr, 0);
+            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + md_payload.size());
+            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out, md_payload.data(), md_payload.size());
             ExecCtx::Get()->Flush();
             break;
           }
@@ -259,7 +265,11 @@ void ShmemServerTransport::SetCallDestination(
               acc.append(reinterpret_cast<const char*>(payload.data()), payload.size());
               // Enforce maximum logical message size
               if (acc.size() > kMaxMessageSize && !stream_trailing_sent_[hdr.stream_id]) {
-                const auto status_payload = grpc_shmem::EncodeTrailingStatus(GRPC_STATUS_RESOURCE_EXHAUSTED);
+                // Send RESOURCE_EXHAUSTED as KV trailer
+                std::vector<grpc_shmem::KVPair> kvs;
+                kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_RESOURCE_EXHAUSTED)});
+                kvs.push_back({"grpc-message", "resource exhausted"});
+                auto status_payload = grpc_shmem::EncodeMetadataKVs(kvs);
                 out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
                 out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
                 grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
@@ -285,7 +295,11 @@ void ShmemServerTransport::SetCallDestination(
               stream_message_accum_.erase(hdr.stream_id);
               // Detect a test-triggered cancel payload.
               if (full == "cancel" && !stream_trailing_sent_[hdr.stream_id]) {
-                const auto status_payload = grpc_shmem::EncodeTrailingStatus(GRPC_STATUS_CANCELLED);
+                // Send CANCELLED as KV trailer
+                std::vector<grpc_shmem::KVPair> kvs;
+                kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)});
+                kvs.push_back({"grpc-message", "cancelled"});
+                auto status_payload = grpc_shmem::EncodeMetadataKVs(kvs);
                 out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
                 out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
                 grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
@@ -319,7 +333,11 @@ void ShmemServerTransport::SetCallDestination(
             out.stream_id = hdr.stream_id;
             out.flags = grpc_shmem::FrameFlags::NONE;
             out.reserved = 0;
-            const auto status_payload = grpc_shmem::EncodeTrailingStatus(GRPC_STATUS_UNIMPLEMENTED);
+            // Trailing metadata: grpc-status + optional grpc-message
+            std::vector<grpc_shmem::KVPair> kvs;
+            kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_UNIMPLEMENTED)});
+            kvs.push_back({"grpc-message", "unimplemented"});
+            auto status_payload = grpc_shmem::EncodeMetadataKVs(kvs);
             out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
             out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
             grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
@@ -335,7 +353,10 @@ void ShmemServerTransport::SetCallDestination(
               out.stream_id = hdr.stream_id;
               out.flags = grpc_shmem::FrameFlags::NONE;
               out.reserved = 0;
-              const auto status_payload = grpc_shmem::EncodeTrailingStatus(GRPC_STATUS_CANCELLED);
+              std::vector<grpc_shmem::KVPair> kvs;
+              kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)});
+              kvs.push_back({"grpc-message", "cancelled"});
+              auto status_payload = grpc_shmem::EncodeMetadataKVs(kvs);
               out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
               out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
               grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
@@ -458,12 +479,15 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                // without altering behavior. We'll evolve to consume these
                // frames on the server side in a later step.
                if (ctrl != nullptr) {
-                 // Extract HTTP path if present and encode payload.
-                 std::string path;
+                 // Encode a subset of initial metadata as key/values.
+                 std::vector<grpc_shmem::KVPair> kvs;
                  if (auto* p = md->get_pointer(HttpPathMetadata()); p) {
-                   path = std::string(p->as_string_view());
+                   kvs.push_back({":path", std::string(p->as_string_view())});
                  }
-                 const auto payload = grpc_shmem::EncodeInitialMdPath(path);
+                 if (auto* ua = md->get_pointer(UserAgentMetadata()); ua) {
+                   kvs.push_back({"user-agent", std::string(ua->as_string_view())});
+                 }
+                 auto payload = grpc_shmem::EncodeMetadataKVs(kvs);
                  grpc_shmem::FrameHeader hdr{};
                  hdr.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + payload.size());
                  hdr.stream_id = stream_id;
@@ -503,11 +527,24 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                        }
                        switch (rh.type) {
                          case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
-               handler->SpawnInfallible(
+                           // Decode kv payload if present
+                           auto kvs = grpc_shmem::DecodeMetadataKVs(bytes);
+                           handler->SpawnInfallible(
                                "push-initial-md",
-                 [h = *handler]() mutable {
+                               [h = *handler, kvs = std::move(kvs)]() mutable {
                                  auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
-                                 md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+                                 bool have_ct = false;
+                                 for (const auto& kv : kvs) {
+                                   if (kv.key == "content-type") {
+                                     have_ct = true;
+                                     md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+                                   } else {
+                                     md->Append(kv.key, Slice::FromCopiedString(kv.value), [](absl::string_view, const Slice&){});
+                                   }
+                                 }
+                                 if (!have_ct) {
+                                   md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+                                 }
                                  h.SpawnPushServerInitialMetadata(std::move(md));
                                  return Empty{};
                                });
@@ -536,12 +573,22 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                            break;
                          }
                          case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
-                           uint32_t code = grpc_shmem::DecodeTrailingStatus(bytes);
-               handler->SpawnInfallible(
+                           auto kvs = grpc_shmem::DecodeMetadataKVs(bytes);
+                           handler->SpawnInfallible(
                                "push-trailing-md",
-                 [h = *handler, code]() mutable {
+                               [h = *handler, kvs = std::move(kvs)]() mutable {
                                  auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
-                                 md->Set(GrpcStatusMetadata(), static_cast<grpc_status_code>(code));
+                                 grpc_status_code status = GRPC_STATUS_UNKNOWN;
+                                 for (const auto& kv : kvs) {
+                                   if (kv.key == "grpc-status") {
+                                     status = static_cast<grpc_status_code>(atoi(kv.value.c_str()));
+                                   } else if (kv.key == "grpc-message") {
+                                     md->Set(GrpcMessageMetadata(), Slice::FromCopiedString(kv.value));
+                                   } else {
+                                     md->Append(kv.key, Slice::FromCopiedString(kv.value), [](absl::string_view, const Slice&){});
+                                   }
+                                 }
+                                 md->Set(GrpcStatusMetadata(), status);
                                  h.SpawnPushServerTrailingMetadata(std::move(md));
                                  return Empty{};
                                });

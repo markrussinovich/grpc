@@ -714,6 +714,215 @@ TEST(ShmemE2E, OversizeMessageGetsResourceExhausted) {
   server.reset();
 }
 
+TEST(ShmemE2E, TwoConcurrentStreamsDemux) {
+  ExecCtx exec_ctx;
+
+  ChannelArgs args = CoreConfiguration::Get()
+                         .channel_args_preconditioning()
+                         .PreconditionChannelArgs(nullptr);
+
+  auto pair = MakeShmemTransportPair(args);
+  auto client = std::move(pair.first);
+  auto server = std::move(pair.second);
+
+  class ServerCallDestination : public UnstartedCallDestination {
+   public:
+    void StartCall(UnstartedCallHandler handler) override { (void)handler.StartCall(); }
+    void Orphaned() override {}
+  } dest;
+  server->server_transport()->SetCallDestination(MakeRefCounted<ServerCallDestination>());
+
+  auto rq = MakeResourceQuota("shmem-e2e");
+  auto allocator = rq->memory_quota()->CreateMemoryAllocator("shmem-e2e-alloc");
+  auto call_arena_allocator = MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+
+  // Create two independent calls sharing the same client transport
+  auto arena1 = call_arena_allocator->MakeArena();
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  arena1->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+  auto md1 = Arena::MakePooledForOverwrite<ClientMetadata>();
+  md1->Set(HttpPathMetadata(), Slice::FromExternalString("/stream1"));
+  auto call1 = MakeCallPair(std::move(md1), std::move(arena1));
+
+  auto arena2 = call_arena_allocator->MakeArena();
+  arena2->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+  auto md2 = Arena::MakePooledForOverwrite<ClientMetadata>();
+  md2->Set(HttpPathMetadata(), Slice::FromExternalString("/stream2"));
+  auto call2 = MakeCallPair(std::move(md2), std::move(arena2));
+
+  // Start both calls
+  call1.handler.SpawnInfallible("start-call1", [c = client.get(), h = call1.handler]() mutable {
+    c->client_transport()->StartCall(h.StartCall());
+    return Empty{};
+  });
+  call2.handler.SpawnInfallible("start-call2", [c = client.get(), h = call2.handler]() mutable {
+    c->client_transport()->StartCall(h.StartCall());
+    return Empty{};
+  });
+
+  // Send different payloads on each stream interleaved
+  const std::string p1 = "alpha";
+  const std::string p2 = "beta";
+  call1.initiator.SpawnInfallible("send1", [i = call1.initiator, p1]() mutable {
+    return Seq(i.PushMessage(Arena::MakePooled<Message>(SliceBuffer(Slice::FromCopiedString(p1)), 0)),
+               [i](StatusFlag) mutable {
+                 i.FinishSends();
+                 return Empty{};
+               });
+  });
+  call2.initiator.SpawnInfallible("send2", [i = call2.initiator, p2]() mutable {
+    return Seq(i.PushMessage(Arena::MakePooled<Message>(SliceBuffer(Slice::FromCopiedString(p2)), 0)),
+               [i](StatusFlag) mutable {
+                 i.FinishSends();
+                 return Empty{};
+               });
+  });
+
+  // Await initial metadata for both
+  Notification imd1, imd2;
+  call1.initiator.SpawnInfallible("imd1", [i = call1.initiator, &imd1]() mutable {
+    return Seq(i.PullServerInitialMetadata(), [&imd1](auto) { imd1.Notify(); return Empty{}; });
+  });
+  call2.initiator.SpawnInfallible("imd2", [i = call2.initiator, &imd2]() mutable {
+    return Seq(i.PullServerInitialMetadata(), [&imd2](auto) { imd2.Notify(); return Empty{}; });
+  });
+  for (int j = 0; j < 20000 && (!imd1.HasBeenNotified() || !imd2.HasBeenNotified()); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(imd1.HasBeenNotified());
+  ASSERT_TRUE(imd2.HasBeenNotified());
+
+  // Each call receives its own echoed payload, matching by stream
+  std::string echoed1, echoed2;
+  Notification got1, got2;
+  call1.initiator.SpawnInfallible("await1", [i = call1.initiator, &echoed1, &got1]() mutable {
+    return Seq(i.PullMessage(), [&echoed1, &got1](ServerToClientNextMessage m) {
+      if (m.ok() && m.has_value()) { echoed1 = m.value().payload()->JoinIntoString(); got1.Notify(); }
+      return Empty{};
+    });
+  });
+  call2.initiator.SpawnInfallible("await2", [i = call2.initiator, &echoed2, &got2]() mutable {
+    return Seq(i.PullMessage(), [&echoed2, &got2](ServerToClientNextMessage m) {
+      if (m.ok() && m.has_value()) { echoed2 = m.value().payload()->JoinIntoString(); got2.Notify(); }
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 30000 && (!got1.HasBeenNotified() || !got2.HasBeenNotified()); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got1.HasBeenNotified());
+  ASSERT_TRUE(got2.HasBeenNotified());
+  EXPECT_EQ(echoed1, p1);
+  EXPECT_EQ(echoed2, p2);
+
+  // And both get UNIMPLEMENTED trailers
+  Notification tr1, tr2;
+  call1.initiator.SpawnInfallible("tr1", [i = call1.initiator, &tr1]() mutable {
+    return Seq(i.PullServerTrailingMetadata(), [&tr1](ServerMetadataHandle) { tr1.Notify(); return Empty{}; });
+  });
+  call2.initiator.SpawnInfallible("tr2", [i = call2.initiator, &tr2]() mutable {
+    return Seq(i.PullServerTrailingMetadata(), [&tr2](ServerMetadataHandle) { tr2.Notify(); return Empty{}; });
+  });
+  for (int j = 0; j < 30000 && (!tr1.HasBeenNotified() || !tr2.HasBeenNotified()); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(tr1.HasBeenNotified());
+  ASSERT_TRUE(tr2.HasBeenNotified());
+
+  client.reset();
+  server.reset();
+}
+
+TEST(ShmemE2E, InitialMetadataAndTrailersEnrichment) {
+  ExecCtx exec_ctx;
+
+  ChannelArgs args = CoreConfiguration::Get()
+                         .channel_args_preconditioning()
+                         .PreconditionChannelArgs(nullptr);
+
+  auto pair = MakeShmemTransportPair(args);
+  auto client = std::move(pair.first);
+  auto server = std::move(pair.second);
+
+  class ServerCallDestination : public UnstartedCallDestination {
+   public:
+    void StartCall(UnstartedCallHandler handler) override { (void)handler.StartCall(); }
+    void Orphaned() override {}
+  } dest;
+  server->server_transport()->SetCallDestination(MakeRefCounted<ServerCallDestination>());
+
+  auto rq = MakeResourceQuota("shmem-e2e");
+  auto allocator = rq->memory_quota()->CreateMemoryAllocator("shmem-e2e-alloc");
+  auto call_arena_allocator = MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+  auto arena = call_arena_allocator->MakeArena();
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+
+  auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+  md->Set(HttpPathMetadata(), Slice::FromExternalString("/meta"));
+  md->Set(UserAgentMetadata(), Slice::FromExternalString("shmem-test/1.0"));
+
+  auto call = MakeCallPair(std::move(md), std::move(arena));
+  call.handler.SpawnInfallible("start", [c = client.get(), h = call.handler]() mutable {
+    c->client_transport()->StartCall(h.StartCall());
+    return Empty{};
+  });
+  call.initiator.SpawnFinishSends();
+
+  // Await initial metadata; expect content-type and x-shmem=1
+  std::optional<ServerMetadataHandle> got_initial;
+  Notification initial_ready;
+  call.initiator.SpawnInfallible(
+      "await-initial",
+      [i = call.initiator, &got_initial, &initial_ready]() mutable {
+        return Seq(i.PullServerInitialMetadata(), [&got_initial, &initial_ready](auto md) {
+          got_initial = std::move(md);
+          initial_ready.Notify();
+          return Empty{};
+        });
+      });
+  for (int i = 0; i < 20000 && !initial_ready.HasBeenNotified(); ++i) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_initial.has_value());
+  ASSERT_NE(got_initial.value(), nullptr);
+  EXPECT_EQ(*got_initial.value()->get_pointer(ContentTypeMetadata()), ContentTypeMetadata::kApplicationGrpc);
+  // x-shmem custom header present
+  std::string backing;
+  auto xs = got_initial.value()->GetStringValue("x-shmem", &backing);
+  ASSERT_TRUE(xs.has_value());
+  EXPECT_EQ(xs.value(), "1");
+
+  // Await trailing metadata; expect status and grpc-message
+  std::optional<ServerMetadataHandle> trailing;
+  Notification tr;
+  call.initiator.SpawnInfallible("await-trailing", [i = call.initiator, &trailing, &tr]() mutable {
+    return Seq(i.PullServerTrailingMetadata(), [&trailing, &tr](ServerMetadataHandle md) {
+      trailing = std::move(md);
+      tr.Notify();
+      return Empty{};
+    });
+  });
+  for (int i = 0; i < 20000 && !tr.HasBeenNotified(); ++i) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(tr.HasBeenNotified());
+  ASSERT_TRUE(trailing.has_value());
+  EXPECT_EQ(*trailing.value()->get_pointer(GrpcStatusMetadata()), GRPC_STATUS_UNIMPLEMENTED);
+  std::string backing2;
+  auto gm = trailing.value()->GetStringValue("grpc-message", &backing2);
+  ASSERT_TRUE(gm.has_value());
+  EXPECT_EQ(gm.value(), "unimplemented");
+
+  client.reset();
+  server.reset();
+}
+
 }  // namespace grpc_core
 
 int main(int argc, char** argv) {

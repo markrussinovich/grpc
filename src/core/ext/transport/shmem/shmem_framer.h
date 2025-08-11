@@ -37,6 +37,19 @@ void WriteFrame(ControlBlock* cb, QueueKind kind, const FrameHeader& hdr, const 
 // Writes the parsed header into out_hdr.
 std::vector<uint8_t> ReadFrame(ControlBlock* cb, QueueKind kind, FrameHeader* out_hdr);
 
+// Simple metadata key/value representation for initial/trailing metadata payloads.
+struct KVPair {
+	std::string key;
+	std::string value;
+};
+
+// Encode a vector of key/value pairs into a compact little-endian payload:
+// [u16 count] { [u16 key_len][key bytes][u32 val_len][val bytes] }*
+std::vector<uint8_t> EncodeMetadataKVs(const std::vector<KVPair>& kvs);
+
+// Decode a payload produced by EncodeMetadataKVs. Returns empty vector on parse error.
+std::vector<KVPair> DecodeMetadataKVs(const std::vector<uint8_t>& bytes);
+
 // Minimal metadata encoding helpers for the unary path (WIP):
 // Encode the HTTP path in a simple little-endian length-prefixed format.
 std::vector<uint8_t> EncodeInitialMdPath(const std::string& path);

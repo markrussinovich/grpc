@@ -77,6 +77,75 @@ std::vector<uint8_t> ReadFrame(ControlBlock* cb, QueueKind kind, FrameHeader* ou
   return payload;
 }
 
+std::vector<uint8_t> EncodeMetadataKVs(const std::vector<KVPair>& kvs) {
+  // Compute size: 2 bytes count + sum(2 + key + 4 + val)
+  size_t size = 2;
+  for (const auto& kv : kvs) {
+    size += 2 + kv.key.size();
+    size += 4 + kv.value.size();
+  }
+  std::vector<uint8_t> out(size);
+  // Write count
+  uint16_t count = static_cast<uint16_t>(kvs.size());
+  out[0] = static_cast<uint8_t>(count & 0xFF);
+  out[1] = static_cast<uint8_t>((count >> 8) & 0xFF);
+  size_t o = 2;
+  for (const auto& kv : kvs) {
+    uint16_t klen = static_cast<uint16_t>(kv.key.size());
+    out[o + 0] = static_cast<uint8_t>(klen & 0xFF);
+    out[o + 1] = static_cast<uint8_t>((klen >> 8) & 0xFF);
+    o += 2;
+    if (klen) {
+      std::memcpy(out.data() + o, kv.key.data(), klen);
+      o += klen;
+    }
+    uint32_t vlen = static_cast<uint32_t>(kv.value.size());
+    out[o + 0] = static_cast<uint8_t>(vlen & 0xFF);
+    out[o + 1] = static_cast<uint8_t>((vlen >> 8) & 0xFF);
+    out[o + 2] = static_cast<uint8_t>((vlen >> 16) & 0xFF);
+    out[o + 3] = static_cast<uint8_t>((vlen >> 24) & 0xFF);
+    o += 4;
+    if (vlen) {
+      std::memcpy(out.data() + o, kv.value.data(), vlen);
+      o += vlen;
+    }
+  }
+  return out;
+}
+
+std::vector<KVPair> DecodeMetadataKVs(const std::vector<uint8_t>& bytes) {
+  std::vector<KVPair> out;
+  if (bytes.size() < 2) return out;
+  uint16_t count = static_cast<uint16_t>(bytes[0]) |
+                   static_cast<uint16_t>(static_cast<uint16_t>(bytes[1]) << 8);
+  size_t o = 2;
+  out.reserve(count);
+  for (uint16_t i = 0; i < count; ++i) {
+    if (o + 2 > bytes.size()) { out.clear(); return out; }
+    uint16_t klen = static_cast<uint16_t>(bytes[o]) |
+                    static_cast<uint16_t>(static_cast<uint16_t>(bytes[o+1]) << 8);
+    o += 2;
+    if (o + klen > bytes.size()) { out.clear(); return out; }
+    std::string key;
+    key.resize(klen);
+    if (klen) std::memcpy(key.data(), bytes.data() + o, klen);
+    o += klen;
+    if (o + 4 > bytes.size()) { out.clear(); return out; }
+    uint32_t vlen = static_cast<uint32_t>(bytes[o]) |
+                    (static_cast<uint32_t>(bytes[o+1]) << 8) |
+                    (static_cast<uint32_t>(bytes[o+2]) << 16) |
+                    (static_cast<uint32_t>(bytes[o+3]) << 24);
+    o += 4;
+    if (o + vlen > bytes.size()) { out.clear(); return out; }
+    std::string val;
+    val.resize(vlen);
+    if (vlen) std::memcpy(val.data(), bytes.data() + o, vlen);
+    o += vlen;
+    out.push_back(KVPair{std::move(key), std::move(val)});
+  }
+  return out;
+}
+
 std::vector<uint8_t> EncodeInitialMdPath(const std::string& path) {
   // Simple 32-bit little-endian length + bytes
   std::vector<uint8_t> out(4 + path.size());
