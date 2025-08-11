@@ -48,3 +48,15 @@ grpc_cc_benchmark(
         "//test/core/test_util:passthrough_endpoint",
     ],
 )
+
+grpc_cc_benchmark(
+    name = "bm_shmem",
+    srcs = ["bm_shmem.cc"],
+    monitoring = HISTORY,
+    deps = [
+        "//:grpc",
+        "//src/core:default_event_engine",
+        "//src/core:grpc_transport_shmem",
+        "//test/core/call:call_spine_benchmarks",
+    ],
+)

@@ -22,6 +22,18 @@ load("//test/core/test_util:grpc_fuzzer.bzl", "grpc_fuzz_test")
 grpc_package(name = "test/core/transport/test_suite")
 
 grpc_cc_library(
+    name = "shmem_fixture",
+    testonly = 1,
+    srcs = ["shmem_fixture.cc"],
+    external_deps = ["gtest"],
+    deps = [
+        "test",
+        "//src/core:grpc_transport_shmem",
+    ],
+    alwayslink = 1,
+)
+
+grpc_cc_library(
     name = "inproc_fixture",
     testonly = 1,
     srcs = ["inproc_fixture.cc"],
