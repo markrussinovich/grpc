@@ -77,4 +77,45 @@ std::vector<uint8_t> ReadFrame(ControlBlock* cb, QueueKind kind, FrameHeader* ou
   return payload;
 }
 
+std::vector<uint8_t> EncodeInitialMdPath(const std::string& path) {
+  // Simple 32-bit little-endian length + bytes
+  std::vector<uint8_t> out(4 + path.size());
+  const uint32_t n = static_cast<uint32_t>(path.size());
+  out[0] = static_cast<uint8_t>(n & 0xFF);
+  out[1] = static_cast<uint8_t>((n >> 8) & 0xFF);
+  out[2] = static_cast<uint8_t>((n >> 16) & 0xFF);
+  out[3] = static_cast<uint8_t>((n >> 24) & 0xFF);
+  if (!path.empty()) {
+    std::memcpy(out.data() + 4, path.data(), path.size());
+  }
+  return out;
+}
+
+std::string DecodeInitialMdPath(const std::vector<uint8_t>& bytes) {
+  if (bytes.size() < 4) return std::string();
+  uint32_t n = static_cast<uint32_t>(bytes[0]) |
+               (static_cast<uint32_t>(bytes[1]) << 8) |
+               (static_cast<uint32_t>(bytes[2]) << 16) |
+               (static_cast<uint32_t>(bytes[3]) << 24);
+  if (bytes.size() < 4u + n) return std::string();
+  return std::string(reinterpret_cast<const char*>(bytes.data() + 4), n);
+}
+
+std::vector<uint8_t> EncodeTrailingStatus(uint32_t status_code) {
+  std::vector<uint8_t> out(4);
+  out[0] = static_cast<uint8_t>(status_code & 0xFF);
+  out[1] = static_cast<uint8_t>((status_code >> 8) & 0xFF);
+  out[2] = static_cast<uint8_t>((status_code >> 16) & 0xFF);
+  out[3] = static_cast<uint8_t>((status_code >> 24) & 0xFF);
+  return out;
+}
+
+uint32_t DecodeTrailingStatus(const std::vector<uint8_t>& bytes) {
+  if (bytes.size() < 4) return 0;
+  return static_cast<uint32_t>(bytes[0]) |
+         (static_cast<uint32_t>(bytes[1]) << 8) |
+         (static_cast<uint32_t>(bytes[2]) << 16) |
+         (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
 }  // namespace grpc_shmem

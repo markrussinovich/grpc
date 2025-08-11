@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "src/core/ext/transport/shmem/shmem_protocol.h"
@@ -35,6 +36,16 @@ void WriteFrame(ControlBlock* cb, QueueKind kind, const FrameHeader& hdr, const 
 // Blocking read of one complete frame from the queue. Returns the payload bytes.
 // Writes the parsed header into out_hdr.
 std::vector<uint8_t> ReadFrame(ControlBlock* cb, QueueKind kind, FrameHeader* out_hdr);
+
+// Minimal metadata encoding helpers for the unary path (WIP):
+// Encode the HTTP path in a simple little-endian length-prefixed format.
+std::vector<uint8_t> EncodeInitialMdPath(const std::string& path);
+// Decode the HTTP path from the bytes encoded by EncodeInitialMdPath.
+std::string DecodeInitialMdPath(const std::vector<uint8_t>& bytes);
+// Encode a trailing status code (gRPC status integer) as little-endian uint32.
+std::vector<uint8_t> EncodeTrailingStatus(uint32_t status_code);
+// Decode a trailing status code from little-endian uint32.
+uint32_t DecodeTrailingStatus(const std::vector<uint8_t>& bytes);
 
 }  // namespace grpc_shmem
 
