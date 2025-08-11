@@ -520,6 +520,200 @@ TEST(ShmemE2E, UnaryCancelViaApiThenCancelled) {
   server.reset();
 }
 
+TEST(ShmemE2E, LargeMessageEchoBackpressureWorks) {
+  ExecCtx exec_ctx;
+
+  ChannelArgs args = CoreConfiguration::Get()
+                         .channel_args_preconditioning()
+                         .PreconditionChannelArgs(nullptr);
+
+  auto pair = MakeShmemTransportPair(args);
+  auto client = std::move(pair.first);
+  auto server = std::move(pair.second);
+
+  class ServerCallDestination : public UnstartedCallDestination {
+   public:
+    void StartCall(UnstartedCallHandler handler) override { (void)handler.StartCall(); }
+    void Orphaned() override {}
+  } dest;
+  server->server_transport()->SetCallDestination(MakeRefCounted<ServerCallDestination>());
+
+  auto rq = MakeResourceQuota("shmem-e2e");
+  auto allocator = rq->memory_quota()->CreateMemoryAllocator("shmem-e2e-alloc");
+  auto call_arena_allocator = MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+  auto arena = call_arena_allocator->MakeArena();
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+
+  auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+  md->Set(HttpPathMetadata(), Slice::FromExternalString("/big_echo"));
+  auto call = MakeCallPair(std::move(md), std::move(arena));
+
+  call.handler.SpawnInfallible(
+      "start-call", [c = client.get(), h = call.handler]() mutable {
+        c->client_transport()->StartCall(h.StartCall());
+        return Empty{};
+      });
+
+  // Build a ~2.5 MiB payload with a deterministic pattern.
+  const size_t sz = 2 * 1024 * 1024 + 512 * 1024;  // 2.5 MiB
+  std::string payload;
+  payload.resize(sz);
+  for (size_t i = 0; i < sz; ++i) payload[i] = static_cast<char>('A' + (i % 26));
+
+  // Send large payload and finish sends when it’s queued.
+  call.initiator.SpawnInfallible("send-big", [i = call.initiator, payload]() mutable {
+    return Seq(i.PushMessage(Arena::MakePooled<Message>(
+                   SliceBuffer(Slice::FromCopiedString(payload)), 0)),
+               [i](StatusFlag) mutable {
+                 i.FinishSends();
+                 return Empty{};
+               });
+  });
+
+  // Await initial metadata
+  Notification got_imd;
+  call.initiator.SpawnInfallible("await-imd", [i = call.initiator, &got_imd]() mutable {
+    return Seq(i.PullServerInitialMetadata(), [&got_imd](auto) {
+      got_imd.Notify();
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 30000 && !got_imd.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_imd.HasBeenNotified());
+
+  // Expect echoed large message
+  std::string echoed;
+  Notification got_msg;
+  call.initiator.SpawnInfallible("await-msg", [i = call.initiator, &echoed, &got_msg]() mutable {
+    return Seq(i.PullMessage(), [&echoed, &got_msg](ServerToClientNextMessage m) {
+      if (m.ok() && m.has_value()) {
+        echoed = m.value().payload()->JoinIntoString();
+        got_msg.Notify();
+      }
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 120000 && !got_msg.HasBeenNotified(); ++j) {  // allow extra time
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_msg.HasBeenNotified());
+  ASSERT_EQ(echoed.size(), sz);
+  EXPECT_EQ(echoed.substr(0, 64), payload.substr(0, 64));
+  EXPECT_EQ(echoed.substr(sz - 64), payload.substr(sz - 64));
+
+  // Trailing UNIMPLEMENTED
+  std::optional<ServerMetadataHandle> trailing;
+  Notification got_tr;
+  call.initiator.SpawnInfallible("await-trailing", [i = call.initiator, &trailing, &got_tr]() mutable {
+    return Seq(i.PullServerTrailingMetadata(), [&trailing, &got_tr](ServerMetadataHandle md) {
+      trailing = std::move(md);
+      got_tr.Notify();
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 30000 && !got_tr.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_tr.HasBeenNotified());
+  ASSERT_TRUE(trailing.has_value());
+  EXPECT_EQ(*trailing.value()->get_pointer(GrpcStatusMetadata()), GRPC_STATUS_UNIMPLEMENTED);
+
+  client.reset();
+  server.reset();
+}
+
+TEST(ShmemE2E, OversizeMessageGetsResourceExhausted) {
+  ExecCtx exec_ctx;
+
+  ChannelArgs args = CoreConfiguration::Get()
+                         .channel_args_preconditioning()
+                         .PreconditionChannelArgs(nullptr);
+
+  auto pair = MakeShmemTransportPair(args);
+  auto client = std::move(pair.first);
+  auto server = std::move(pair.second);
+
+  class ServerCallDestination : public UnstartedCallDestination {
+   public:
+    void StartCall(UnstartedCallHandler handler) override { (void)handler.StartCall(); }
+    void Orphaned() override {}
+  } dest;
+  server->server_transport()->SetCallDestination(MakeRefCounted<ServerCallDestination>());
+
+  auto rq = MakeResourceQuota("shmem-e2e");
+  auto allocator = rq->memory_quota()->CreateMemoryAllocator("shmem-e2e-alloc");
+  auto call_arena_allocator = MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+  auto arena = call_arena_allocator->MakeArena();
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+
+  auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+  md->Set(HttpPathMetadata(), Slice::FromExternalString("/too_big"));
+  auto call = MakeCallPair(std::move(md), std::move(arena));
+
+  call.handler.SpawnInfallible(
+      "start-call", [c = client.get(), h = call.handler]() mutable {
+        c->client_transport()->StartCall(h.StartCall());
+        return Empty{};
+      });
+
+  // Build a payload just over 3 MiB to exceed kMaxMessageSize
+  const size_t sz = 3 * 1024 * 1024 + 8 * 1024;
+  std::string payload;
+  payload.resize(sz, 'X');
+
+  // Send oversize payload and finish sends
+  call.initiator.SpawnInfallible("send-big", [i = call.initiator, payload]() mutable {
+    return Seq(i.PushMessage(Arena::MakePooled<Message>(
+                   SliceBuffer(Slice::FromCopiedString(payload)), 0)),
+               [i](StatusFlag) mutable {
+                 i.FinishSends();
+                 return Empty{};
+               });
+  });
+
+  // Wait for initial metadata (still expected)
+  Notification got_imd;
+  call.initiator.SpawnInfallible("await-imd", [i = call.initiator, &got_imd]() mutable {
+    return Seq(i.PullServerInitialMetadata(), [&got_imd](auto) {
+      got_imd.Notify();
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 30000 && !got_imd.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_imd.HasBeenNotified());
+
+  // Expect trailing RESOURCE_EXHAUSTED
+  std::optional<ServerMetadataHandle> trailing;
+  Notification got_tr;
+  call.initiator.SpawnInfallible("await-trailing", [i = call.initiator, &trailing, &got_tr]() mutable {
+    return Seq(i.PullServerTrailingMetadata(), [&trailing, &got_tr](ServerMetadataHandle md) {
+      trailing = std::move(md);
+      got_tr.Notify();
+      return Empty{};
+    });
+  });
+  for (int j = 0; j < 60000 && !got_tr.HasBeenNotified(); ++j) {
+    ExecCtx::Get()->Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(got_tr.HasBeenNotified());
+  ASSERT_TRUE(trailing.has_value());
+  EXPECT_EQ(*trailing.value()->get_pointer(GrpcStatusMetadata()), GRPC_STATUS_RESOURCE_EXHAUSTED);
+
+  client.reset();
+  server.reset();
+}
+
 }  // namespace grpc_core
 
 int main(int argc, char** argv) {
