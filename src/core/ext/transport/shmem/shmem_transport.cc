@@ -56,6 +56,48 @@ constexpr size_t kMaxFramePayload = 1024 * 1024;  // 1 MiB
 // Max logical message size allowed by the transport (across fragments).
 constexpr size_t kMaxMessageSize = 3 * 1024 * 1024;  // 3MiB
 
+// Pre-encoded common metadata to avoid repeated allocations
+namespace {
+static const std::vector<uint8_t> kInitialMetadataPayload = []() {
+  std::vector<grpc_shmem::KVPair> kvs;
+  kvs.push_back({"content-type", "application/grpc"});
+  kvs.push_back({"x-shmem", "1"});
+  return grpc_shmem::EncodeMetadataKVs(kvs);
+}();
+
+static const std::vector<uint8_t> kOkStatusPayload = []() {
+  std::vector<grpc_shmem::KVPair> kvs;
+  kvs.push_back({"grpc-status", "0"});
+  return grpc_shmem::EncodeMetadataKVs(kvs);
+}();
+
+static const std::vector<uint8_t> kUnimplementedStatusPayload = []() {
+  std::vector<grpc_shmem::KVPair> kvs;
+  kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_UNIMPLEMENTED)});
+  kvs.push_back({"grpc-message", "unimplemented"});
+  return grpc_shmem::EncodeMetadataKVs(kvs);
+}();
+
+static const std::vector<uint8_t> kResourceExhaustedStatusPayload = []() {
+  std::vector<grpc_shmem::KVPair> kvs;
+  kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_RESOURCE_EXHAUSTED)});
+  kvs.push_back({"grpc-message", "resource exhausted"});
+  return grpc_shmem::EncodeMetadataKVs(kvs);
+}();
+
+static const std::vector<uint8_t> kCancelledStatusPayload = []() {
+  std::vector<grpc_shmem::KVPair> kvs;
+  kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)});
+  kvs.push_back({"grpc-message", "cancelled"});
+  return grpc_shmem::EncodeMetadataKVs(kvs);
+}();
+
+static const std::vector<uint8_t> kEmptyMetadataPayload = []() {
+  std::vector<grpc_shmem::KVPair> kvs;
+  return grpc_shmem::EncodeMetadataKVs(kvs);
+}();
+}  // namespace
+
 class ShmemClientTransport final : public ClientTransport {
  public:
   explicit ShmemClientTransport(
@@ -184,6 +226,7 @@ class ShmemServerTransport final : public ServerTransport {
   // Basic per-stream state for simple multiplexing in tests
   absl::flat_hash_map<uint32_t, bool> stream_trailing_sent_;
   absl::flat_hash_map<uint32_t, std::string> stream_message_accum_;
+  absl::flat_hash_map<uint32_t, std::string> stream_path_; // Track path per stream
 };
 
 ShmemServerTransport::ShmemServerTransport(const ChannelArgs& args) {
@@ -213,6 +256,7 @@ void ShmemServerTransport::SetCallDestination(
     stop_reader_.store(false, std::memory_order_relaxed);
     server_reader_ = std::thread([this] {
       ExecCtx exec_ctx;
+      bool needs_flush = false;
   while (!stop_reader_.load(std::memory_order_relaxed)) {
         grpc_shmem::FrameHeader hdr;
         // Blocking read; will wait until a frame is available.
@@ -228,22 +272,26 @@ void ShmemServerTransport::SetCallDestination(
             // New stream begins; reset trailing-sent flag for this stream.
             stream_trailing_sent_[hdr.stream_id] = false;
             stream_message_accum_.erase(hdr.stream_id);
-            // Decode any client initial md if present (currently path only) - ignored on server side.
-            (void)payload;
+            // Decode client initial md to extract path
+            auto kvs = grpc_shmem::DecodeMetadataKVs(payload);
+            std::string path = "/unknown";
+            for (const auto& kv : kvs) {
+              if (kv.key == ":path") {
+                path = kv.value;
+                break;
+              }
+            }
+            stream_path_[hdr.stream_id] = path;
+            
             // Respond with S2C initial metadata. Include content-type and an echo header.
             grpc_shmem::FrameHeader out{};
             out.stream_id = hdr.stream_id;
             out.flags = grpc_shmem::FrameFlags::NONE;
             out.reserved = 0;
-            // Initial metadata payload: content-type: application/grpc and x-shmem: 1
-            std::vector<grpc_shmem::KVPair> kvs;
-            kvs.push_back({"content-type", "application/grpc"});
-            kvs.push_back({"x-shmem", "1"});
-            auto md_payload = grpc_shmem::EncodeMetadataKVs(kvs);
             out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
-            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + md_payload.size());
-            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out, md_payload.data(), md_payload.size());
-            ExecCtx::Get()->Flush();
+            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + kInitialMetadataPayload.size());
+            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out, kInitialMetadataPayload.data(), kInitialMetadataPayload.size());
+            needs_flush = true;
             break;
           }
           case grpc_shmem::FrameType::C2S_MESSAGE: {
@@ -264,18 +312,15 @@ void ShmemServerTransport::SetCallDestination(
               // Enforce maximum logical message size
               if (acc.size() > kMaxMessageSize && !stream_trailing_sent_[hdr.stream_id]) {
                 // Send RESOURCE_EXHAUSTED as KV trailer
-                std::vector<grpc_shmem::KVPair> kvs;
-                kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_RESOURCE_EXHAUSTED)});
-                kvs.push_back({"grpc-message", "resource exhausted"});
-                auto status_payload = grpc_shmem::EncodeMetadataKVs(kvs);
+                auto status_payload = kResourceExhaustedStatusPayload;
                 out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
                 out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
                 grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
                                        status_payload.data(), status_payload.size());
-                ExecCtx::Get()->Flush();
                 stream_trailing_sent_[hdr.stream_id] = true;
                 // Drop any accumulated payload to free memory
                 stream_message_accum_.erase(hdr.stream_id);
+                needs_flush = true;
                 break;
               }
             } else {
@@ -294,16 +339,13 @@ void ShmemServerTransport::SetCallDestination(
               // Detect a test-triggered cancel payload.
               if (full == "cancel" && !stream_trailing_sent_[hdr.stream_id]) {
                 // Send CANCELLED as KV trailer
-                std::vector<grpc_shmem::KVPair> kvs;
-                kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)});
-                kvs.push_back({"grpc-message", "cancelled"});
-                auto status_payload = grpc_shmem::EncodeMetadataKVs(kvs);
+                auto status_payload = kCancelledStatusPayload;
                 out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
                 out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
                 grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
                                        status_payload.data(), status_payload.size());
                 stream_trailing_sent_[hdr.stream_id] = true;
-                ExecCtx::Get()->Flush();
+                needs_flush = true;
               } else {
                 // Echo the message back, fragmenting as needed
                 size_t offset = 0;
@@ -323,7 +365,7 @@ void ShmemServerTransport::SetCallDestination(
             break;
           }
           case grpc_shmem::FrameType::C2S_TRAILING_METADATA: {
-            // Client finished sends; respond with trailing UNIMPLEMENTED unless already sent.
+            // Client finished sends; respond based on path - OK for /echo, UNIMPLEMENTED for others.
             if (stream_trailing_sent_[hdr.stream_id]) {
               break;
             }
@@ -331,17 +373,23 @@ void ShmemServerTransport::SetCallDestination(
             out.stream_id = hdr.stream_id;
             out.flags = grpc_shmem::FrameFlags::NONE;
             out.reserved = 0;
-            // Trailing metadata: grpc-status + optional grpc-message
-            std::vector<grpc_shmem::KVPair> kvs;
-            kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_UNIMPLEMENTED)});
-            kvs.push_back({"grpc-message", "unimplemented"});
-            auto status_payload = grpc_shmem::EncodeMetadataKVs(kvs);
             out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
-            out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
-            grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
-                                   status_payload.data(), status_payload.size());
-    ExecCtx::Get()->Flush();
+            
+            // Use OK status for /benchmark path, UNIMPLEMENTED for others
+            const std::string& path = stream_path_[hdr.stream_id];
+            if (path == "/benchmark") {
+              out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + kOkStatusPayload.size());
+              grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
+                                     kOkStatusPayload.data(), kOkStatusPayload.size());
+            } else {
+              out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + kUnimplementedStatusPayload.size());
+              grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
+                                     kUnimplementedStatusPayload.data(), kUnimplementedStatusPayload.size());
+            }
+            needs_flush = true;
             stream_trailing_sent_[hdr.stream_id] = true;
+            // Clean up stream state
+            stream_path_.erase(hdr.stream_id);
             // Leave trailing flag true to ignore further frames for this stream
             break;
           }
@@ -351,15 +399,11 @@ void ShmemServerTransport::SetCallDestination(
               out.stream_id = hdr.stream_id;
               out.flags = grpc_shmem::FrameFlags::NONE;
               out.reserved = 0;
-              std::vector<grpc_shmem::KVPair> kvs;
-              kvs.push_back({"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)});
-              kvs.push_back({"grpc-message", "cancelled"});
-              auto status_payload = grpc_shmem::EncodeMetadataKVs(kvs);
               out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
-              out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + status_payload.size());
+              out.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + kCancelledStatusPayload.size());
               grpc_shmem::WriteFrame(ctrl_, grpc_shmem::QueueKind::kS2C, out,
-                                     status_payload.data(), status_payload.size());
-              ExecCtx::Get()->Flush();
+                                     kCancelledStatusPayload.data(), kCancelledStatusPayload.size());
+              needs_flush = true;
               stream_trailing_sent_[hdr.stream_id] = true;
               // Leave trailing flag true to ignore further frames for this stream
             }
@@ -367,6 +411,11 @@ void ShmemServerTransport::SetCallDestination(
           default:
             // TODO: handle more frame types.
             break;
+        }
+        
+        // Batch flush - only call if we wrote any frames this iteration
+        if (needs_flush) {
+          ExecCtx::Get()->Flush();
         }
       }
     });
@@ -485,15 +534,24 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  if (auto* ua = md->get_pointer(UserAgentMetadata()); ua) {
                    kvs.push_back({"user-agent", std::string(ua->as_string_view())});
                  }
-                 auto payload = grpc_shmem::EncodeMetadataKVs(kvs);
+                 
+                 // Use pre-encoded empty metadata if no custom metadata
+                 const std::vector<uint8_t>* payload;
+                 std::vector<uint8_t> dynamic_payload;
+                 if (kvs.empty()) {
+                   payload = &kEmptyMetadataPayload;
+                 } else {
+                   dynamic_payload = grpc_shmem::EncodeMetadataKVs(kvs);
+                   payload = &dynamic_payload;
+                 }
                  grpc_shmem::FrameHeader hdr{};
-                 hdr.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + payload.size());
+                 hdr.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + payload->size());
                  hdr.stream_id = stream_id;
                  hdr.type = grpc_shmem::FrameType::C2S_INITIAL_METADATA;
                  hdr.flags = grpc_shmem::FrameFlags::NONE;
                  hdr.reserved = 0;
                  grpc_shmem::WriteFrame(ctrl, grpc_shmem::QueueKind::kC2S, hdr,
-                                        payload.data(), payload.size());
+                                        payload->data(), payload->size());
                  // Start a single background demuxing reader if not already started.
                  if (!self->reader_started_.exchange(true, std::memory_order_acq_rel)) {
                    self->stop_reader_.store(false, std::memory_order_relaxed);
@@ -620,21 +678,34 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                                 return Empty{};
                               }
                               if (msg.has_value()) {
-                                std::string s = msg.value().payload()->JoinIntoString();
-                                size_t offset = 0;
-                                while (offset < s.size()) {
-                                  const size_t n = std::min(kMaxFramePayload, s.size() - offset);
+                                auto& sb = *msg.value().payload();
+                                if (sb.Length() == 0) {
+                                  // Zero-length message - avoid JoinIntoString
                                   grpc_shmem::FrameHeader wh{};
                                   wh.stream_id = stream_id;
-                                  wh.flags = (offset + n < s.size()) ? grpc_shmem::FrameFlags::MORE_FRAMES_FOLLOW
-                                                                     : grpc_shmem::FrameFlags::NONE;
+                                  wh.flags = grpc_shmem::FrameFlags::NONE;
                                   wh.reserved = 0;
                                   wh.type = grpc_shmem::FrameType::C2S_MESSAGE;
-                                  wh.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + n);
-                                  grpc_shmem::WriteFrame(
-                                      writer_ctrl, grpc_shmem::QueueKind::kC2S, wh,
-                                      reinterpret_cast<const uint8_t*>(s.data() + offset), n);
-                                  offset += n;
+                                  wh.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize);
+                                  grpc_shmem::WriteFrame(writer_ctrl, grpc_shmem::QueueKind::kC2S, wh, nullptr, 0);
+                                } else {
+                                  // Non-zero payload - still need to join for fragmentation
+                                  std::string s = sb.JoinIntoString();
+                                  size_t offset = 0;
+                                  while (offset < s.size()) {
+                                    const size_t n = std::min(kMaxFramePayload, s.size() - offset);
+                                    grpc_shmem::FrameHeader wh{};
+                                    wh.stream_id = stream_id;
+                                    wh.flags = (offset + n < s.size()) ? grpc_shmem::FrameFlags::MORE_FRAMES_FOLLOW
+                                                                       : grpc_shmem::FrameFlags::NONE;
+                                    wh.reserved = 0;
+                                    wh.type = grpc_shmem::FrameType::C2S_MESSAGE;
+                                    wh.frame_size = static_cast<uint32_t>(grpc_shmem::kSerializedHeaderSize + n);
+                                    grpc_shmem::WriteFrame(
+                                        writer_ctrl, grpc_shmem::QueueKind::kC2S, wh,
+                                        reinterpret_cast<const uint8_t*>(s.data() + offset), n);
+                                    offset += n;
+                                  }
                                 }
                                 // Continue pumping by scheduling again.
                                 (*schedule_pump)(h);

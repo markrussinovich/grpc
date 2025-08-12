@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
+#include <chrono>
 
 #include <boost/interprocess/sync/scoped_lock.hpp>
 
@@ -36,15 +38,63 @@ inline boost::interprocess::interprocess_condition& SelectNotFull(
 }
 }  // namespace
 
+#ifndef GRPC_SHMEM_SPSC_LOCKFREE
+#define GRPC_SHMEM_SPSC_LOCKFREE 0
+#endif
+
+namespace {
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+  asm volatile("pause" ::: "memory");
+#else
+  // Fallback noop
+#endif
+}
+
+inline void backoff_wait(int iter) {
+  if (iter < 64) {
+    cpu_relax();
+  } else if (iter < 256) {
+    std::this_thread::yield();
+  } else {
+    std::this_thread::sleep_for(std::chrono::nanoseconds(1000));
+  }
+}
+}  // namespace
+
 void RingWriteBlocking(ControlBlock* cb, QueueKind kind, const uint8_t* data,
                        size_t len) {
   RingBuffer* rb = SelectRB(cb, kind);
+  size_t written = 0;
+#if GRPC_SHMEM_SPSC_LOCKFREE
+  // Aggressive lock-free SPSC with minimal spinning
+  while (written < len) {
+    const uint64_t head = rb->head.load(std::memory_order_relaxed);
+    const uint64_t tail = rb->tail.load(std::memory_order_acquire);
+    const uint64_t available = rb->capacity - (head - tail);
+    
+    if (available == 0) {
+      // Tight spin for a few iterations, then yield
+      for (int i = 0; i < 8; ++i) {
+        cpu_relax();
+        if (rb->tail.load(std::memory_order_acquire) != tail) break;
+      }
+      continue;
+    }
+    
+    const uint64_t pos = head % rb->capacity;
+    const uint64_t to_end = rb->capacity - pos;
+    const size_t chunk = std::min({available, to_end, len - written});
+    
+    std::memcpy(rb->buffer.get() + pos, data + written, chunk);
+    rb->head.store(head + chunk, std::memory_order_release);
+    written += chunk;
+  }
+#else
   auto& m = SelectMutex(cb, kind);
   auto& not_empty = SelectNotEmpty(cb, kind);
   auto& not_full = SelectNotFull(cb, kind);
-
-  size_t written = 0;
-  boost::interprocess::scoped_lock lock(m);
+  boost::interprocess::scoped_lock<boost::interprocess::interprocess_mutex> lock(m);
   while (written < len) {
     while (RingWritable(*rb) == 0) {
       not_full.wait(lock);
@@ -61,17 +111,42 @@ void RingWriteBlocking(ControlBlock* cb, QueueKind kind, const uint8_t* data,
     written += n;
     not_empty.notify_one();
   }
+#endif
 }
 
 void RingReadBlocking(ControlBlock* cb, QueueKind kind, uint8_t* out,
                       size_t len) {
   RingBuffer* rb = SelectRB(cb, kind);
+  size_t read = 0;
+#if GRPC_SHMEM_SPSC_LOCKFREE
+  // Aggressive lock-free SPSC with minimal spinning  
+  while (read < len) {
+    const uint64_t head = rb->head.load(std::memory_order_acquire);
+    const uint64_t tail = rb->tail.load(std::memory_order_relaxed);
+    const uint64_t available = head - tail;
+    
+    if (available == 0) {
+      // Tight spin for a few iterations, then yield
+      for (int i = 0; i < 8; ++i) {
+        cpu_relax();
+        if (rb->head.load(std::memory_order_acquire) != head) break;
+      }
+      continue;
+    }
+    
+    const uint64_t pos = tail % rb->capacity;
+    const uint64_t to_end = rb->capacity - pos;
+    const size_t chunk = std::min({available, to_end, len - read});
+    
+    std::memcpy(out + read, rb->buffer.get() + pos, chunk);
+    rb->tail.store(tail + chunk, std::memory_order_release);
+    read += chunk;
+  }
+#else
   auto& m = SelectMutex(cb, kind);
   auto& not_empty = SelectNotEmpty(cb, kind);
   auto& not_full = SelectNotFull(cb, kind);
-
-  size_t read = 0;
-  boost::interprocess::scoped_lock lock(m);
+  boost::interprocess::scoped_lock<boost::interprocess::interprocess_mutex> lock(m);
   while (read < len) {
     while (RingReadable(*rb) == 0) {
       not_empty.wait(lock);
@@ -88,6 +163,7 @@ void RingReadBlocking(ControlBlock* cb, QueueKind kind, uint8_t* out,
     read += n;
     not_full.notify_one();
   }
+#endif
 }
 
 }  // namespace grpc_shmem

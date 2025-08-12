@@ -59,9 +59,23 @@ void WriteFrame(ControlBlock* cb, QueueKind kind, const FrameHeader& hdr, const 
   (void)payload_size;
   uint8_t header_buf[kSerializedHeaderSize];
   SerializeHeaderLE(hdr, header_buf);
-  RingWriteBlocking(cb, kind, header_buf, kSerializedHeaderSize);
-  if (hdr.frame_size > kSerializedHeaderSize) {
-    RingWriteBlocking(cb, kind, payload, hdr.frame_size - kSerializedHeaderSize);
+  
+  // Optimization: For small frames (≤ 256 bytes), combine header and payload into single ring write
+  const size_t payload_bytes = hdr.frame_size > kSerializedHeaderSize ? hdr.frame_size - kSerializedHeaderSize : 0;
+  if (payload_bytes <= 256) {
+    // Use stack buffer for small combined writes
+    uint8_t combined_buf[kSerializedHeaderSize + 256];
+    std::memcpy(combined_buf, header_buf, kSerializedHeaderSize);
+    if (payload_bytes > 0) {
+      std::memcpy(combined_buf + kSerializedHeaderSize, payload, payload_bytes);
+    }
+    RingWriteBlocking(cb, kind, combined_buf, kSerializedHeaderSize + payload_bytes);
+  } else {
+    // Use separate writes for large frames
+    RingWriteBlocking(cb, kind, header_buf, kSerializedHeaderSize);
+    if (payload_bytes > 0) {
+      RingWriteBlocking(cb, kind, payload, payload_bytes);
+    }
   }
 }
 
@@ -77,7 +91,7 @@ std::vector<uint8_t> ReadFrame(ControlBlock* cb, QueueKind kind, FrameHeader* ou
   return payload;
 }
 
-std::vector<uint8_t> EncodeMetadataKVs(const std::vector<KVPair>& kvs) {
+std::vector<uint8_t> EncodeMetadataKVs(const std::vector<grpc_shmem::KVPair>& kvs) {
   // Compute size: 2 bytes count + sum(2 + key + 4 + val)
   size_t size = 2;
   for (const auto& kv : kvs) {
@@ -113,8 +127,8 @@ std::vector<uint8_t> EncodeMetadataKVs(const std::vector<KVPair>& kvs) {
   return out;
 }
 
-std::vector<KVPair> DecodeMetadataKVs(const std::vector<uint8_t>& bytes) {
-  std::vector<KVPair> out;
+std::vector<grpc_shmem::KVPair> DecodeMetadataKVs(const std::vector<uint8_t>& bytes) {
+  std::vector<grpc_shmem::KVPair> out;
   if (bytes.size() < 2) return out;
   uint16_t count = static_cast<uint16_t>(bytes[0]) |
                    static_cast<uint16_t>(static_cast<uint16_t>(bytes[1]) << 8);
@@ -141,7 +155,7 @@ std::vector<KVPair> DecodeMetadataKVs(const std::vector<uint8_t>& bytes) {
     val.resize(vlen);
     if (vlen) std::memcpy(val.data(), bytes.data() + o, vlen);
     o += vlen;
-    out.push_back(KVPair{std::move(key), std::move(val)});
+    out.push_back(grpc_shmem::KVPair{std::move(key), std::move(val)});
   }
   return out;
 }

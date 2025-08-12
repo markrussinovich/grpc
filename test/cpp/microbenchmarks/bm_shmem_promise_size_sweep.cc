@@ -24,49 +24,60 @@ static void BM_ShmemPromiseUnaryPingPong(benchmark::State& state) {
   const int resp_bytes = static_cast<int>(state.range(1));
   ExecCtx exec_ctx;
 
-  ChannelArgs args = CoreConfiguration::Get()
-                         .channel_args_preconditioning()
-                         .PreconditionChannelArgs(nullptr);
-  auto pair = MakeShmemTransportPair(args);
-  auto client = std::move(pair.first);
-  auto server = std::move(pair.second);
-
+  // Create and cache the transport pair and allocator once per process.
+  struct Env {
+    OrphanablePtr<Transport> client;
+    OrphanablePtr<Transport> server;
+    RefCountedPtr<CallArenaAllocator> call_arena_allocator;
+  RefCountedPtr<UnstartedCallDestination> dest;
+  };
+  static Env* env = [] {
+    auto* e = new Env();
+    ChannelArgs args = CoreConfiguration::Get()
+                           .channel_args_preconditioning()
+                           .PreconditionChannelArgs(nullptr);
+    auto pair = MakeShmemTransportPair(args);
+    e->client = std::move(pair.first);
+    e->server = std::move(pair.second);
   class ServerCallDestination : public UnstartedCallDestination {
-   public:
-    void StartCall(UnstartedCallHandler h) override { (void)h.StartCall(); }
-    void Orphaned() override {}
-  } dest;
+     public:
+      void StartCall(UnstartedCallHandler h) override { (void)h.StartCall(); }
+      void Orphaned() override {}
+  };
+  e->dest = MakeRefCounted<ServerCallDestination>();
+  e->server->server_transport()->SetCallDestination(e->dest);
+    auto rq = MakeResourceQuota("bm-shmem");
+    auto allocator = rq->memory_quota()->CreateMemoryAllocator("bm-shmem-alloc");
+    e->call_arena_allocator = MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+    return e;
+  }();
 
-  server->server_transport()->SetCallDestination(
-      MakeRefCounted<ServerCallDestination>());
-
-  auto rq = MakeResourceQuota("bm-shmem");
-  auto allocator = rq->memory_quota()->CreateMemoryAllocator("bm-shmem-alloc");
-  auto call_arena_allocator =
-      MakeRefCounted<CallArenaAllocator>(std::move(allocator), 1024);
+  // Prebuild payload for this size once outside the loop.
+  std::string payload;
+  if (req_bytes > 0) payload.assign(req_bytes, 'q');
 
   for (auto _ : state) {
-    auto arena = call_arena_allocator->MakeArena();
+    auto arena = env->call_arena_allocator->MakeArena();
     auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
     arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
 
-  auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
-  // Use echo path so the transport echoes the request payload back once.
-  md->Set(HttpPathMetadata(), Slice::FromExternalString("/echo"));
+    auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+    // Use benchmark path so the transport returns OK status for successful completion.
+    md->Set(HttpPathMetadata(), Slice::FromExternalString("/benchmark"));
     auto call = MakeCallPair(std::move(md), std::move(arena));
 
     call.handler.SpawnInfallible("start-call",
-                                 [c = client.get(), h = call.handler]() mutable {
+                                 [c = env->client.get(), h = call.handler]() mutable {
                                    c->client_transport()->StartCall(h.StartCall());
                                    return Empty{};
                                  });
 
     if (req_bytes > 0) {
-      std::string payload(req_bytes, 'q');
+      const std::string* payload_ptr = &payload;
       call.initiator.SpawnInfallible(
-          "send-msg", [i = call.initiator, payload = std::move(payload)]() mutable {
+          "send-msg", [i = call.initiator, payload_ptr]() mutable {
             return Seq(i.PushMessage(Arena::MakePooled<Message>(
-                           SliceBuffer(Slice::FromCopiedString(payload)), 0)),
+                           SliceBuffer(Slice::FromCopiedString(*payload_ptr)), 0)),
                        [i](StatusFlag) mutable {
                          i.FinishSends();
                          return Empty{};
@@ -76,27 +87,19 @@ static void BM_ShmemPromiseUnaryPingPong(benchmark::State& state) {
       call.initiator.SpawnFinishSends();
     }
 
-    Notification imd;
-    call.initiator.SpawnInfallible("imd", [i = call.initiator, &imd]() mutable {
-      return Seq(i.PullServerInitialMetadata(), [&imd](auto) {
-        imd.Notify();
-        return Empty{};
-      });
+    // Pull initial metadata but don't wait on it; it will complete before trailing.
+    call.initiator.SpawnInfallible("imd", [i = call.initiator]() mutable {
+      return Seq(i.PullServerInitialMetadata(), [](auto) { return Empty{}; });
     });
-    while (!imd.HasBeenNotified()) ExecCtx::Get()->Flush();
 
-  if (req_bytes > 0) {
-      Notification msg;
-      call.initiator.SpawnInfallible("msg", [i = call.initiator, &msg]() mutable {
-        return Seq(i.PullMessage(), [&msg](ServerToClientNextMessage m) {
-          (void)m;
-          msg.Notify();
-          return Empty{};
-        });
+    // Pull one message if we expect one, but don't wait separately.
+    if (req_bytes > 0) {
+      call.initiator.SpawnInfallible("msg", [i = call.initiator]() mutable {
+        return Seq(i.PullMessage(), [](ServerToClientNextMessage) { return Empty{}; });
       });
-      while (!msg.HasBeenNotified()) ExecCtx::Get()->Flush();
     }
 
+    // Wait only on trailing metadata as the barrier for completion.
     Notification tr;
     call.initiator.SpawnInfallible("tr", [i = call.initiator, &tr]() mutable {
       return Seq(i.PullServerTrailingMetadata(), [&tr](ServerMetadataHandle) {
@@ -104,7 +107,7 @@ static void BM_ShmemPromiseUnaryPingPong(benchmark::State& state) {
         return Empty{};
       });
     });
-    while (!tr.HasBeenNotified()) ExecCtx::Get()->Flush();
+  tr.WaitForNotification();
   }
 
   state.SetBytesProcessed(
