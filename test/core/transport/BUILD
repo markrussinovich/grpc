@@ -207,7 +207,6 @@ grpc_cc_test(
     deps = [
         "//:grpc_transport_shmem",
         "//test/core/test_util:grpc_test_util",
-        "//test/core/test_util:grpc_test_util_base",
     ],
 )
 

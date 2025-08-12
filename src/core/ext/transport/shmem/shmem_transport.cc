@@ -49,9 +49,10 @@ namespace {
 
 class ShmemServerTransport;
 
-// Max payload per frame to avoid monopolizing the ring buffer; larger messages
-// are fragmented across multiple frames.
-constexpr size_t kMaxFramePayload = 256 * 1024;  // 256KiB
+// Max payload per frame; larger messages are fragmented across multiple frames.
+// Increased to 1 MiB to reduce per-frame overhead (locks, wakeups) while still
+// allowing multiplexing fairness.
+constexpr size_t kMaxFramePayload = 1024 * 1024;  // 1 MiB
 // Max logical message size allowed by the transport (across fragments).
 constexpr size_t kMaxMessageSize = 3 * 1024 * 1024;  // 3MiB
 
@@ -211,8 +212,7 @@ void ShmemServerTransport::SetCallDestination(
   if (ctrl_ != nullptr && !server_reader_.joinable()) {
     stop_reader_.store(false, std::memory_order_relaxed);
     server_reader_ = std::thread([this] {
-  ExecCtx exec_ctx;
-      fprintf(stderr, "[shmem] server_reader start\n");
+      ExecCtx exec_ctx;
   while (!stop_reader_.load(std::memory_order_relaxed)) {
         grpc_shmem::FrameHeader hdr;
         // Blocking read; will wait until a frame is available.
@@ -221,10 +221,8 @@ void ShmemServerTransport::SetCallDestination(
           payload = grpc_shmem::ReadFrame(ctrl_, grpc_shmem::QueueKind::kC2S, &hdr);
         } catch (...) {
           // If any exception occurs (shouldn't in our C++ setup), break loop.
-          fprintf(stderr, "[shmem] server_reader exception, exiting\n");
           break;
         }
-        fprintf(stderr, "[shmem] server_reader got frame type=%u size=%u\n", static_cast<unsigned>(hdr.type), hdr.frame_size);
   switch (hdr.type) {
           case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
             // New stream begins; reset trailing-sent flag for this stream.
@@ -502,7 +500,6 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                    auto reader_ctrl = ctrl;
                    self->client_reader_ = std::thread([self, reader_ctrl]() mutable {
                      ExecCtx exec_ctx;
-                     fprintf(stderr, "[shmem] client_reader (demux) start\n");
                      absl::flat_hash_map<uint32_t, std::string> partial;  // reassembly per stream
                      while (!self->stop_reader_.load(std::memory_order_relaxed)) {
                        grpc_shmem::FrameHeader rh;
@@ -510,10 +507,8 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                        try {
                          bytes = grpc_shmem::ReadFrame(reader_ctrl, grpc_shmem::QueueKind::kS2C, &rh);
                        } catch (...) {
-                         fprintf(stderr, "[shmem] client_reader exception, exiting\n");
                          break;
                        }
-                       fprintf(stderr, "[shmem] client_reader got frame type=%u size=%u\n", static_cast<unsigned>(rh.type), rh.frame_size);
              // Look up the handler for this stream id.
              std::unique_ptr<CallHandler> handler;
                        {

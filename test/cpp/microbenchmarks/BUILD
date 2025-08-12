@@ -389,6 +389,22 @@ grpc_cc_benchmark(
     deps = [":callback_streaming_ping_pong_h"],
 )
 
+grpc_cc_benchmark(
+    name = "bm_shmem_promise_size_sweep",
+    srcs = ["bm_shmem_promise_size_sweep.cc"],
+    deps = [
+        "//:grpc",
+        "//:grpc_transport_shmem",
+        "//src/core:default_event_engine",
+        "//src/core:resource_quota",
+        "//src/core:channel_args",
+        "//src/core:metadata",
+        "//src/core:call_spine",
+        "//src/core:call_arena_allocator",
+        "//src/core:promise_factory",
+    ],
+)
+
 # TODO(hork): Generalize this for other work queue implementations
 grpc_cc_benchmark(
     name = "bm_basic_work_queue",

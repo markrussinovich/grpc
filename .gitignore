@@ -165,6 +165,14 @@ cmake-build-debug/
 # Benchmark outputs
 BenchmarkDotNet.Artifacts/
 
+# Local performance temp artifacts (plots, CSV, JSON extracts)
+.perf_tmp/
+transport_sweeps*.csv
+*_sweep.json
+transport_throughput.*
+transport_latency.*
+transport_ops.*
+
 # pyenv config
 .python-version
 
