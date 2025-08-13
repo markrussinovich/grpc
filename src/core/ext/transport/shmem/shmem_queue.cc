@@ -1,6 +1,8 @@
 #include "src/core/ext/transport/shmem/shmem_queue.h"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 namespace grpc_shmem {
 
@@ -11,18 +13,20 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset) 
 		const uint64_t head = rb->head.load(std::memory_order_acquire);
 		const uint64_t tail = rb->tail.load(std::memory_order_acquire);
 		const uint64_t used = head - tail;  // monotonic
-		if (used + size > rb->capacity) {
-			// Busy wait until sufficient free space becomes available.
-			// Caller may consider yielding in long waits.
-			continue;
-		}
+			if (used + size > rb->capacity) {
+				// Busy wait until sufficient free space becomes available.
+				// Be polite and yield briefly to reduce starvation under load.
+				std::this_thread::sleep_for(std::chrono::microseconds(50));
+				continue;
+			}
 		// Reserve [head%capacity, head%capacity + size)
 		const uint64_t offset = head % rb->capacity;
 		// If this reservation would straddle the end, either wait or allow wrapping
 		// by the next reservation. Here we choose to wait for simplicity.
-		if (offset + size > rb->capacity) {
-			continue;  // wait until consumer advances to free contiguous tail space
-		}
+			if (offset + size > rb->capacity) {
+				std::this_thread::sleep_for(std::chrono::microseconds(50));
+				continue;  // wait until consumer advances to free contiguous tail space
+			}
 		const uint64_t new_head = head + size;
 		if (rb->head.compare_exchange_weak(
 						const_cast<uint64_t&>(head), new_head, std::memory_order_acq_rel,

@@ -39,12 +39,18 @@ void ShmemSegment::InitQueues(bip::managed_shared_memory& seg, ControlBlock* cb,
 	cb->s2c_queues = s2c;
 }
 
-ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
-	// Ensure any previous segment is removed for a clean start in tests/examples.
-	RemoveIfExists(cfg.name);
+void ShmemSegment::RemoveIfExists(const std::string& name) {
+	// Use a process-local suffix to avoid different processes/tests deleting each
+	// others segments when they pick common names.
+	std::string local = name + "_" + std::to_string(getpid());
+	bip::shared_memory_object::remove(local.c_str());
+}
 
-	// Create or open managed shared memory
-	auto seg = std::make_unique<bip::managed_shared_memory>(bip::create_only, cfg.name.c_str(), cfg.size);
+ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
+	// Create a process-local named segment to avoid collisions between tests.
+	std::string local = cfg.name + "_" + std::to_string(getpid());
+	// Create managed shared memory
+	auto seg = std::make_unique<bip::managed_shared_memory>(bip::create_only, local.c_str(), cfg.size);
 
 	// Construct ControlBlock
 	auto* cb = seg->find_or_construct<ControlBlock>(kControlBlockName)();
@@ -57,11 +63,12 @@ ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
 	// Initialize queues and data rings
 	InitQueues(*seg, cb, cfg.data_ring_capacity);
 
-	return ShmemSegment(cfg.name, std::move(seg), cb);
+	return ShmemSegment(local, std::move(seg), cb);
 }
 
 ShmemSegment ShmemSegment::Open(const std::string& name) {
-	auto seg = std::make_unique<bip::managed_shared_memory>(bip::open_only, name.c_str());
+	std::string local = name + "_" + std::to_string(getpid());
+	auto seg = std::make_unique<bip::managed_shared_memory>(bip::open_only, local.c_str());
 
 	auto res = seg->find<ControlBlock>(kControlBlockName);
 	ControlBlock* cb = nullptr;
@@ -72,7 +79,7 @@ ShmemSegment ShmemSegment::Open(const std::string& name) {
 		cb->client_state.store(1);
 	}
 
-	return ShmemSegment(name, std::move(seg), cb);
+	return ShmemSegment(local, std::move(seg), cb);
 }
 
 }  // namespace grpc_shmem

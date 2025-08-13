@@ -31,9 +31,10 @@ class ShmemSegment {
   ShmemSegment(const ShmemSegment&) = delete;
   ShmemSegment& operator=(const ShmemSegment&) = delete;
 
-  static void RemoveIfExists(const std::string& name) {
-    boost::interprocess::shared_memory_object::remove(name.c_str());
-  }
+  // Remove the shared memory segment for this process-local name.
+  // Note: To avoid cross-test interference, the implementation removes a
+  // process-suffixed name; see shmem_segment.cc for details.
+  static void RemoveIfExists(const std::string& name);
 
   // Create a new segment and initialize ControlBlock and queues.
   static ShmemSegment Create(const SegmentConfig& cfg);

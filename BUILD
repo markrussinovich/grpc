@@ -5002,6 +5002,7 @@ grpc_cc_library(
         "grpc_trace",
         "iomgr",
         "promise",
+    "//src/core:map",
         "ref_counted_ptr",
         "server",
         "//src/core:arena",
