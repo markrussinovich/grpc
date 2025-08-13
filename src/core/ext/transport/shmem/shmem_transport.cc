@@ -18,6 +18,7 @@
 #include "src/core/lib/slice/slice.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
 #include "src/core/lib/transport/transport.h"
+#include "src/core/lib/channel/channel_args.h"
 
 #include "src/core/ext/transport/shmem/shmem_segment.h"
 #include "src/core/ext/transport/shmem/shmem_queue.h"
@@ -28,13 +29,15 @@ namespace grpc_core {
 namespace {
 
 constexpr uint32_t kMaxMessageSize = 3 * 1024 * 1024;  // 3 MiB
+constexpr absl::string_view kArgShmemSpinIters = "grpc.shmem.spin_iters";
+constexpr int kDefaultSpinIters = 1000;
 
 class ShmemServerTransport;
 
 class ShmemClientTransport final : public ClientTransport {
  public:
   ShmemClientTransport(RefCountedPtr<ShmemServerTransport> server, grpc_shmem::ControlBlock* cb)
-      : server_(std::move(server)), cb_(cb) {}
+  : server_(std::move(server)), cb_(cb) {}
 
   void StartCall(CallHandler child_call_handler) override;
   void Orphan() override {
@@ -66,6 +69,7 @@ class ShmemClientTransport final : public ClientTransport {
   std::atomic<bool> stop_{false};
   std::thread reader_;
   std::atomic<uint32_t> next_stream_id_{1};
+  int spin_iters_ = kDefaultSpinIters;
 
   Mutex mu_;
   absl::flat_hash_map<uint32_t, CallHandler> handlers_ ABSL_GUARDED_BY(mu_);
@@ -74,9 +78,12 @@ class ShmemClientTransport final : public ClientTransport {
 
 class ShmemServerTransport final : public ServerTransport {
  public:
-  explicit ShmemServerTransport(const ChannelArgs& /*args*/) {}
-  ShmemServerTransport(const ChannelArgs& /*args*/, std::unique_ptr<grpc_shmem::ShmemSegment> seg)
+  explicit ShmemServerTransport(const ChannelArgs& args) {
+    spin_iters_ = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
+  }
+  ShmemServerTransport(const ChannelArgs& args, std::unique_ptr<grpc_shmem::ShmemSegment> seg)
       : segment_(std::move(seg)) {
+    spin_iters_ = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
     cb_ = segment_ ? segment_->control() : nullptr;
     EnsureReaderStarted();
   }
@@ -109,6 +116,7 @@ class ShmemServerTransport final : public ServerTransport {
   }
 
   grpc_shmem::ControlBlock* control() const { return cb_; }
+  int spin_iters() const { return spin_iters_; }
 
  private:
   ~ShmemServerTransport() override = default;
@@ -128,7 +136,7 @@ class ShmemServerTransport final : public ServerTransport {
     for (;;) {
       if (stop_.load(std::memory_order_relaxed)) break;
       grpc_shmem::Command cmd;
-      if (!grpc_shmem::PopCommandHybrid(cb_->c2s_queues.get(), cb_, grpc_shmem::Direction::kC2S, 1000, &cmd)) {
+  if (!grpc_shmem::PopCommandHybrid(cb_->c2s_queues.get(), cb_, grpc_shmem::Direction::kC2S, spin_iters_, &cmd)) {
         continue;
       }
       auto& st = state[cmd.stream_id];
@@ -238,6 +246,7 @@ class ShmemServerTransport final : public ServerTransport {
   std::thread reader_;
   std::atomic<bool> stop_{false};
   std::atomic<bool> reader_started_{false};
+  int spin_iters_ = kDefaultSpinIters;
 };
 
 void ShmemClientTransport::EnsureReaderStarted() {
@@ -246,10 +255,12 @@ void ShmemClientTransport::EnsureReaderStarted() {
     stop_.store(false, std::memory_order_relaxed);
     reader_ = std::thread([this] {
       ExecCtx exec_ctx;
+      // Initialize client config lazily from server's config
+      if (server_ != nullptr) spin_iters_ = server_->spin_iters();
       for (;;) {
         if (stop_.load(std::memory_order_relaxed)) break;
         grpc_shmem::Command cmd;
-        if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, 1000, &cmd)) {
+        if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, spin_iters_, &cmd)) {
           continue;
         }
         std::unique_ptr<CallHandler> handler;

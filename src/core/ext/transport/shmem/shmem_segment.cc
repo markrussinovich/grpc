@@ -14,6 +14,16 @@ constexpr const char* kC2SDataName = "grpc_shmem_c2s_data";
 constexpr const char* kS2CDataName = "grpc_shmem_s2c_data";
 }  // namespace
 
+static std::string WithPidSuffix(const std::string& name) {
+	std::string pid = std::to_string(getpid());
+	std::string suffix = std::string("_") + pid;
+	if (name.size() >= suffix.size() + 1 &&
+			name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+		return name;  // already suffixed
+	}
+	return name + suffix;
+}
+
 void ShmemSegment::InitQueues(bip::managed_shared_memory& seg, ControlBlock* cb,
 															std::size_t data_ring_capacity) {
 	// Construct ShmemQueues for each direction
@@ -40,15 +50,16 @@ void ShmemSegment::InitQueues(bip::managed_shared_memory& seg, ControlBlock* cb,
 }
 
 void ShmemSegment::RemoveIfExists(const std::string& name) {
-	// Use a process-local suffix to avoid different processes/tests deleting each
-	// others segments when they pick common names.
-	std::string local = name + "_" + std::to_string(getpid());
+	// Remove both the raw name and the pid-suffixed variant to be robust across
+	// callers that may or may not have added the suffix already.
+	bip::shared_memory_object::remove(name.c_str());
+	std::string local = WithPidSuffix(name);
 	bip::shared_memory_object::remove(local.c_str());
 }
 
 ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
 	// Create a process-local named segment to avoid collisions between tests.
-	std::string local = cfg.name + "_" + std::to_string(getpid());
+		std::string local = WithPidSuffix(cfg.name);
 	// Create managed shared memory
 	auto seg = std::make_unique<bip::managed_shared_memory>(bip::create_only, local.c_str(), cfg.size);
 
@@ -67,7 +78,7 @@ ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
 }
 
 ShmemSegment ShmemSegment::Open(const std::string& name) {
-	std::string local = name + "_" + std::to_string(getpid());
+		std::string local = WithPidSuffix(name);
 	auto seg = std::make_unique<bip::managed_shared_memory>(bip::open_only, local.c_str());
 
 	auto res = seg->find<ControlBlock>(kControlBlockName);
