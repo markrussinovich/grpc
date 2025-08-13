@@ -224,6 +224,18 @@ grpc_cc_test(
 )
 
 grpc_cc_test(
+    name = "shmem_structs_test",
+    srcs = ["shmem_structs_test.cc"],
+    external_deps = [
+        "gtest",
+    ],
+    deps = [
+        "//:grpc_transport_shmem",
+        "//test/core/test_util:grpc_test_util",
+    ],
+)
+
+grpc_cc_test(
     name = "shmem_framer_test",
     srcs = ["shmem_framer_test.cc"],
     external_deps = [

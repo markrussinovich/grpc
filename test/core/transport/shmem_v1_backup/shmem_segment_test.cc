@@ -22,7 +22,7 @@ TEST(ShmemSegmentTest, CreateOpenAndVerify) {
   const std::string name = "grpc_shmem_test_segment";
   ShmemSegment::RemoveIfExists(name);
 
-  SegmentConfig cfg{.name = name, .size = 4 * 1024 * 1024, .data_ring_capacity = 64 * 1024};
+  SegmentConfig cfg{.name = name, .size = 4 * 1024 * 1024, .queue_capacity = 64 * 1024};
   auto server = ShmemSegment::Create(cfg);
   auto* cb = server.control();
   ASSERT_NE(cb, nullptr);
@@ -30,12 +30,12 @@ TEST(ShmemSegmentTest, CreateOpenAndVerify) {
   EXPECT_EQ(cb->transport_version, kVersion);
   EXPECT_EQ(cb->server_state.load(), 1u);
   EXPECT_EQ(cb->client_state.load(), 0u);
-  ASSERT_NE(cb->c2s_queues.get(), nullptr);
-  ASSERT_NE(cb->s2c_queues.get(), nullptr);
-  EXPECT_EQ(cb->c2s_queues->data_rb.capacity, cfg.data_ring_capacity);
-  EXPECT_EQ(cb->s2c_queues->data_rb.capacity, cfg.data_ring_capacity);
-  ASSERT_NE(cb->c2s_queues->data_rb.buffer.get(), nullptr);
-  ASSERT_NE(cb->s2c_queues->data_rb.buffer.get(), nullptr);
+  ASSERT_NE(cb->c2s_queue.get(), nullptr);
+  ASSERT_NE(cb->s2c_queue.get(), nullptr);
+  EXPECT_EQ(cb->c2s_queue->capacity, cfg.queue_capacity);
+  EXPECT_EQ(cb->s2c_queue->capacity, cfg.queue_capacity);
+  ASSERT_NE(cb->c2s_queue->buffer.get(), nullptr);
+  ASSERT_NE(cb->s2c_queue->buffer.get(), nullptr);
 
   // Open client view
   auto client = ShmemSegment::Open(name);

@@ -13,20 +13,18 @@
 // limitations under the License.
 
 #include "src/core/ext/transport/shmem/shmem_memory.h"
-#include "src/core/ext/transport/shmem/shmem_transport.h"
 
 #include <gtest/gtest.h>
 
 namespace grpc_shmem {
 
 TEST(ShmemMemoryTest, ControlBlockDefaults) {
-  // ControlBlock is defined in shmem_transport.h
-  grpc_shmem::ControlBlock cb;
+  ControlBlock cb;
   EXPECT_EQ(cb.transport_version, 1u);
   EXPECT_EQ(cb.server_state.load(), 0u);
   EXPECT_EQ(cb.client_state.load(), 0u);
-  EXPECT_EQ(cb.c2s_queues.get(), nullptr);
-  EXPECT_EQ(cb.s2c_queues.get(), nullptr);
+  EXPECT_EQ(cb.c2s_queue.get(), nullptr);
+  EXPECT_EQ(cb.s2c_queue.get(), nullptr);
 }
 
 TEST(ShmemMemoryTest, RingBufferPointersAdvance) {

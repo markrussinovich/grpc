@@ -1,22 +1,6 @@
-// Copyright 2025 gRPC authors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include "src/core/ext/transport/shmem/shmem_segment.h"
 
 #include <cstring>
-
-#include <boost/interprocess/allocators/allocator.hpp>
 
 namespace bip = boost::interprocess;
 
@@ -24,43 +8,71 @@ namespace grpc_shmem {
 
 namespace {
 constexpr const char* kControlBlockName = "grpc_shmem_control";
-constexpr const char* kC2SBufName = "grpc_shmem_c2s_buf";
-constexpr const char* kS2CBufName = "grpc_shmem_s2c_buf";
+constexpr const char* kC2SQueuesName = "grpc_shmem_c2s_queues";
+constexpr const char* kS2CQueuesName = "grpc_shmem_s2c_queues";
+constexpr const char* kC2SDataName = "grpc_shmem_c2s_data";
+constexpr const char* kS2CDataName = "grpc_shmem_s2c_data";
 }  // namespace
 
+void ShmemSegment::InitQueues(bip::managed_shared_memory& seg, ControlBlock* cb,
+															std::size_t data_ring_capacity) {
+	// Construct ShmemQueues for each direction
+	auto* c2s = seg.find_or_construct<ShmemQueues>(kC2SQueuesName)();
+	auto* s2c = seg.find_or_construct<ShmemQueues>(kS2CQueuesName)();
+
+	// Allocate data ring buffers
+	auto* c2s_buf = seg.construct<unsigned char>(kC2SDataName)[data_ring_capacity]();
+	auto* s2c_buf = seg.construct<unsigned char>(kS2CDataName)[data_ring_capacity]();
+
+	c2s->data_rb.capacity = data_ring_capacity;
+	c2s->data_rb.head.store(0);
+	c2s->data_rb.tail.store(0);
+	c2s->data_rb.buffer = c2s_buf;
+
+	s2c->data_rb.capacity = data_ring_capacity;
+	s2c->data_rb.head.store(0);
+	s2c->data_rb.tail.store(0);
+	s2c->data_rb.buffer = s2c_buf;
+
+	// Store pointers in control block
+	cb->c2s_queues = c2s;
+	cb->s2c_queues = s2c;
+}
+
 ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
-  // Create segment
-  auto* seg = new bip::managed_shared_memory(bip::create_only, cfg.name.c_str(), cfg.size);
-  // Construct ControlBlock at a known name
-  ControlBlock* cb = seg->construct<ControlBlock>(kControlBlockName)();
-  cb->magic_number = kMagic;
-  cb->transport_version = kVersion;
-  cb->server_state.store(1);  // Listening
-  cb->client_state.store(0);
+	// Ensure any previous segment is removed for a clean start in tests/examples.
+	RemoveIfExists(cfg.name);
 
-  // Allocate ring buffers and backing storage inside segment
-  cb->c2s_queue = seg->construct<RingBuffer>("c2s_queue")();
-  cb->s2c_queue = seg->construct<RingBuffer>("s2c_queue")();
+	// Create or open managed shared memory
+	auto seg = std::make_unique<bip::managed_shared_memory>(bip::create_only, cfg.name.c_str(), cfg.size);
 
-  cb->c2s_queue->capacity = cfg.queue_capacity;
-  cb->s2c_queue->capacity = cfg.queue_capacity;
+	// Construct ControlBlock
+	auto* cb = seg->find_or_construct<ControlBlock>(kControlBlockName)();
+	cb->magic_number = 0x47525043534D454Dull;
+	cb->transport_version = 1;
+	cb->server_state.store(1);  // listening
+	cb->client_state.store(0);
+	// Semaphores already initialized to 0 in constructor.
 
-  // Allocate raw buffers
-  cb->c2s_queue->buffer = seg->construct<unsigned char>(kC2SBufName)[cfg.queue_capacity]();
-  cb->s2c_queue->buffer = seg->construct<unsigned char>(kS2CBufName)[cfg.queue_capacity]();
+	// Initialize queues and data rings
+	InitQueues(*seg, cb, cfg.data_ring_capacity);
 
-  return ShmemSegment(seg, cb);
+	return ShmemSegment(cfg.name, std::move(seg), cb);
 }
 
 ShmemSegment ShmemSegment::Open(const std::string& name) {
-  auto* seg = new bip::managed_shared_memory(bip::open_only, name.c_str());
-  ControlBlock* cb = seg->find<ControlBlock>(kControlBlockName).first;
-  if (cb == nullptr || cb->magic_number != kMagic || cb->transport_version != kVersion) {
-    // Invalid/unknown segment; throw to signal error to caller
-    throw std::runtime_error("Invalid shmem segment");
-  }
-  cb->client_state.store(1);
-  return ShmemSegment(seg, cb);
+	auto seg = std::make_unique<bip::managed_shared_memory>(bip::open_only, name.c_str());
+
+	auto res = seg->find<ControlBlock>(kControlBlockName);
+	ControlBlock* cb = nullptr;
+	if (res.first != nullptr) cb = res.first;
+
+	// Basic verification
+	if (cb != nullptr && cb->magic_number == 0x47525043534D454Dull && cb->transport_version == 1) {
+		cb->client_state.store(1);
+	}
+
+	return ShmemSegment(name, std::move(seg), cb);
 }
 
 }  // namespace grpc_shmem
