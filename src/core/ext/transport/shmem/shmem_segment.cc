@@ -1,6 +1,7 @@
 #include "src/core/ext/transport/shmem/shmem_segment.h"
 
 #include <cstring>
+#include <unistd.h>
 
 namespace bip = boost::interprocess;
 
@@ -60,8 +61,16 @@ void ShmemSegment::RemoveIfExists(const std::string& name) {
 ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
 	// Create a process-local named segment to avoid collisions between tests.
 		std::string local = WithPidSuffix(cfg.name);
-	// Create managed shared memory
-	auto seg = std::make_unique<bip::managed_shared_memory>(bip::create_only, local.c_str(), cfg.size);
+	// Create managed shared memory; if it already exists (leaked from a crash),
+	// remove and retry once.
+	std::unique_ptr<bip::managed_shared_memory> seg;
+	try {
+		seg = std::make_unique<bip::managed_shared_memory>(bip::create_only, local.c_str(), cfg.size);
+	} catch (const bip::interprocess_exception&) {
+		// Best-effort cleanup then retry
+		bip::shared_memory_object::remove(local.c_str());
+		seg = std::make_unique<bip::managed_shared_memory>(bip::create_only, local.c_str(), cfg.size);
+	}
 
 	// Construct ControlBlock
 	auto* cb = seg->find_or_construct<ControlBlock>(kControlBlockName)();

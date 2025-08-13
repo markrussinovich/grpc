@@ -39,8 +39,12 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset) 
 }
 
 static inline void Post(ControlBlock* cb, Direction dir) {
-	if (dir == Direction::kC2S) cb->c2s_sem.post();
-	else cb->s2c_sem.post();
+	if (dir == Direction::kC2S) {
+		// Only post if a consumer is actually waiting.
+		if (cb->c2s_waiters.load(std::memory_order_acquire)) cb->c2s_sem.post();
+	} else {
+		if (cb->s2c_waiters.load(std::memory_order_acquire)) cb->s2c_sem.post();
+	}
 }
 
 static inline void Wait(ControlBlock* cb, Direction dir) {
@@ -71,8 +75,20 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir, int spin_
 			return true;
 		}
 	}
+	// Declare intent to sleep, then re-check before actually sleeping to avoid lost wakeups
+	if (dir == Direction::kC2S) cb->c2s_waiters.store(1, std::memory_order_release);
+	else cb->s2c_waiters.store(1, std::memory_order_release);
+	// One last check after setting waiters flag
+	if (q->command_q.pop(tmp)) {
+		*out = tmp;
+		if (dir == Direction::kC2S) cb->c2s_waiters.store(0, std::memory_order_release);
+		else cb->s2c_waiters.store(0, std::memory_order_release);
+		return true;
+	}
 	// Sleep until woken up by producer
 	Wait(cb, dir);
+	if (dir == Direction::kC2S) cb->c2s_waiters.store(0, std::memory_order_release);
+	else cb->s2c_waiters.store(0, std::memory_order_release);
 	// Upon wake, try again (one attempt)
 	if (q->command_q.pop(tmp)) {
 		*out = tmp;

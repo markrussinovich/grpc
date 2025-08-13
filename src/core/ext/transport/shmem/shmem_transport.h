@@ -46,6 +46,10 @@ struct ControlBlock {
   // from empty to non-empty.
   boost::interprocess::interprocess_semaphore c2s_sem;
   boost::interprocess::interprocess_semaphore s2c_sem;
+  // Set by the consumer just before sleeping; producers check this to avoid
+  // spurious posts. 0 = not waiting, 1 = waiting.
+  std::atomic<uint32_t> c2s_waiters{0};
+  std::atomic<uint32_t> s2c_waiters{0};
 
   // --- Pointers to the new queue structures ---
   boost::interprocess::offset_ptr<ShmemQueues> c2s_queues;
@@ -59,6 +63,8 @@ struct ControlBlock {
         client_state(0),
         c2s_sem(0),
         s2c_sem(0),
+  c2s_waiters(0),
+  s2c_waiters(0),
         c2s_queues(nullptr),
         s2c_queues(nullptr) {}
 };

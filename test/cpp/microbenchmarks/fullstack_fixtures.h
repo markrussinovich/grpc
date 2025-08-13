@@ -170,6 +170,8 @@ class ShmemTransport : public BaseFixture {
                          const FixtureConfiguration& fixture_configuration =
                              FixtureConfiguration()) {
     ServerBuilder b;
+  // Ensure the server uses the v3 (promise) stack which our shmem transport implements
+  b.AddChannelArgument(GRPC_ARG_USE_V3_STACK, 1);
     cq_ = b.AddCompletionQueue(true);
     b.RegisterService(service);
     fixture_configuration.ApplyCommonServerBuilderConfig(&b);
