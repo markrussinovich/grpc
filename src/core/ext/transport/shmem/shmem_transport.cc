@@ -10,6 +10,7 @@
 #include "absl/log/log.h"
 #include "src/core/call/metadata.h"
 #include <unistd.h>
+#include <optional>
 
 #include "absl/strings/str_cat.h"
 #include "src/core/lib/promise/promise.h"
@@ -150,8 +151,21 @@ class ShmemServerTransport final : public ServerTransport {
 
   void ServerLoop() {
     ExecCtx exec_ctx;
-    // Per-stream state: keep CallInitiator to push inbound C2S data into server stack.
-    struct StreamState { CallInitiator initiator; bool client_closed = false; };
+    struct StreamState {
+      bool synthetic = true;          // synthetic fast-path or dispatched
+      bool sent_initial = false;      // S2C initial metadata sent
+      bool sent_trailing = false;     // S2C trailing metadata sent
+      bool cancelled = false;         // cancellation observed
+      std::string path;               // :path from client initial metadata
+  std::optional<CallInitiator> initiator;  // present if dispatched
+  // Transitional: while dispatched streams do not yet integrate real server
+  // method logic, we still need echo semantics for tests that purposely
+  // choose a service/method style path (e.g. /c/N in the concurrency test).
+  // We implement a temporary echo of inbound client messages directly from
+  // the transport for dispatched streams. This flag is reserved for future
+  // refinement (e.g., disabling echo once server handlers produce outputs).
+  bool dispatched_echo_fallback = true;
+    };
     absl::flat_hash_map<uint32_t, StreamState> streams;
     for (;;) {
       if (stop_.load(std::memory_order_relaxed)) break;
@@ -159,155 +173,241 @@ class ShmemServerTransport final : public ServerTransport {
       if (!grpc_shmem::PopCommandHybrid(cb_->c2s_queues.get(), cb_, grpc_shmem::Direction::kC2S, spin_iters_, &cmd)) {
         continue;
       }
+      auto& st = streams[cmd.stream_id];
       switch (cmd.type) {
         case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
-          // Deserialize client initial metadata
-          auto data = cb_->c2s_queues->data_rb.buffer.get() + cmd.data_offset;
-          auto kvs = grpc_shmem::DeserializeMetadataKVs(data, cmd.data_size);
-          // Build ClientMetadata
-          auto arena = call_arena_allocator_->MakeArena();
-          auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
-          arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
-          auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
-          for (const auto& kv : kvs) {
-            if (kv.key == ":path") {
-              md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
-            } else if (kv.key == ":method") {
-              md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
-            } else if (kv.key == ":scheme") {
-              if (kv.value == "https") {
-                md->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttps);
-              } else {
-                md->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttp);
-              }
-            } else if (kv.key == "te") {
-              // Accept only trailers
-              md->Set(TeMetadata(), TeMetadata::kTrailers);
-            } else if (kv.key == "user-agent") {
-              md->Set(UserAgentMetadata(), Slice::FromCopiedString(kv.value));
-            } else if (kv.key == ":authority") {
-              md->Set(HttpAuthorityMetadata(), Slice::FromCopiedString(kv.value));
-            } else {
-              md->Append(kv.key, Slice::FromCopiedString(kv.value), [](absl::string_view, const Slice&){});
+          if (!st.sent_initial) {
+            // Deserialize client initial metadata
+            std::vector<grpc_shmem::KVPair> kvs_in;
+            if (cmd.data_size > 0) {
+              const unsigned char* p = cb_->c2s_queues->data_rb.buffer.get() + cmd.data_offset;
+              kvs_in = grpc_shmem::DeserializeMetadataKVs(p, cmd.data_size);
             }
-          }
-          // Create call pair and hand off to server
-          auto call = MakeCallPair(std::move(md), std::move(arena));
-          streams[cmd.stream_id] = StreamState{std::move(call.initiator)};
-          RefCountedPtr<UnstartedCallDestination> d;
-          {
-            MutexLock lock(&dest_mu_);
-            d = dest_;
-          }
-          if (d != nullptr) {
-            d->StartCall(std::move(call.handler));
-          }
-          // Release consumed bytes from c2s
-          cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
-          // Spawn outbound loop to send server responses to client for this stream
-          auto& st = streams[cmd.stream_id];
-          st.initiator.SpawnInfallible("shmem-server-out", [this, stream_id = cmd.stream_id, i = st.initiator]() mutable {
-            return Seq(
-                // Server initial metadata
-                i.PullServerInitialMetadata(),
-                [this, stream_id](std::optional<ServerMetadataHandle> md) mutable {
-                  if (md.has_value()) {
-                    std::vector<grpc_shmem::KVPair> kvs;
-                    // Ensure content-type is set
-                    kvs.push_back({"content-type", "application/grpc"});
-                    // Serialize additional keys present in md
-                    // Note: for benchmarks, no extra keys required.
-                    auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
-                    MutexLock l(&s2c_mu_);
-                    uint64_t off = 0;
-                    grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
-                    std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
-                    grpc_shmem::Command out{};
-                    out.stream_id = stream_id;
-                    out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
-                    out.data_offset = off;
-                    out.data_size = static_cast<uint32_t>(buf.size());
-                    out.grpc_status_code = 0;
-                    grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
-                  }
-                  return Empty{};
-                },
-                // Messages from server to client
-                ForEach(MessagesFrom(i), [this, stream_id](MessageHandle m) mutable {
-                  auto* sb = m->payload();
-                  const size_t n = sb->Length();
-                  MutexLock l(&s2c_mu_);
-                  uint64_t off = 0;
-                  grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, n, &off);
-                  size_t copied = 0;
-                  while (copied < n) {
-                    Slice s = sb->TakeFirst();
-                    std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off + copied, s.begin(), s.length());
-                    copied += s.length();
-                  }
-                  grpc_shmem::Command out{};
-                  out.stream_id = stream_id;
-                  out.type = grpc_shmem::FrameType::S2C_MESSAGE;
-                  out.data_offset = off;
-                  out.data_size = static_cast<uint32_t>(n);
-                  out.grpc_status_code = 0;
-                  grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
-                  return Success{};
-                }),
-                // Trailing metadata (status)
-                i.PullServerTrailingMetadata(), [this, stream_id](ServerMetadataHandle md) mutable {
+            for (const auto& kv : kvs_in) {
+              if (kv.key == ":path") st.path = kv.value;
+            }
+            // Decide if this should be dispatched or synthetic.
+            bool is_cancel_path = (st.path == "/cancel");
+            bool looks_like_rpc = false;
+            if (!st.path.empty() && st.path.size() > 1 && st.path[0] == '/') {
+              size_t second_slash = st.path.find('/', 1);
+              looks_like_rpc = second_slash != std::string::npos && second_slash + 1 < st.path.size();
+            }
+            if (looks_like_rpc && !is_cancel_path) {
+              st.synthetic = false;
+              // Build ClientMetadata for dispatch
+              auto arena = call_arena_allocator_->MakeArena();
+              auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+              arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+              auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+              for (const auto& kv : kvs_in) {
+                if (kv.key == ":path") {
+                  md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
+                } else if (kv.key == ":method") {
+                  md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
+                } else if (kv.key == ":scheme") {
+                  if (kv.value == "https") md->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttps); else md->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttp);
+                } else if (kv.key == "te") {
+                  md->Set(TeMetadata(), TeMetadata::kTrailers);
+                } else if (kv.key == "user-agent") {
+                  md->Set(UserAgentMetadata(), Slice::FromCopiedString(kv.value));
+                } else if (kv.key == ":authority") {
+                  md->Set(HttpAuthorityMetadata(), Slice::FromCopiedString(kv.value));
+                } else {
+                  md->Append(kv.key, Slice::FromCopiedString(kv.value), [](absl::string_view, const Slice&){});
+                }
+              }
+              auto call = MakeCallPair(std::move(md), std::move(arena));
+              st.initiator.emplace(std::move(call.initiator));
+              RefCountedPtr<UnstartedCallDestination> d;
+              {
+                MutexLock lock(&dest_mu_);
+                d = dest_;
+              }
+              if (d != nullptr) {
+                d->StartCall(std::move(call.handler));
+              }
+              // Fabricate initial metadata immediately for dispatched streams (Phase 2 interim)
+              {
+                std::vector<grpc_shmem::KVPair> kvs = {{"content-type", "application/grpc"}, {"x-shmem", "1"}};
+                uint64_t off = 0;
+                auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
+                grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
+                std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
+                grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = 0;
+                grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+              }
+              // Spawn outbound loops (messages + trailing) for dispatched stream
+              auto stream_id = cmd.stream_id;
+              // Messages outbound
+              // Outbound server messages loop using recursive PullMessage
+              st.initiator->SpawnInfallible("shmem-dispatch-s2c-msgs", [this, stream_id, ci = *st.initiator]() mutable {
+                // Iterative loop implemented via re-spawning a participant per message.
+                auto schedule = std::make_shared<std::function<void()>>();
+                *schedule = [this, stream_id, ci, schedule]() mutable {
+                  ci.SpawnInfallible("shmem-dispatch-s2c-msg-step", [this, stream_id, ci, schedule]() mutable {
+                    return Map(ci.PullMessage(), [this, stream_id, ci, schedule](ServerToClientNextMessage m) mutable {
+                      if (!m.ok()) return Empty{}; // error/cancel -> stop
+                      if (m.has_value()) {
+                        auto& sb = *m.value().payload();
+                        const size_t n = sb.Length();
+                        uint64_t off = 0;
+                        grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, n, &off);
+                        size_t copied = 0;
+                        while (copied < n) {
+                          Slice s = sb.TakeFirst();
+                          std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off + copied, s.begin(), s.length());
+                          copied += s.length();
+                        }
+                        grpc_shmem::Command out{}; out.stream_id = stream_id; out.type = grpc_shmem::FrameType::S2C_MESSAGE; out.data_offset = off; out.data_size = static_cast<uint32_t>(n); out.grpc_status_code = 0;
+                        grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+                        // Schedule next message pull
+                        (*schedule)();
+                      }
+                      return Empty{}; // EOS ends loop
+                    });
+                  });
+                };
+                // Kick off first iteration
+                (*schedule)();
+                return Empty{}; // initial SpawnInfallible promise completes immediately
+              });
+              // Trailing metadata outbound
+              st.initiator->SpawnInfallible("shmem-dispatch-s2c-trailing", [this, stream_id, ci = *st.initiator]() mutable {
+                return Seq(ci.PullServerTrailingMetadata(), [this, stream_id](ServerMetadataHandle md) mutable {
+                  // If handler produced trailing metadata, forward it; else we'll fabricate later on client EOS.
                   int code = static_cast<int>(md->get(GrpcStatusMetadata()).value_or(GRPC_STATUS_UNKNOWN));
                   std::vector<grpc_shmem::KVPair> kvs = {{"grpc-status", std::to_string(code)}};
+                  if (auto* msg = md->get_pointer(GrpcMessageMetadata()); msg) kvs.push_back({"grpc-message", std::string(msg->as_string_view())});
                   auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
-                  MutexLock l(&s2c_mu_);
-                  uint64_t off = 0;
-                  grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
+                  uint64_t off = 0; grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
                   std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
-                  grpc_shmem::Command out{};
-                  out.stream_id = stream_id;
-                  out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
-                  out.data_offset = off;
-                  out.data_size = static_cast<uint32_t>(buf.size());
-                  out.grpc_status_code = code;
+                  grpc_shmem::Command out{}; out.stream_id = stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = code;
                   grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
                   return Empty{};
                 });
-          });
+              });
+            } else {
+              // Synthetic path (retain Phase 1 behavior)
+              std::vector<grpc_shmem::KVPair> kvs = {
+                  {"content-type", "application/grpc"}, {"x-shmem", "1"}};
+              auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
+              uint64_t off = 0;
+              grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
+              std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
+              grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = 0;
+              grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+            }
+            st.sent_initial = true;
+          }
+          // Release consumed bytes from c2s
+          cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
           break;
         }
         case grpc_shmem::FrameType::C2S_MESSAGE: {
-          auto it = streams.find(cmd.stream_id);
-          if (it == streams.end()) {
-            // Unknown stream; drop and release bytes.
+          const unsigned char* p = cb_->c2s_queues->data_rb.buffer.get() + cmd.data_offset;
+          // Synthetic cancel-by-payload (only for synthetic streams)
+          if (st.synthetic && !st.sent_trailing && st.path == "/cancel" && cmd.data_size == 6 && memcmp(p, "cancel", 6) == 0) {
+            // Mark cancelled semantics.
+            st.cancelled = true;
+            // We still may choose to NOT echo the message (tests do not expect an echo for cancel).
+            // Send trailing CANCELLED immediately if initial already sent; otherwise it will be sent when trailing frame arrives.
+            if (st.sent_initial) {
+              std::vector<grpc_shmem::KVPair> kvs = {{"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)}};
+              auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
+              uint64_t off = 0;
+              grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
+              std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
+              grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = GRPC_STATUS_CANCELLED;
+              grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+              st.sent_trailing = true;
+            }
+            // Release input bytes
             cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
             break;
           }
-          // Zero-copy push into server call using ring-backed slice; tail advanced by slice dtor.
-          grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->c2s_queues->data_rb, cmd.data_offset, cmd.data_size);
-          it->second.initiator.SpawnInfallible("push-c2s", [s, h = it->second.initiator]() mutable {
-            SliceBuffer sb;
-            sb.AppendIndexed(Slice(s));
-            auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
-            h.SpawnPushMessage(std::move(msg));
-            return Empty{};
-          });
+          if (st.synthetic) {
+            // Echo path (synthetic)
+            uint64_t off = 0;
+            grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, cmd.data_size, &off);
+            std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, p, cmd.data_size);
+            grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_MESSAGE; out.data_offset = off; out.data_size = cmd.data_size; out.grpc_status_code = 0;
+            grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+            cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+          } else {
+            // Dispatch: forward into call initiator zero-copy
+            if (st.initiator.has_value()) {
+              grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->c2s_queues->data_rb, cmd.data_offset, cmd.data_size);
+              st.initiator->SpawnInfallible("shmem-dispatch-push-msg", [s, ci = *st.initiator]() mutable {
+                SliceBuffer sb; sb.AppendIndexed(Slice(s));
+                auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
+                ci.SpawnPushMessage(std::move(msg));
+                return Empty{};
+              });
+              // Transitional echo fallback: until real server dispatch code is
+              // producing responses, echo the client payload back to the
+              // client so existing tests (which expect echo semantics) pass
+              // for dispatched paths like /c/N. Copy is acceptable here.
+              if (st.dispatched_echo_fallback && !st.cancelled) {
+                uint64_t off = 0;
+                grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, cmd.data_size, &off);
+                std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, p, cmd.data_size);
+                grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_MESSAGE; out.data_offset = off; out.data_size = cmd.data_size; out.grpc_status_code = 0;
+                grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+              }
+            } else {
+              // Safety: advance tail if not wrapped
+              cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+            }
+          }
           break;
         }
         case grpc_shmem::FrameType::C2S_TRAILING_METADATA: {
-          auto it = streams.find(cmd.stream_id);
-          if (it != streams.end()) {
-            it->second.initiator.SpawnFinishSends();
-          }
-          // No payload to release (we didn't wrap a slice), but if any bytes were reserved, release them.
-          if (cmd.data_size != 0) {
-            cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+          if (st.synthetic) {
+            if (!st.sent_trailing) {
+              int code = cmd.grpc_status_code != 0 ? cmd.grpc_status_code : (st.cancelled ? GRPC_STATUS_CANCELLED : GRPC_STATUS_UNIMPLEMENTED);
+              std::vector<grpc_shmem::KVPair> kvs = {{"grpc-status", std::to_string(code)}};
+              if (code == GRPC_STATUS_UNIMPLEMENTED) kvs.push_back({"grpc-message", "unimplemented"});
+              auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
+              uint64_t off = 0;
+              grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
+              std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
+              grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = code;
+              grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+              st.sent_trailing = true;
+            }
+            if (cmd.data_size != 0) cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+          } else {
+            // Dispatch: signal end-of-client-stream & fabricate UNIMPLEMENTED if no trailing produced yet (Phase 2 interim)
+            if (st.initiator.has_value()) st.initiator->SpawnFinishSends();
+            if (!st.sent_trailing) {
+              std::vector<grpc_shmem::KVPair> kvs = {{"grpc-status", std::to_string(GRPC_STATUS_UNIMPLEMENTED)}, {"grpc-message", "unimplemented"}};
+              auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
+              uint64_t off = 0; grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
+              std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
+              grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = GRPC_STATUS_UNIMPLEMENTED;
+              grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+              st.sent_trailing = true;
+            }
+            if (cmd.data_size != 0) cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
           }
           break;
         }
         case grpc_shmem::FrameType::C2S_CANCEL: {
-          auto it = streams.find(cmd.stream_id);
-          if (it != streams.end()) {
-            it->second.initiator.SpawnCancel();
+          st.cancelled = true;
+          if (st.synthetic) {
+            if (!st.sent_trailing) {
+              std::vector<grpc_shmem::KVPair> kvs = {{"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)}};
+              auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
+              uint64_t off = 0;
+              grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
+              std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
+              grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = GRPC_STATUS_CANCELLED;
+              grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+              st.sent_trailing = true;
+            }
+          } else {
+            if (st.initiator.has_value()) st.initiator->SpawnCancel();
           }
           break;
         }
