@@ -285,6 +285,7 @@ grpc_cc_benchmark(
     srcs = [
         "bm_fullstack_unary_ping_pong.cc",
     ],
+    copts = ["-fsanitize=address","-O1","-fno-omit-frame-pointer","-g"],
     deps = [":fullstack_unary_ping_pong_h"],
 )
 
