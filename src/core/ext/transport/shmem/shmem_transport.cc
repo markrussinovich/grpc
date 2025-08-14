@@ -2,9 +2,12 @@
 #include "src/core/ext/transport/shmem/shmem_transport.h"
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unordered_set>
+#include <algorithm>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
@@ -13,6 +16,7 @@
 #include <optional>
 
 #include "absl/strings/str_cat.h"
+#include "grpc/support/log.h"
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/promise/map.h"
 #include "src/core/lib/promise/try_seq.h"
@@ -155,6 +159,7 @@ class ShmemServerTransport final : public ServerTransport {
       bool synthetic = true;          // synthetic fast-path or dispatched
       bool sent_initial = false;      // S2C initial metadata sent
       bool sent_trailing = false;     // S2C trailing metadata sent
+      bool completed = false;         // stream fully complete, ready for cleanup
       bool cancelled = false;         // cancellation observed
       std::string path;               // :path from client initial metadata
   std::optional<CallInitiator> initiator;  // present if dispatched
@@ -180,7 +185,12 @@ class ShmemServerTransport final : public ServerTransport {
     
   // Stage 1: Helper to announce dispatched unary call when both initial + message ready
   auto announce_dispatched_call = [this](uint32_t stream_id, StreamState& st) {
-    if (!st.dispatched_unary || st.dispatched_unary->call_announced) return;
+    if (!st.dispatched_unary || st.dispatched_unary->call_announced) {
+      if (st.dispatched_unary && st.dispatched_unary->call_announced) {
+        LOG(INFO) << "Skipping stream " << stream_id << " - call already announced (stale state?)";
+      }
+      return;
+    }
     
     // Build ClientMetadata for dispatch
     auto arena = call_arena_allocator_->MakeArena();
@@ -277,7 +287,9 @@ class ShmemServerTransport final : public ServerTransport {
     
     // Trailing metadata outbound (runs in parallel but will only complete after messages)
     st.initiator->SpawnInfallible("shmem-dispatch-s2c-trailing", [this, stream_id, ci = *st.initiator]() mutable {
+      LOG(INFO) << "Starting S2C trailing metadata promise for stream " << stream_id;
       return Seq(ci.PullServerTrailingMetadata(), [this, stream_id](ServerMetadataHandle md) mutable {
+        LOG(INFO) << "Sending S2C trailing metadata for stream " << stream_id;
         int code = static_cast<int>(md->get(GrpcStatusMetadata()).value_or(GRPC_STATUS_UNKNOWN));
         std::vector<grpc_shmem::KVPair> kvs = {{"grpc-status", std::to_string(code)}};
         if (auto* msg = md->get_pointer(GrpcMessageMetadata()); msg) {
@@ -289,6 +301,16 @@ class ShmemServerTransport final : public ServerTransport {
         grpc_shmem::Command out{}; out.stream_id = stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; 
         out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = code;
         grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+        
+        // Mark stream as completed - need to store this in a thread-safe way
+        // Since we can't safely access the local streams map from this async context,
+        // we'll use a separate completed streams set
+        {
+          std::lock_guard<std::mutex> lock(completed_streams_mu_);
+          completed_streams_.insert(stream_id);
+          LOG(INFO) << "Added stream " << stream_id << " to completed set";
+        }
+        
         return Empty{};
       });
     });
@@ -301,6 +323,7 @@ class ShmemServerTransport final : public ServerTransport {
         continue;
       }
       auto& st = streams[cmd.stream_id];
+      LOG(INFO) << "Processing command for stream " << cmd.stream_id << " type=" << static_cast<int>(cmd.type);
       switch (cmd.type) {
         case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
           if (!st.sent_initial) {
@@ -360,6 +383,7 @@ class ShmemServerTransport final : public ServerTransport {
               grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = GRPC_STATUS_CANCELLED;
               grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
               st.sent_trailing = true;
+              st.completed = true;  // Mark stream as completed for cleanup
             }
             // Release input bytes
             cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
@@ -381,6 +405,7 @@ class ShmemServerTransport final : public ServerTransport {
               
               // If we have both initial + message, announce the call
               if (st.dispatched_unary->have_initial) {
+                LOG(INFO) << "Announcing call for stream " << cmd.stream_id << " (have initial + message)";
                 announce_dispatched_call(cmd.stream_id, st);
               }
             }
@@ -401,6 +426,7 @@ class ShmemServerTransport final : public ServerTransport {
               grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = code;
               grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
               st.sent_trailing = true;
+              st.completed = true;  // Mark stream as completed for cleanup
             }
             if (cmd.data_size != 0) cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
           } else {
@@ -410,6 +436,7 @@ class ShmemServerTransport final : public ServerTransport {
               
               // If we have initial but no message, this is empty-unary - announce now
               if (st.dispatched_unary->have_initial && !st.dispatched_unary->have_message) {
+                LOG(INFO) << "Announcing call for stream " << cmd.stream_id << " (empty unary)";
                 announce_dispatched_call(cmd.stream_id, st);
               }
               
@@ -435,6 +462,7 @@ class ShmemServerTransport final : public ServerTransport {
               grpc_shmem::Command out{}; out.stream_id = cmd.stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = GRPC_STATUS_CANCELLED;
               grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
               st.sent_trailing = true;
+              st.completed = true;  // Mark stream as completed for cleanup
             }
           } else {
             if (st.initiator.has_value()) st.initiator->SpawnCancel();
@@ -445,6 +473,39 @@ class ShmemServerTransport final : public ServerTransport {
           break;
       }
       ExecCtx::Get()->Flush();
+      
+      // Clean up completed streams to prevent stale state accumulation
+      std::vector<uint32_t> completed_stream_ids;
+      
+      // Check local completed flags (for synchronous completion)
+      for (const auto& [stream_id, stream_state] : streams) {
+        if (stream_state.completed) {
+          completed_stream_ids.push_back(stream_id);
+        }
+      }
+      
+      // Check async completed streams (for promise-based completion)
+      {
+        std::lock_guard<std::mutex> lock(completed_streams_mu_);
+        for (uint32_t stream_id : completed_streams_) {
+          if (streams.find(stream_id) != streams.end()) {
+            completed_stream_ids.push_back(stream_id);
+          }
+        }
+        if (!completed_streams_.empty()) {
+          LOG(INFO) << "Processing " << completed_streams_.size() << " async completed streams";
+        }
+        completed_streams_.clear();  // Clear the set after processing
+      }
+      
+      // Remove duplicates and erase completed streams
+      std::sort(completed_stream_ids.begin(), completed_stream_ids.end());
+      completed_stream_ids.erase(std::unique(completed_stream_ids.begin(), completed_stream_ids.end()), 
+                                completed_stream_ids.end());
+      
+      for (uint32_t stream_id : completed_stream_ids) {
+        streams.erase(stream_id);
+      }
     }
   }
 
@@ -459,6 +520,9 @@ class ShmemServerTransport final : public ServerTransport {
   int spin_iters_ = kDefaultSpinIters;
   RefCountedPtr<CallArenaAllocator> call_arena_allocator_;
   Mutex s2c_mu_;
+  // Thread-safe tracking of completed streams for cleanup
+  std::mutex completed_streams_mu_;
+  std::unordered_set<uint32_t> completed_streams_;
   // Hold a fallback resource quota if one was needed, to keep it alive.
   ResourceQuotaRefPtr fallback_rq_;
 };
