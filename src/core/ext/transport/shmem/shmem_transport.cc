@@ -452,6 +452,7 @@ class ShmemServerTransport final : public ServerTransport {
   grpc_shmem::ControlBlock* cb_ = nullptr;
   RefCountedPtr<UnstartedCallDestination> dest_;
   Mutex dest_mu_;
+  Mutex stream_mu_;  // protects streams hash map
   std::thread reader_;
   std::atomic<bool> stop_{false};
   std::atomic<bool> reader_started_{false};
