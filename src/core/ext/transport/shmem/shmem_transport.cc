@@ -217,6 +217,20 @@ class ShmemServerTransport final : public ServerTransport {
     }
     auto call = MakeCallPair(std::move(md), std::move(arena));
     st.initiator.emplace(std::move(call.initiator));
+    
+    // CRITICAL FIX: Push buffered message BEFORE starting the call
+    // This ensures the message is in the pipeline when the service handler is invoked
+    if (st.dispatched_unary->have_message) {
+      grpc_slice s = grpc_slice_from_copied_buffer(st.dispatched_unary->request_payload.data(), 
+                                                   st.dispatched_unary->request_payload.size());
+      SliceBuffer sb; sb.AppendIndexed(Slice(s));
+      auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
+      st.initiator->SpawnPushMessage(std::move(msg));
+    }
+    
+    // Finish the client stream immediately since unary calls don't send additional messages
+    st.initiator->SpawnFinishSends();
+    
     RefCountedPtr<UnstartedCallDestination> d;
     {
       MutexLock lock(&dest_mu_);
@@ -226,18 +240,6 @@ class ShmemServerTransport final : public ServerTransport {
       d->StartCall(std::move(call.handler));
     }
     st.dispatched_unary->call_announced = true;
-    
-    // Send buffered message if available
-    if (st.dispatched_unary->have_message) {
-      grpc_slice s = grpc_slice_from_copied_buffer(st.dispatched_unary->request_payload.data(), 
-                                                   st.dispatched_unary->request_payload.size());
-      st.initiator->SpawnInfallible("shmem-dispatch-push-buffered-msg", [s, ci = *st.initiator]() mutable {
-        SliceBuffer sb; sb.AppendIndexed(Slice(s));
-        auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
-        ci.SpawnPushMessage(std::move(msg));
-        return Empty{};
-      });
-    }
     
     // Stage 2: Send initial metadata first, then spawn outbound loops
     // This ensures initial metadata arrives before any server messages
@@ -438,12 +440,14 @@ class ShmemServerTransport final : public ServerTransport {
               if (st.dispatched_unary->have_initial && !st.dispatched_unary->have_message) {
                 LOG(INFO) << "Announcing call for stream " << cmd.stream_id << " (empty unary)";
                 announce_dispatched_call(cmd.stream_id, st);
+                
+                // For empty unary, finish sends immediately after announcement
+                if (st.initiator.has_value()) {
+                  st.initiator->SpawnFinishSends();
+                }
               }
-              
-              // Signal end-of-client-stream if call was announced
-              if (st.initiator.has_value()) {
-                st.initiator->SpawnFinishSends();
-              }
+              // Note: For regular unary calls (have_message=true), SpawnFinishSends() 
+              // is called immediately after the message push in announce_dispatched_call
             }
             
             if (cmd.data_size != 0) cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
