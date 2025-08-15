@@ -40,7 +40,8 @@ namespace {
 
 constexpr uint32_t kMaxMessageSize = 3 * 1024 * 1024;  // 3 MiB
 constexpr absl::string_view kArgShmemSpinIters = "grpc.shmem.spin_iters";
-constexpr int kDefaultSpinIters = 1000;
+constexpr absl::string_view kArgShmemDispatchOnly = "grpc.shmem.dispatch_only";
+constexpr int kDefaultSpinIters = 0;  // No spinning by default - optimize for dispatched workloads
 
 class ShmemServerTransport;
 
@@ -96,6 +97,7 @@ class ShmemServerTransport final : public ServerTransport {
       state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(), "init");
     }
     spin_iters_ = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
+    dispatch_only_ = args.GetBool(kArgShmemDispatchOnly).value_or(true);
     // Initialize call arena allocator from resource quota (or create one).
     ResourceQuota* rq = args.GetObject<ResourceQuota>();
     if (rq == nullptr) {
@@ -114,6 +116,7 @@ class ShmemServerTransport final : public ServerTransport {
       state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(), "init");
     }
     spin_iters_ = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
+    dispatch_only_ = args.GetBool(kArgShmemDispatchOnly).value_or(true);
     cb_ = segment_ ? segment_->control() : nullptr;
     // Initialize call arena allocator from resource quota (or create one).
     ResourceQuota* rq = args.GetObject<ResourceQuota>();
@@ -171,19 +174,17 @@ class ShmemServerTransport final : public ServerTransport {
 
   grpc_shmem::ControlBlock* control() const { return cb_; }
   int spin_iters() const { return spin_iters_; }
+  bool dispatch_only() const { return dispatch_only_; }
   
-  // Method to allow client to get CallInitiator for ForwardCall
-  std::optional<CallInitiator> GetCallInitiator(uint32_t stream_id);
-  
-  // In-process bootstrap entry point for dispatched RPCs
-  void AnnounceCallFromClient(uint32_t stream_id, ClientMetadataHandle md);
+  // Fast in-proc bootstrap: create server half and return initiator immediately.
+  CallInitiator AnnounceAndGetInitiator(uint32_t /*stream_id*/, ClientMetadataHandle md);
 
  private:
   ~ShmemServerTransport() override = default;
 
   void EnsureReaderStarted() {
     if (cb_ == nullptr) return;
-    if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
+    if (!dispatch_only_ && !reader_started_.exchange(true, std::memory_order_acq_rel)) {
       stop_.store(false, std::memory_order_relaxed);
       reader_ = std::thread([this] { this->ServerLoop(); });
     }
@@ -497,6 +498,7 @@ class ShmemServerTransport final : public ServerTransport {
   std::atomic<bool> stop_{false};
   std::atomic<bool> reader_started_{false};
   int spin_iters_ = kDefaultSpinIters;
+  bool dispatch_only_ = true;  // Skip ring threads for dispatch-only workloads by default
   RefCountedPtr<CallArenaAllocator> call_arena_allocator_;
   Mutex s2c_mu_;
   // Thread-safe tracking of completed streams for cleanup
@@ -536,72 +538,21 @@ class ShmemServerTransport final : public ServerTransport {
   }
 };
 
-std::optional<CallInitiator> ShmemServerTransport::GetCallInitiator(uint32_t stream_id) {
-  // Get or create synchronization structure for this stream
-  StreamSync* sync_ptr;
-  {
-    MutexLock lock(&stream_sync_mu_);
-    auto it = stream_sync_.find(stream_id);
-    if (it == stream_sync_.end()) {
-      // Create new sync structure for this stream
-      auto sync = std::make_unique<StreamSync>();
-      sync_ptr = sync.get();
-      stream_sync_[stream_id] = std::move(sync);
-    } else {
-      sync_ptr = it->second.get();
-    }
-  }
-  
-  // Block efficiently until CallInitiator is ready
-  MutexLock lock(&sync_ptr->mu);
-  while (!sync_ptr->initiator_ready) {
-    sync_ptr->cv.Wait(&sync_ptr->mu);
-  }
-  
-  // Now safely retrieve the CallInitiator
-  MutexLock initiator_lock(&stream_initiators_mu_);
-  auto it = stream_initiators_.find(stream_id);
-  if (it != stream_initiators_.end()) {
-    return it->second;
-  }
-  LOG(ERROR) << "GetCallInitiator: CallInitiator not found after signal for stream " << stream_id;
-  return std::nullopt;
-}
-
-void ShmemServerTransport::AnnounceCallFromClient(uint32_t stream_id, ClientMetadataHandle md) {
-  
+CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
+    uint32_t /*stream_id*/, ClientMetadataHandle md) {
   auto arena = call_arena_allocator_->MakeArena();
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
   arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
-
   auto call = MakeCallPair(std::move(md), std::move(arena));
-
-  {
-    MutexLock lock(&stream_initiators_mu_);
-    stream_initiators_[stream_id] = call.initiator;  // store for client lookup
-  }
-  {
-    // wake anyone waiting in GetCallInitiator(stream_id)
-    MutexLock lock(&stream_sync_mu_);
-    auto& sync = stream_sync_[stream_id];
-    if (!sync) sync = std::make_unique<StreamSync>();
-    MutexLock lk(&sync->mu);
-    sync->initiator_ready = true;
-    sync->cv.Signal();
-  }
-
   RefCountedPtr<UnstartedCallDestination> d;
-  {
-    MutexLock lock(&dest_mu_);
-    d = dest_;
-  }
-  if (d != nullptr) {
-    d->StartCall(std::move(call.handler));
-  }
+  { MutexLock lock(&dest_mu_); d = dest_; }
+  if (d != nullptr) d->StartCall(std::move(call.handler));
+  return std::move(call.initiator);
 }
 
 void ShmemClientTransport::EnsureReaderStarted() {
   if (cb_ == nullptr) return;
+  if (server_ != nullptr && server_->dispatch_only()) return;  // no S2C reader in in-proc mode
   if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
     stop_.store(false, std::memory_order_relaxed);
     reader_ = std::thread([this] {
@@ -729,18 +680,9 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                
                
                if (looks_like_rpc && !is_cancel_path) {
-                 // *** NEW: direct in-proc bootstrap (no ring) ***
-                 server_->AnnounceCallFromClient(stream_id, std::move(md));
-
-                 // Get the server-side initiator
-                 auto initiator = server_->GetCallInitiator(stream_id);
-                 if (!initiator.has_value()) {
-                   LOG(ERROR) << "Failed to get CallInitiator for stream " << stream_id;
-                   return absl::InternalError("Failed to get server CallInitiator");
-                 }
-
-                 // Wire the two halves; also erase the handler on completion
-                 ForwardCall(child_call_handler, std::move(*initiator),
+                 // *** NEW: zero-sync in-proc bootstrap ***
+                 auto initiator = server_->AnnounceAndGetInitiator(stream_id, std::move(md));
+                 ForwardCall(child_call_handler, std::move(initiator),
                              [this, stream_id](ServerMetadata&) {
                                MutexLock lock(&mu_);
                                handlers_.erase(stream_id);
