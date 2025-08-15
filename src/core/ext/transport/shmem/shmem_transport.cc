@@ -182,7 +182,8 @@ class ShmemServerTransport final : public ServerTransport {
         bool client_trailing_seen = false; // client EOS observed
         bool call_announced = false;       // StartCall invoked
         std::vector<grpc_shmem::KVPair> initial_kvs; // buffered initial kvs
-        std::string request_payload;       // buffered unary request body
+        uint64_t payload_offset = 0;       // zero-copy: ring buffer offset 
+        uint32_t payload_size = 0;         // zero-copy: payload size
       };
       std::unique_ptr<DispatchedUnaryState> dispatched_unary; // only for dispatched streams
     };
@@ -247,11 +248,14 @@ class ShmemServerTransport final : public ServerTransport {
       }
     }
     
-    // CRITICAL FIX: Push buffered message BEFORE starting the call
+    // CRITICAL FIX: Push zero-copy message BEFORE starting the call
     // This ensures the message is in the pipeline when the service handler is invoked
     if (st.dispatched_unary->have_message) {
-      grpc_slice s = grpc_slice_from_copied_buffer(st.dispatched_unary->request_payload.data(), 
-                                                   st.dispatched_unary->request_payload.size());
+      // Zero-copy: Create grpc_slice pointing directly to ring buffer
+      LOG(INFO) << "Creating zero-copy grpc_slice for " << st.dispatched_unary->payload_size << " bytes at offset " << st.dispatched_unary->payload_offset;
+      grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->c2s_queues->data_rb, 
+                                                   st.dispatched_unary->payload_offset,
+                                                   st.dispatched_unary->payload_size);
       SliceBuffer sb; sb.AppendIndexed(Slice(s));
       auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
       st.initiator->SpawnPushMessage(std::move(msg));
@@ -439,9 +443,11 @@ class ShmemServerTransport final : public ServerTransport {
             grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
             cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
           } else {
-            // Stage 1: Buffer message for dispatched unary calls
+            // Stage 1: Store ring buffer location for dispatched unary calls (zero-copy)
             if (st.dispatched_unary && !st.dispatched_unary->have_message) {
-              st.dispatched_unary->request_payload.assign(reinterpret_cast<const char*>(p), cmd.data_size);
+              LOG(INFO) << "Zero-copy: Storing payload location offset=" << cmd.data_offset << " size=" << cmd.data_size << " for stream " << cmd.stream_id;
+              st.dispatched_unary->payload_offset = cmd.data_offset;
+              st.dispatched_unary->payload_size = cmd.data_size;
               st.dispatched_unary->have_message = true;
               
               // If we have both initial + message, announce the call
@@ -449,8 +455,12 @@ class ShmemServerTransport final : public ServerTransport {
                 LOG(INFO) << "Announcing call for stream " << cmd.stream_id << " (have initial + message)";
                 announce_dispatched_call(cmd.stream_id, st);
               }
+              // NOTE: Do NOT release ring buffer tail here for dispatched calls!
+              // The MakeSliceFromRing destructor will handle tail release for zero-copy.
+            } else {
+              // For non-dispatched calls, release immediately  
+              cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
             }
-            cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
           }
           break;
         }
