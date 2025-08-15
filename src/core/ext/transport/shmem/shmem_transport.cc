@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_set>
 #include <algorithm>
+#include <optional>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
@@ -232,6 +233,18 @@ class ShmemServerTransport final : public ServerTransport {
       MutexLock lock(&stream_initiators_mu_);
       stream_initiators_[stream_id] = call.initiator;
       LOG(INFO) << "Stored CallInitiator for stream " << stream_id;
+    }
+    
+    // Signal client that CallInitiator is ready - this replaces polling with efficient blocking
+    {
+      MutexLock sync_lock(&stream_sync_mu_);
+      auto sync_it = stream_sync_.find(stream_id);
+      if (sync_it != stream_sync_.end()) {
+        MutexLock stream_lock(&sync_it->second->mu);
+        sync_it->second->initiator_ready = true;
+        sync_it->second->cv.Signal();
+        LOG(INFO) << "Signaled CallInitiator readiness for stream " << stream_id;
+      }
     }
     
     // CRITICAL FIX: Push buffered message BEFORE starting the call
@@ -553,20 +566,53 @@ class ShmemServerTransport final : public ServerTransport {
   // ForwardCall support: store CallInitiators for client access
   Mutex stream_initiators_mu_;
   absl::flat_hash_map<uint32_t, CallInitiator> stream_initiators_ ABSL_GUARDED_BY(stream_initiators_mu_);
+  
+  // Efficient signaling mechanism - per-stream synchronization
+  struct StreamSync {
+    Mutex mu;
+    CondVar cv;
+    bool initiator_ready = false;
+  };
+  Mutex stream_sync_mu_;
+  absl::flat_hash_map<uint32_t, std::unique_ptr<StreamSync>> stream_sync_ ABSL_GUARDED_BY(stream_sync_mu_);
+  
   // Hold a fallback resource quota if one was needed, to keep it alive.
   ResourceQuotaRefPtr fallback_rq_;
 };
 
 std::optional<CallInitiator> ShmemServerTransport::GetCallInitiator(uint32_t stream_id) {
-  MutexLock lock(&stream_initiators_mu_);
-  LOG(INFO) << "GetCallInitiator: Looking for stream " << stream_id << " in " << stream_initiators_.size() << " streams";
+  // Get or create synchronization structure for this stream
+  std::unique_ptr<StreamSync> sync;
+  {
+    MutexLock lock(&stream_sync_mu_);
+    auto it = stream_sync_.find(stream_id);
+    if (it == stream_sync_.end()) {
+      // Create new sync structure for this stream
+      sync = std::make_unique<StreamSync>();
+      stream_sync_[stream_id] = std::unique_ptr<StreamSync>(sync.get());
+      sync.release(); // Map now owns it
+      sync = std::unique_ptr<StreamSync>(stream_sync_[stream_id].get());
+    } else {
+      sync.reset(it->second.get());
+    }
+  }
+  
+  // Block efficiently until CallInitiator is ready
+  MutexLock lock(&sync->mu);
+  LOG(INFO) << "GetCallInitiator: Waiting for CallInitiator readiness for stream " << stream_id;
+  while (!sync->initiator_ready) {
+    sync->cv.Wait(&sync->mu);
+  }
+  LOG(INFO) << "GetCallInitiator: CallInitiator ready signal received for stream " << stream_id;
+  
+  // Now safely retrieve the CallInitiator
+  MutexLock initiator_lock(&stream_initiators_mu_);
   auto it = stream_initiators_.find(stream_id);
   if (it != stream_initiators_.end()) {
-    LOG(INFO) << "GetCallInitiator: Found stream " << stream_id << ", returning CallInitiator";
-    // Return a copy of the CallInitiator
+    LOG(INFO) << "GetCallInitiator: Found and returning CallInitiator for stream " << stream_id;
     return it->second;
   }
-  LOG(INFO) << "GetCallInitiator: Stream " << stream_id << " not found";
+  LOG(ERROR) << "GetCallInitiator: CallInitiator not found after signal for stream " << stream_id;
   return std::nullopt;
 }
 
@@ -714,22 +760,18 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                grpc_shmem::PushCommand(cb->c2s_queues.get(), cb, grpc_shmem::Direction::kC2S, trailing_cmd);
                LOG(INFO) << "Client sent trailing metadata for stream " << stream_id << " (empty unary)";
                
-               // FORWARDCALL IMPLEMENTATION: Poll server for CallInitiator and establish bidirectional flow
+               // FORWARDCALL IMPLEMENTATION: Block efficiently for CallInitiator and establish bidirectional flow
                return TrySeq(
                  [this, stream_id]() -> absl::StatusOr<CallInitiator> {
                    LOG(INFO) << "Waiting for server-side CallInitiator for stream " << stream_id;
-                   // Poll server for CallInitiator with timeout/retry
-                   for (int i = 0; i < 1000; ++i) {
-                     if (auto initiator = server_->GetCallInitiator(stream_id)) {
-                       LOG(INFO) << "Found server-side CallInitiator for stream " << stream_id;
-                       return std::move(*initiator);
-                     }
-                     // Brief sleep before retry (shorter interval for faster detection)
-                     std::this_thread::sleep_for(std::chrono::microseconds(50));
+                   // Use efficient blocking instead of polling
+                   if (auto initiator = server_->GetCallInitiator(stream_id)) {
+                     LOG(INFO) << "Found server-side CallInitiator for stream " << stream_id;
+                     return std::move(*initiator);
                    }
                    
-                   LOG(ERROR) << "Timeout waiting for server-side CallInitiator for stream " << stream_id;
-                   return absl::DeadlineExceededError("Timeout waiting for server call creation");
+                   LOG(ERROR) << "Failed to get CallInitiator for stream " << stream_id;
+                   return absl::InternalError("Failed to get server CallInitiator");
                  },
                  [child_call_handler, stream_id](CallInitiator initiator) mutable {
                    LOG(INFO) << "Establishing ForwardCall for stream " << stream_id;
