@@ -5019,6 +5019,7 @@ grpc_cc_library(
         "//src/core:resource_quota",
         "//src/core:event_engine_context",
         "//src/core:metadata",
+        "//src/core:connectivity_state",
     ],
 )
 
