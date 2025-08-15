@@ -26,7 +26,6 @@
 #include <sstream>
 
 #include "absl/log/check.h"
-#include "absl/log/log.h"
 #include "src/proto/grpc/testing/echo.grpc.pb.h"
 #include "test/cpp/microbenchmarks/fullstack_context_mutators.h"
 #include "test/cpp/microbenchmarks/fullstack_fixtures.h"
@@ -43,13 +42,6 @@ static void* tag(intptr_t x) { return reinterpret_cast<void*>(x); }
 template <class Fixture, class ClientContextMutator, class ServerContextMutator>
 static void BM_UnaryPingPong(benchmark::State& state) {
   GRPC_LATENT_SEE_ALWAYS_ON_SCOPE("BM_UnaryPingPong");
-  extern std::atomic<int64_t> g_benchmark_last_progress_ns;  // from .cc
-  extern std::atomic<uint64_t> g_benchmark_iteration_counter; // from .cc
-  extern int64_t NowSteadyNanos();
-  // Helper: heartbeat tick (does not count a full iteration, just liveness)
-  auto progress_tick = []() {
-    g_benchmark_last_progress_ns.store(NowSteadyNanos(), std::memory_order_relaxed);
-  };
   EchoTestService::AsyncService service;
   std::unique_ptr<Fixture> fixture(new Fixture(&service));
   EchoRequest send_request;
@@ -84,9 +76,6 @@ static void BM_UnaryPingPong(benchmark::State& state) {
       EchoTestService::NewStub(fixture->channel()));
   for (auto _ : state) {
     GRPC_LATENT_SEE_ALWAYS_ON_SCOPE("OneRequest");
-    // Progress heartbeat: update global counters every iteration.
-    g_benchmark_iteration_counter.fetch_add(1, std::memory_order_relaxed);
-    g_benchmark_last_progress_ns.store(NowSteadyNanos(), std::memory_order_relaxed);
     recv_response.Clear();
     ClientContext cli_ctx;
     ClientContextMutator cli_ctx_mut(&cli_ctx);
@@ -97,8 +86,6 @@ static void BM_UnaryPingPong(benchmark::State& state) {
     bool ok;
     {
       GRPC_LATENT_SEE_ALWAYS_ON_SCOPE("WaitForRequest");
-  // Liveness heartbeat just before blocking.
-  progress_tick();
       CHECK(fixture->cq()->Next(&t, &ok));
     }
     CHECK(ok);
@@ -106,23 +93,10 @@ static void BM_UnaryPingPong(benchmark::State& state) {
     intptr_t slot = reinterpret_cast<intptr_t>(t);
     ServerEnv* senv = server_env[slot];
     ServerContextMutator svr_ctx_mut(&senv->ctx);
-    
-    // Debug: Log received request details
-    LOG(INFO) << "Handler received request with message: '" 
-              << senv->recv_request.message() << "' (length=" 
-              << senv->recv_request.message().length() << ")";
-    
-    // TEMPORARY: Force send response to test outbound path even with empty request
-    LOG(INFO) << "Handler sending response with tag 3";
-    
     senv->response_writer.Finish(send_response, Status::OK, tag(3));
     {
       GRPC_LATENT_SEE_ALWAYS_ON_SCOPE("WaitForCqs");
       for (int i = (1 << 3) | (1 << 4); i != 0;) {
-  // Heartbeat before each blocking wait to avoid false stall alarms
-  // during large message benchmarks where a single iteration can span
-  // several seconds.
-  progress_tick();
         CHECK(fixture->cq()->Next(&t, &ok));
         CHECK(ok);
         int tagnum = static_cast<int>(reinterpret_cast<intptr_t>(t));

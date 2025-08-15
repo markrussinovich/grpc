@@ -222,24 +222,18 @@ class ShmemServerTransport final : public ServerTransport {
     
   // Stage 1: Helper to announce dispatched unary call when both initial + message ready
   auto announce_dispatched_call = [this](uint32_t stream_id, StreamState& st) {
-    LOG(INFO) << "announce_dispatched_call called for stream " << stream_id;
     if (!st.dispatched_unary || st.dispatched_unary->call_announced) {
       if (!st.dispatched_unary) {
-        LOG(INFO) << "Skipping stream " << stream_id << " - no dispatched_unary state";
       } else if (st.dispatched_unary->call_announced) {
-        LOG(INFO) << "Skipping stream " << stream_id << " - call already announced (stale state?)";
       }
       return;
     }
     
-    LOG(INFO) << "Creating call pair for stream " << stream_id;
     // Build ClientMetadata for dispatch
     auto arena = call_arena_allocator_->MakeArena();
-    LOG(INFO) << "Created arena for stream " << stream_id;
     auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
     arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
     auto md = arena->MakePooledForOverwrite<ClientMetadata>();
-    LOG(INFO) << "Created ClientMetadata for stream " << stream_id;
     for (const auto& kv : st.dispatched_unary->initial_kvs) {
       if (kv.key == ":path") {
         md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
@@ -265,7 +259,6 @@ class ShmemServerTransport final : public ServerTransport {
     {
       MutexLock lock(&stream_initiators_mu_);
       stream_initiators_[stream_id] = *st.initiator;  // Copy from the one we just emplaced
-      LOG(INFO) << "Stored CallInitiator for stream " << stream_id;
     }
     
     // Signal client that CallInitiator is ready - this replaces polling with efficient blocking
@@ -276,7 +269,6 @@ class ShmemServerTransport final : public ServerTransport {
         MutexLock stream_lock(&sync_it->second->mu);
         sync_it->second->initiator_ready = true;
         sync_it->second->cv.Signal();
-        LOG(INFO) << "Signaled CallInitiator readiness for stream " << stream_id;
       }
     }
     
@@ -311,7 +303,6 @@ class ShmemServerTransport final : public ServerTransport {
       
       if (has_command) {
         auto& st = streams[cmd.stream_id];
-        LOG(INFO) << "Processing command for stream " << cmd.stream_id << " type=" << static_cast<int>(cmd.type);
         switch (cmd.type) {
         case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
           if (!st.sent_initial) {
@@ -336,23 +327,18 @@ class ShmemServerTransport final : public ServerTransport {
                 looks_like_rpc = true;
               }
             }
-            LOG(INFO) << "Path decision for stream " << cmd.stream_id << ": path='" << st.path 
-                      << "' is_cancel_path=" << is_cancel_path << " looks_like_rpc=" << looks_like_rpc;
             if (looks_like_rpc && !is_cancel_path) {
-              LOG(INFO) << "Creating dispatched unary state for stream " << cmd.stream_id << " with path " << st.path;
               st.synthetic = false;
               // Stage 1: Buffer initial metadata for dispatched unary calls
               st.dispatched_unary = std::make_unique<StreamState::DispatchedUnaryState>();
               st.dispatched_unary->initial_kvs = kvs_in;
               st.dispatched_unary->have_initial = true;
-              LOG(INFO) << "Dispatched unary state created and initialized for stream " << cmd.stream_id;
 
               // *** FIX PART 1: announce call immediately on initial metadata ***
               // ForwardCall will deliver messages and finish-sends; we do NOT need
               // to wait for a message or synthesize client trailing here.
               announce_dispatched_call(cmd.stream_id, st);
             } else {
-              LOG(INFO) << "Using synthetic fast-path for stream " << cmd.stream_id << " with path " << st.path;
               // Synthetic path (retain Phase 1 behavior)
               std::vector<grpc_shmem::KVPair> kvs = {
                   {"content-type", "application/grpc"}, {"x-shmem", "1"}};
@@ -477,7 +463,6 @@ class ShmemServerTransport final : public ServerTransport {
           }
         }
         if (!completed_streams_.empty()) {
-          LOG(INFO) << "Processing " << completed_streams_.size() << " async completed streams";
         }
         completed_streams_.clear();  // Clear the set after processing
       }
@@ -569,17 +554,14 @@ std::optional<CallInitiator> ShmemServerTransport::GetCallInitiator(uint32_t str
   
   // Block efficiently until CallInitiator is ready
   MutexLock lock(&sync_ptr->mu);
-  LOG(INFO) << "GetCallInitiator: Waiting for CallInitiator readiness for stream " << stream_id;
   while (!sync_ptr->initiator_ready) {
     sync_ptr->cv.Wait(&sync_ptr->mu);
   }
-  LOG(INFO) << "GetCallInitiator: CallInitiator ready signal received for stream " << stream_id;
   
   // Now safely retrieve the CallInitiator
   MutexLock initiator_lock(&stream_initiators_mu_);
   auto it = stream_initiators_.find(stream_id);
   if (it != stream_initiators_.end()) {
-    LOG(INFO) << "GetCallInitiator: Found and returning CallInitiator for stream " << stream_id;
     return it->second;
   }
   LOG(ERROR) << "GetCallInitiator: CallInitiator not found after signal for stream " << stream_id;
@@ -587,7 +569,6 @@ std::optional<CallInitiator> ShmemServerTransport::GetCallInitiator(uint32_t str
 }
 
 void ShmemServerTransport::AnnounceCallFromClient(uint32_t stream_id, ClientMetadataHandle md) {
-  LOG(INFO) << "AnnounceCallFromClient: Creating server call for stream " << stream_id;
   
   auto arena = call_arena_allocator_->MakeArena();
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
@@ -598,7 +579,6 @@ void ShmemServerTransport::AnnounceCallFromClient(uint32_t stream_id, ClientMeta
   {
     MutexLock lock(&stream_initiators_mu_);
     stream_initiators_[stream_id] = call.initiator;  // store for client lookup
-    LOG(INFO) << "AnnounceCallFromClient: Stored CallInitiator for stream " << stream_id;
   }
   {
     // wake anyone waiting in GetCallInitiator(stream_id)
@@ -608,7 +588,6 @@ void ShmemServerTransport::AnnounceCallFromClient(uint32_t stream_id, ClientMeta
     MutexLock lk(&sync->mu);
     sync->initiator_ready = true;
     sync->cv.Signal();
-    LOG(INFO) << "AnnounceCallFromClient: Signaled CallInitiator readiness for stream " << stream_id;
   }
 
   RefCountedPtr<UnstartedCallDestination> d;
@@ -617,7 +596,6 @@ void ShmemServerTransport::AnnounceCallFromClient(uint32_t stream_id, ClientMeta
     d = dest_;
   }
   if (d != nullptr) {
-    LOG(INFO) << "AnnounceCallFromClient: Starting server call for stream " << stream_id;
     d->StartCall(std::move(call.handler));
   }
 }
@@ -701,12 +679,10 @@ void ShmemClientTransport::EnsureReaderStarted() {
               h.SpawnPushServerTrailingMetadata(std::move(md));
               
               // FINAL FIX: Clean up client-side handler when RPC completes
-              LOG(INFO) << "Client-side RPC complete for stream " << stream_id << " - cleaning up handler";
               {
                 MutexLock lock(&this->mu_);
                 this->handlers_.erase(stream_id);
               }
-              LOG(INFO) << "Client-side cleanup complete for stream " << stream_id;
               
               return Empty{};
             });
@@ -751,12 +727,9 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  }
                }
                
-               LOG(INFO) << "Client path decision for stream " << stream_id << ": path='" << path 
-                         << "' is_cancel_path=" << is_cancel_path << " looks_like_rpc=" << looks_like_rpc;
                
                if (looks_like_rpc && !is_cancel_path) {
                  // *** NEW: direct in-proc bootstrap (no ring) ***
-                 LOG(INFO) << "Using direct in-process bootstrap for stream " << stream_id;
                  server_->AnnounceCallFromClient(stream_id, std::move(md));
 
                  // Get the server-side initiator
@@ -766,18 +739,15 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                    return absl::InternalError("Failed to get server CallInitiator");
                  }
 
-                 LOG(INFO) << "CallInitiator ready for stream " << stream_id << " - using ForwardCall";
                  // Wire the two halves; also erase the handler on completion
                  ForwardCall(child_call_handler, std::move(*initiator),
                              [this, stream_id](ServerMetadata&) {
                                MutexLock lock(&mu_);
                                handlers_.erase(stream_id);
-                               LOG(INFO) << "Cleaned up handler for completed stream " << stream_id;
                              });
                  return absl::OkStatus();
                } else {
                  // *** Old synthetic path (echo/cancel) keeps using the ring ***
-                 LOG(INFO) << "Using synthetic ring path for stream " << stream_id << " with path " << path;
                  
                  // Add handler to map for synthetic calls only
                  {
@@ -811,7 +781,6 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  cmd.data_offset = off;
                  cmd.data_size = static_cast<uint32_t>(vec.size());
                  grpc_shmem::PushCommand(cb->c2s_queues.get(), cb, grpc_shmem::Direction::kC2S, cmd);
-                 LOG(INFO) << "Client sent initial metadata to ring for synthetic stream " << stream_id;
                  
                  return absl::OkStatus();
                }
