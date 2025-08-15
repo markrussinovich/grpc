@@ -348,7 +348,7 @@ class ShmemServerTransport final : public ServerTransport {
     
     // Chain 3: Pull and forward server trailing metadata (CRITICAL - this completes the RPC)
     initiator3.SpawnInfallible("s2c-trailing-metadata", 
-      Map(initiator3.PullServerTrailingMetadata(), [cb = cb_, stream_id](ServerMetadataHandle trailing_metadata) mutable {
+      Map(initiator3.PullServerTrailingMetadata(), [cb = cb_, stream_id, this](ServerMetadataHandle trailing_metadata) mutable {
         LOG(INFO) << "Forwarding server trailing metadata for stream " << stream_id << " - RPC complete";
         
         // Extract status and message from trailing metadata
@@ -372,6 +372,19 @@ class ShmemServerTransport final : public ServerTransport {
         s2c_trailing_cmd.data_size = static_cast<uint32_t>(buf.size());
         s2c_trailing_cmd.grpc_status_code = code;
         grpc_shmem::PushCommand(cb->s2c_queues.get(), cb, grpc_shmem::Direction::kS2C, s2c_trailing_cmd);
+        
+        // FINAL FIX: Clean up transport internal state to prevent resource leak
+        LOG(INFO) << "Cleaning up stream state for completed stream " << stream_id;
+        {
+          MutexLock lock(&this->stream_initiators_mu_);
+          this->stream_initiators_.erase(stream_id);
+        }
+        {
+          MutexLock lock(&this->stream_sync_mu_);
+          this->stream_sync_.erase(stream_id);
+        }
+        LOG(INFO) << "Stream " << stream_id << " cleanup complete";
+        
         return Empty{};
       }));
     st.dispatched_unary->call_announced = true;
