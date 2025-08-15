@@ -206,7 +206,7 @@ class ShmemServerTransport final : public ServerTransport {
     LOG(INFO) << "Created arena for stream " << stream_id;
     auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
     arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
-    auto md = Arena::MakePooledForOverwrite<ClientMetadata>();
+    auto md = arena->MakePooledForOverwrite<ClientMetadata>();
     LOG(INFO) << "Created ClientMetadata for stream " << stream_id;
     for (const auto& kv : st.dispatched_unary->initial_kvs) {
       if (kv.key == ":path") {
@@ -229,10 +229,10 @@ class ShmemServerTransport final : public ServerTransport {
     auto call = MakeCallPair(std::move(md), std::move(arena));
     st.initiator.emplace(call.initiator);
     
-    // Store CallInitiator for client ForwardCall access
+    // Store CallInitiator for client ForwardCall access - use reference to avoid copying
     {
       MutexLock lock(&stream_initiators_mu_);
-      stream_initiators_[stream_id] = call.initiator;
+      stream_initiators_[stream_id] = *st.initiator;  // Copy from the one we just emplaced
       LOG(INFO) << "Stored CallInitiator for stream " << stream_id;
     }
     
@@ -248,22 +248,39 @@ class ShmemServerTransport final : public ServerTransport {
       }
     }
     
-    // CRITICAL FIX: Push zero-copy message BEFORE starting the call
-    // This ensures the message is in the pipeline when the service handler is invoked
+    // CRITICAL FIX: Always push exactly one message to satisfy unary API contract
+    // Create and push the message first, then handle finish sends separately
     if (st.dispatched_unary->have_message) {
       // Zero-copy: Create grpc_slice pointing directly to ring buffer
       LOG(INFO) << "Creating zero-copy grpc_slice for " << st.dispatched_unary->payload_size << " bytes at offset " << st.dispatched_unary->payload_offset;
       grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->c2s_queues->data_rb, 
                                                    st.dispatched_unary->payload_offset,
                                                    st.dispatched_unary->payload_size);
-      SliceBuffer sb; sb.AppendIndexed(Slice(s));
+      SliceBuffer sb; 
+      sb.AppendIndexed(Slice(s));
       auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
+      
+      // Push the payload message immediately
       st.initiator->SpawnPushMessage(std::move(msg));
+      
+      // If client trailing metadata was seen, signal finish sends
+      if (st.dispatched_unary->client_trailing_seen) {
+        st.initiator->SpawnFinishSends();
+      }
+    } else {
+      // Empty unary: Synthesize empty message to satisfy API contract
+      LOG(INFO) << "Creating empty message to satisfy unary API contract for stream " << stream_id;
+      auto empty_msg = Arena::MakePooled<Message>(SliceBuffer(), 0);
+      
+      // Push the empty message immediately
+      st.initiator->SpawnPushMessage(std::move(empty_msg));
+      
+      // If client trailing metadata was seen, signal finish sends
+      if (st.dispatched_unary->client_trailing_seen) {
+        st.initiator->SpawnFinishSends();
+      }
     }
-    
-    // Finish the client stream immediately since unary calls don't send additional messages
-    st.initiator->SpawnFinishSends();
-    
+
     RefCountedPtr<UnstartedCallDestination> d;
     {
       MutexLock lock(&dest_mu_);
@@ -272,83 +289,92 @@ class ShmemServerTransport final : public ServerTransport {
     if (d != nullptr) {
       d->StartCall(std::move(call.handler));
     }
-    st.dispatched_unary->call_announced = true;
     
-    // Stage 2: Send initial metadata first, then spawn outbound loops
-    // This ensures initial metadata arrives before any server messages
-    {
-      std::vector<grpc_shmem::KVPair> kvs = {{"content-type", "application/grpc"}, {"x-shmem", "1"}};
-      uint64_t off = 0;
-      auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
-      grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
-      std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
-      grpc_shmem::Command out{}; out.stream_id = stream_id; out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA; 
-      out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = 0;
-      grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
-    }
+    // CRITICAL: Implement manual S2C response forwarding to complete the RPC
+    // This replaces the generic ForwardCall mechanism with transport-specific logic
     
-    // Messages outbound loop (after initial metadata is sent)
-    st.initiator->SpawnInfallible("shmem-dispatch-s2c-msgs", [this, stream_id, ci = *st.initiator]() mutable {
-      auto schedule = std::make_shared<std::function<void()>>();
-      *schedule = [this, stream_id, ci, schedule]() mutable {
-        ci.SpawnInfallible("shmem-dispatch-s2c-msg-step", [this, stream_id, ci, schedule]() mutable {
-          return Map(ci.PullMessage(), [this, stream_id, schedule](ServerToClientNextMessage m) mutable {
-            if (!m.ok()) return Empty{}; // error/cancel -> stop
-            if (m.has_value()) {
-              auto& sb = *m.value().payload();
-              const size_t n = sb.Length();
-              uint64_t off = 0;
-              grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, n, &off);
-              size_t copied = 0;
-              while (copied < n) {
-                Slice s = sb.TakeFirst();
-                std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off + copied, s.begin(), s.length());
-                copied += s.length();
-              }
-              grpc_shmem::Command out{}; out.stream_id = stream_id; out.type = grpc_shmem::FrameType::S2C_MESSAGE; 
-              out.data_offset = off; out.data_size = static_cast<uint32_t>(n); out.grpc_status_code = 0;
-              grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
-              // Schedule next message pull
-              (*schedule)();
-            }
-            return Empty{}; // EOS ends loop
-          });
-        });
-      };
-      // Kick off first iteration
-      (*schedule)();
-      return Empty{}; // initial SpawnInfallible promise completes immediately
-    });
+    // Create separate CallInitiator copies to avoid reference counting issues
+    CallInitiator initiator1 = *st.initiator;
+    CallInitiator initiator2 = *st.initiator;  
+    CallInitiator initiator3 = *st.initiator;
     
-    // Trailing metadata outbound (runs in parallel but will only complete after messages)
-    st.initiator->SpawnInfallible("shmem-dispatch-s2c-trailing", [this, stream_id, ci = *st.initiator]() mutable {
-      LOG(INFO) << "Starting S2C trailing metadata promise for stream " << stream_id;
-      return Seq(ci.PullServerTrailingMetadata(), [this, stream_id](ServerMetadataHandle md) mutable {
-        LOG(INFO) << "Sending S2C trailing metadata for stream " << stream_id;
-        int code = static_cast<int>(md->get(GrpcStatusMetadata()).value_or(GRPC_STATUS_UNKNOWN));
-        std::vector<grpc_shmem::KVPair> kvs = {{"grpc-status", std::to_string(code)}};
-        if (auto* msg = md->get_pointer(GrpcMessageMetadata()); msg) {
-          kvs.push_back({"grpc-message", std::string(msg->as_string_view())});
-        }
+    // Chain 1: Pull and forward server initial metadata
+    initiator1.SpawnInfallible("s2c-initial-metadata", 
+      Map(initiator1.PullServerInitialMetadata(), [cb = cb_, stream_id](std::optional<ServerMetadataHandle> metadata) mutable {
+        LOG(INFO) << "Forwarding server initial metadata for stream " << stream_id;
+        
+        // Serialize initial metadata  
+        std::vector<grpc_shmem::KVPair> kvs = {{"content-type", "application/grpc"}, {"x-shmem", "1"}};
         auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
-        uint64_t off = 0; grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb, buf.size(), &off);
-        std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
-        grpc_shmem::Command out{}; out.stream_id = stream_id; out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA; 
-        out.data_offset = off; out.data_size = static_cast<uint32_t>(buf.size()); out.grpc_status_code = code;
-        grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_, grpc_shmem::Direction::kS2C, out);
+        uint64_t off = 0;
+        grpc_shmem::ReserveContiguous(&cb->s2c_queues->data_rb, buf.size(), &off);
+        std::memcpy(cb->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
         
-        // Mark stream as completed - need to store this in a thread-safe way
-        // Since we can't safely access the local streams map from this async context,
-        // we'll use a separate completed streams set
-        {
-          std::lock_guard<std::mutex> lock(completed_streams_mu_);
-          completed_streams_.insert(stream_id);
-          LOG(INFO) << "Added stream " << stream_id << " to completed set";
+        // Push S2C_INITIAL_METADATA frame to ring buffer
+        grpc_shmem::Command s2c_initial_cmd;
+        s2c_initial_cmd.stream_id = stream_id;
+        s2c_initial_cmd.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
+        s2c_initial_cmd.data_offset = off;
+        s2c_initial_cmd.data_size = static_cast<uint32_t>(buf.size());
+        s2c_initial_cmd.grpc_status_code = 0;
+        grpc_shmem::PushCommand(cb->s2c_queues.get(), cb, grpc_shmem::Direction::kS2C, s2c_initial_cmd);
+        return Empty{};
+      }));
+    
+    // Chain 2: Pull and forward server response message
+    initiator2.SpawnInfallible("s2c-message", 
+      Map(initiator2.PullMessage(), [cb = cb_, stream_id](ServerToClientNextMessage msg) mutable {
+        if (msg.ok() && msg.has_value()) {
+          LOG(INFO) << "Forwarding server response message for stream " << stream_id;
+          auto message = msg.TakeValue();
+          
+          // Get message payload and write to ring buffer
+          std::string payload = message->payload()->JoinIntoString();
+          uint64_t off = 0;
+          grpc_shmem::ReserveContiguous(&cb->s2c_queues->data_rb, payload.size(), &off);
+          std::memcpy(cb->s2c_queues->data_rb.buffer.get() + off, payload.data(), payload.size());
+          
+          // Push S2C_MESSAGE frame
+          grpc_shmem::Command s2c_msg_cmd;
+          s2c_msg_cmd.stream_id = stream_id;
+          s2c_msg_cmd.type = grpc_shmem::FrameType::S2C_MESSAGE;
+          s2c_msg_cmd.data_offset = off;
+          s2c_msg_cmd.data_size = static_cast<uint32_t>(payload.size());
+          s2c_msg_cmd.grpc_status_code = 0;
+          grpc_shmem::PushCommand(cb->s2c_queues.get(), cb, grpc_shmem::Direction::kS2C, s2c_msg_cmd);
+        }
+        return Empty{};
+      }));
+    
+    // Chain 3: Pull and forward server trailing metadata (CRITICAL - this completes the RPC)
+    initiator3.SpawnInfallible("s2c-trailing-metadata", 
+      Map(initiator3.PullServerTrailingMetadata(), [cb = cb_, stream_id](ServerMetadataHandle trailing_metadata) mutable {
+        LOG(INFO) << "Forwarding server trailing metadata for stream " << stream_id << " - RPC complete";
+        
+        // Extract status and message from trailing metadata
+        int code = static_cast<int>(trailing_metadata->get(GrpcStatusMetadata()).value_or(GRPC_STATUS_OK));
+        std::vector<grpc_shmem::KVPair> kvs = {{"grpc-status", std::to_string(code)}};
+        if (auto* msg_ptr = trailing_metadata->get_pointer(GrpcMessageMetadata()); msg_ptr) {
+          kvs.push_back({"grpc-message", std::string(msg_ptr->as_string_view())});
         }
         
+        // Serialize trailing metadata
+        auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
+        uint64_t off = 0;
+        grpc_shmem::ReserveContiguous(&cb->s2c_queues->data_rb, buf.size(), &off);
+        std::memcpy(cb->s2c_queues->data_rb.buffer.get() + off, buf.data(), buf.size());
+        
+        // Push final S2C_TRAILING_METADATA frame to unblock client
+        grpc_shmem::Command s2c_trailing_cmd;
+        s2c_trailing_cmd.stream_id = stream_id;
+        s2c_trailing_cmd.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
+        s2c_trailing_cmd.data_offset = off;
+        s2c_trailing_cmd.data_size = static_cast<uint32_t>(buf.size());
+        s2c_trailing_cmd.grpc_status_code = code;
+        grpc_shmem::PushCommand(cb->s2c_queues.get(), cb, grpc_shmem::Direction::kS2C, s2c_trailing_cmd);
         return Empty{};
-      });
-    });
+      }));
+    st.dispatched_unary->call_announced = true;
   };
     absl::flat_hash_map<uint32_t, StreamState> streams;
     for (;;) {
@@ -489,11 +515,15 @@ class ShmemServerTransport final : public ServerTransport {
               if (st.dispatched_unary->have_initial && !st.dispatched_unary->have_message) {
                 LOG(INFO) << "Announcing call for stream " << cmd.stream_id << " (empty unary)";
                 announce_dispatched_call(cmd.stream_id, st);
-                
-                // Note: SpawnFinishSends() is already called inside announce_dispatched_call
               }
-              // Note: For regular unary calls (have_message=true), SpawnFinishSends() 
-              // is called immediately after the message push in announce_dispatched_call
+              // If we have initial + message and call was already announced, 
+              // we need to signal finish sends now that trailing metadata arrived
+              else if (st.dispatched_unary->have_initial && st.dispatched_unary->have_message && st.dispatched_unary->call_announced) {
+                LOG(INFO) << "Signaling finish sends for stream " << cmd.stream_id << " (trailing metadata received after call announced)";
+                st.initiator->SpawnFinishSends();
+              }
+              // Note: For regular unary calls (have_message=true) where call not yet announced,
+              // announce_dispatched_call will handle the finish sends when it's called
             }
             
             if (cmd.data_size != 0) cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
@@ -555,6 +585,16 @@ class ShmemServerTransport final : public ServerTransport {
       
       for (uint32_t stream_id : completed_stream_ids) {
         streams.erase(stream_id);
+        
+        // Clean up associated CallInitiator and sync structures
+        {
+          MutexLock lock(&stream_initiators_mu_);
+          stream_initiators_.erase(stream_id);
+        }
+        {
+          MutexLock lock(&stream_sync_mu_);
+          stream_sync_.erase(stream_id);
+        }
       }
     }
   }
@@ -592,26 +632,25 @@ class ShmemServerTransport final : public ServerTransport {
 
 std::optional<CallInitiator> ShmemServerTransport::GetCallInitiator(uint32_t stream_id) {
   // Get or create synchronization structure for this stream
-  std::unique_ptr<StreamSync> sync;
+  StreamSync* sync_ptr;
   {
     MutexLock lock(&stream_sync_mu_);
     auto it = stream_sync_.find(stream_id);
     if (it == stream_sync_.end()) {
       // Create new sync structure for this stream
-      sync = std::make_unique<StreamSync>();
-      stream_sync_[stream_id] = std::unique_ptr<StreamSync>(sync.get());
-      sync.release(); // Map now owns it
-      sync = std::unique_ptr<StreamSync>(stream_sync_[stream_id].get());
+      auto sync = std::make_unique<StreamSync>();
+      sync_ptr = sync.get();
+      stream_sync_[stream_id] = std::move(sync);
     } else {
-      sync.reset(it->second.get());
+      sync_ptr = it->second.get();
     }
   }
   
   // Block efficiently until CallInitiator is ready
-  MutexLock lock(&sync->mu);
+  MutexLock lock(&sync_ptr->mu);
   LOG(INFO) << "GetCallInitiator: Waiting for CallInitiator readiness for stream " << stream_id;
-  while (!sync->initiator_ready) {
-    sync->cv.Wait(&sync->mu);
+  while (!sync_ptr->initiator_ready) {
+    sync_ptr->cv.Wait(&sync_ptr->mu);
   }
   LOG(INFO) << "GetCallInitiator: CallInitiator ready signal received for stream " << stream_id;
   
@@ -770,7 +809,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                grpc_shmem::PushCommand(cb->c2s_queues.get(), cb, grpc_shmem::Direction::kC2S, trailing_cmd);
                LOG(INFO) << "Client sent trailing metadata for stream " << stream_id << " (empty unary)";
                
-               // FORWARDCALL IMPLEMENTATION: Block efficiently for CallInitiator and establish bidirectional flow
+               // TRANSPORT-HANDLED: Simply wait for CallInitiator - announce_dispatched_call handles message forwarding
                return TrySeq(
                  [this, stream_id]() -> absl::StatusOr<CallInitiator> {
                    LOG(INFO) << "Waiting for server-side CallInitiator for stream " << stream_id;
@@ -784,49 +823,8 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                    return absl::InternalError("Failed to get server CallInitiator");
                  },
                  [child_call_handler, stream_id](CallInitiator initiator) mutable {
-                   LOG(INFO) << "Establishing ForwardCall for stream " << stream_id;
-                   // Establish bidirectional ForwardCall manually
-                   // Forward messages from handler to initiator
-                   child_call_handler.SpawnInfallible("handler-to-initiator", [child_call_handler, initiator]() mutable {
-                     auto schedule = std::make_shared<std::function<void()>>();
-                     *schedule = [child_call_handler, initiator, schedule]() mutable {
-                       child_call_handler.SpawnInfallible("pump-message", [child_call_handler, initiator, schedule]() mutable {
-                         return Map(child_call_handler.PullMessage(), [initiator, schedule](ClientToServerNextMessage msg) mutable {
-                           if (!msg.ok()) return Empty{};
-                           if (msg.has_value()) {
-                             initiator.SpawnPushMessage(msg.TakeValue());
-                             (*schedule)(); // Continue pumping
-                           } else {
-                             initiator.SpawnFinishSends(); // EOS
-                           }
-                           return Empty{};
-                         });
-                       });
-                     };
-                     (*schedule)();
-                     return Empty{};
-                   });
-                   
-                   // Forward messages from initiator to handler  
-                   child_call_handler.SpawnInfallible("initiator-to-handler", [child_call_handler, initiator]() mutable {
-                     auto schedule = std::make_shared<std::function<void()>>();
-                     *schedule = [child_call_handler, initiator, schedule]() mutable {
-                       child_call_handler.SpawnInfallible("pump-response", [child_call_handler, initiator, schedule]() mutable {
-                         return Map(initiator.PullMessage(), [child_call_handler, schedule](ServerToClientNextMessage msg) mutable {
-                           if (!msg.ok()) return Empty{};
-                           if (msg.has_value()) {
-                             child_call_handler.SpawnPushMessage(msg.TakeValue());
-                             (*schedule)(); // Continue pumping  
-                           }
-                           return Empty{};
-                         });
-                       });
-                     };
-                     (*schedule)();
-                     return Empty{};
-                   });
-                   
-                   LOG(INFO) << "ForwardCall established successfully for stream " << stream_id;
+                   LOG(INFO) << "CallInitiator ready for stream " << stream_id << " - transport handles message forwarding";
+                   // No ForwardCall needed - announce_dispatched_call already handled message push and finish sends
                    return absl::OkStatus();
                  }
                );
