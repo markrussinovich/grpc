@@ -106,6 +106,15 @@ static void BM_UnaryPingPong(benchmark::State& state) {
     intptr_t slot = reinterpret_cast<intptr_t>(t);
     ServerEnv* senv = server_env[slot];
     ServerContextMutator svr_ctx_mut(&senv->ctx);
+    
+    // Debug: Log received request details
+    LOG(INFO) << "Handler received request with message: '" 
+              << senv->recv_request.message() << "' (length=" 
+              << senv->recv_request.message().length() << ")";
+    
+    // TEMPORARY: Force send response to test outbound path even with empty request
+    LOG(INFO) << "Handler sending response with tag 3";
+    
     senv->response_writer.Finish(send_response, Status::OK, tag(3));
     {
       GRPC_LATENT_SEE_ALWAYS_ON_SCOPE("WaitForCqs");
