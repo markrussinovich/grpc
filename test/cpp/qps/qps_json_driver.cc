@@ -77,6 +77,9 @@ ABSL_FLAG(
     "the credentials specified in --credential_type. The value of this flag "
     "is a semicolon-separated list of map entries, where each map entry is "
     "a comma-separated pair.");
+// Select which in-proc transport the server should use to create the channel.
+// Recognized values: "inproc" (default), "shmem".
+ABSL_FLAG(std::string, inproc_transport, "inproc", "In-proc transport: inproc or shmem.");
 ABSL_FLAG(bool, run_inproc, false, "Perform an in-process transport test");
 ABSL_FLAG(
     int32_t, median_latency_collection_interval_millis, 0,
@@ -125,8 +128,15 @@ static std::unique_ptr<ScenarioResult> RunAndReport(
     const std::map<std::string, std::string>& per_worker_credential_types,
     bool* success) {
   std::cerr << "RUNNING SCENARIO: " << scenario.name() << "\n";
-  RunScenarioOptions options(scenario.client_config(),
-                             scenario.server_config());
+  // If running in-proc, inject a channel arg so the server can decide
+  // which in-proc transport to use when it builds the channel.
+  ClientConfig client_cfg = scenario.client_config();
+  if (absl::GetFlag(FLAGS_run_inproc)) {
+    auto* arg = client_cfg.add_channel_args();
+    arg->set_name("grpc.inproc_transport");
+    arg->set_str_value(absl::GetFlag(FLAGS_inproc_transport));
+  }
+  RunScenarioOptions options(client_cfg, scenario.server_config());
   options.set_num_clients(scenario.num_clients())
       .set_num_servers(scenario.num_servers())
       .set_warmup_seconds(scenario.warmup_seconds())

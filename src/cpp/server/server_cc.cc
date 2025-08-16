@@ -78,6 +78,11 @@
 #include "src/cpp/server/health/default_health_check_service.h"
 #include "src/cpp/thread_manager/thread_manager.h"
 
+// Forward declaration for shmem transport (defined in shmem transport)
+extern "C" grpc_channel* grpc_shmem_channel_create(grpc_server* server,
+                                                   const grpc_channel_args* args,
+                                                   void* reserved);
+
 namespace grpc {
 namespace {
 
@@ -1032,8 +1037,24 @@ grpc_server* Server::c_server() { return server_; }
 std::shared_ptr<grpc::Channel> Server::InProcessChannel(
     const grpc::ChannelArguments& args) {
   grpc_channel_args channel_args = args.c_channel_args();
+  // Look for the selector arg inside the C-level channel args.
+  const grpc_arg* sel =
+      grpc_channel_args_find(&channel_args, "grpc.inproc_transport");
+  const char* which =
+      (sel != nullptr && sel->type == GRPC_ARG_STRING) ? sel->value.string : nullptr;
+
+  grpc_channel* c = nullptr;
+  const char* host = "inproc";
+  if (which != nullptr && 0 == strcmp(which, "shmem")) {
+    // Use the Shmem in-proc channel implementation.
+    c = grpc_shmem_channel_create(server_, &channel_args, nullptr);
+    host = "shmem";
+  } else {
+    // Default: built-in inproc transport.
+    c = grpc_inproc_channel_create(server_, &channel_args, nullptr);
+  }
   return grpc::CreateChannelInternal(
-      "inproc", grpc_inproc_channel_create(server_, &channel_args, nullptr),
+      host, c,
       std::vector<std::unique_ptr<
           grpc::experimental::ClientInterceptorFactoryInterface>>());
 }
