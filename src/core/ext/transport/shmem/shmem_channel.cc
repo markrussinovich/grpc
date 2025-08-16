@@ -20,6 +20,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 
+#include "src/core/client_channel/direct_channel.h"        // DirectChannel (promise stack)
 #include "src/core/ext/transport/shmem/shmem_transport.h"  // MakeShmemTransportPair
 #include "src/core/config/core_configuration.h"
 #include "src/core/util/ref_counted_ptr.h"
@@ -27,6 +28,7 @@
 #include "src/core/lib/resource_quota/resource_quota.h"
 #include "src/core/server/server.h"
 #include "src/core/lib/surface/channel_create.h"
+#include "src/core/lib/surface/lame_client.h"
 #include "src/core/lib/transport/transport.h"
 
 namespace grpc_core {
@@ -68,16 +70,22 @@ static RefCountedPtr<Channel> MakeShmemChannel(Server* server,
   // SetupTransport takes ownership through the vtable; don't delete it here.
   (void)server_transport.release();
 
-  // 3) Create the client channel bound to our client transport.
-  auto channel = ChannelCreate(
-      /*target=*/"shmem",
-      client_channel_args.Set(GRPC_ARG_DEFAULT_AUTHORITY, "shmem.authority"),
-      GRPC_CLIENT_DIRECT_CHANNEL,
-      /*client_transport=*/client_transport.release());
-  if (!channel.ok()) {
-    return MakeLameChannel("Failed to create client channel", channel.status());
+  // 3) Create a **promise-based direct channel** bound to our client transport.
+  //    Legacy channels (filter stacks) cannot be used with promise transports.
+  //    Use DirectChannel::Create to avoid the legacy builder entirely.
+  //
+  //    See legacy builder rejecting promise transports (your error) here:
+  //    src/core/lib/surface/legacy_channel.cc (channel stack builder failed...).
+  auto channel_result = DirectChannel::Create(
+      "shmem",
+      client_channel_args.Set(GRPC_ARG_DEFAULT_AUTHORITY, "shmem.authority")
+                          .SetObject(client_transport.get()));
+  if (!channel_result.ok()) {
+    return MakeLameChannel("Failed to create direct channel", channel_result.status());
   }
-  return std::move(*channel);
+  // DirectChannel now owns the transport
+  (void)client_transport.release();
+  return std::move(*channel_result);
 }
 
 }  // namespace

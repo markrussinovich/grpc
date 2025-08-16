@@ -5011,6 +5011,7 @@ grpc_cc_library(
         "//src/core:call_arena_allocator",
         "//src/core:channel_args",
         "//src/core:channel_args_preconditioning",
+        "//src/core:direct_channel",
         "//src/core:metadata_batch",
         "//src/core:slice",
         "//src/core:slice_buffer",
