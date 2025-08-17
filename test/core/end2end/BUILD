@@ -547,3 +547,12 @@ grpc_core_end2end_test_suite(
         "grpc:no-internal-poller",
     ],
 )
+
+grpc_core_end2end_test_suite(
+    name = "end2end_shmem",
+    config_src = "end2end_shmem_config.cc",
+    flaky = True,
+    deps = [
+        "//:grpc_transport_shmem",
+    ],
+)
