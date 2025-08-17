@@ -1,0 +1,69 @@
+I0816 20:58:43.599125 3065006 test_config.cc:152] test slowdown factor: sanitizer=1, fixture=1, poller=1, total=1
+I0816 20:58:43.599485 3065006 config.cc:256] gRPC experiments enabled: call_tracer_in_transport, chaotic_good_framing_layer, event_engine_callback_cq, event_engine_client, event_engine_dns, event_engine_dns_non_client_channel, event_engine_for_all_other_endpoints, event_engine_listener, event_engine_secure_endpoint, max_inflight_pings_strict_limit, monitoring_experiment, server_global_callbacks_ownership, shard_global_connection_pool
+I0816 20:58:43.599784 3065006 server_builder.cc:390] Synchronous server. Num CQs: 1, Min pollers: 1, Max Pollers: 2, CQ timeout (msec): 10000
+I0816 20:58:43.599966 3065006 lb_policy_registry.cc:45] registering LB policy factory for "priority_experimental"
+I0816 20:58:43.600012 3065006 lb_policy_registry.cc:45] registering LB policy factory for "outlier_detection_experimental"
+I0816 20:58:43.600027 3065006 lb_policy_registry.cc:45] registering LB policy factory for "weighted_target_experimental"
+I0816 20:58:43.600040 3065006 lb_policy_registry.cc:45] registering LB policy factory for "pick_first"
+I0816 20:58:43.600053 3065006 lb_policy_registry.cc:45] registering LB policy factory for "round_robin"
+I0816 20:58:43.600067 3065006 lb_policy_registry.cc:45] registering LB policy factory for "ring_hash_experimental"
+I0816 20:58:43.600081 3065006 lb_policy_registry.cc:45] registering LB policy factory for "weighted_round_robin"
+I0816 20:58:43.600145 3065006 lb_policy_registry.cc:45] registering LB policy factory for "grpclb"
+I0816 20:58:43.600192 3065006 dns_resolver_plugin.cc:41] Using EventEngine dns resolver
+I0816 20:58:43.600250 3065006 lb_policy_registry.cc:45] registering LB policy factory for "rls_experimental"
+I0816 20:58:43.600338 3065006 lb_policy_registry.cc:45] registering LB policy factory for "xds_cluster_manager_experimental"
+I0816 20:58:43.600372 3065006 lb_policy_registry.cc:45] registering LB policy factory for "xds_cluster_impl_experimental"
+I0816 20:58:43.600400 3065006 lb_policy_registry.cc:45] registering LB policy factory for "cds_experimental"
+I0816 20:58:43.600417 3065006 lb_policy_registry.cc:45] registering LB policy factory for "xds_override_host_experimental"
+I0816 20:58:43.600432 3065006 lb_policy_registry.cc:45] registering LB policy factory for "xds_wrr_locality_experimental"
+I0816 20:58:43.600447 3065006 certificate_provider_registry.cc:34] registering certificate provider factory for "file_watcher"
+I0816 20:58:43.605029 3065006 qps_worker.cc:299] QpsWorker: BuildAndStart(driver_port=20001, server_port=0) done
+I0816 20:58:43.647583 3065023 chttp2_transport.cc:2134] ipv4:127.0.0.1:39284 SERVER: Sending goaway last_new_stream_id=0 err=UNKNOWN:Channel Destroyed
+I0816 20:58:43.700450 3065027 qps_worker.cc:108] RunClient: Entering
+I0816 20:58:43.700756 3065027 qps_worker.cc:192] RunClientBody: about to create client
+I0816 20:58:43.700785 3065027 qps_worker.cc:50] Starting client of type SYNC_CLIENT UNARY false
+I0816 20:58:43.712049 3065027 client.h:547] Connecting to localhost:14505
+I0816 20:58:43.712444 3065027 client.h:547] Connecting to localhost:14505
+I0816 20:58:43.712813 3065027 client.h:547] Connecting to localhost:14505
+I0816 20:58:43.713177 3065027 client.h:547] Connecting to localhost:14505
+I0816 20:58:43.713242 3065027 client.h:466] Waiting for up to 10 seconds for all channels to connect
+I0816 20:58:43.722070 3065027 client.h:497] Channel 0x7dd674004a70 connected!
+I0816 20:58:43.722305 3065027 client.h:497] Channel 0x7dd674021ef0 connected!
+I0816 20:58:43.722558 3065027 client.h:497] Channel 0x7dd67401b690 connected!
+I0816 20:58:43.723036 3065027 client.h:497] Channel 0x7dd67401d3f0 connected!
+I0816 20:58:43.723467 3065027 qps_worker.cc:197] RunClientBody: client created
+I0816 20:58:43.723753 3065027 qps_worker.cc:202] RunClientBody: creation status reported
+I0816 20:58:43.724554 3065027 qps_worker.cc:204] RunClientBody: Message read: goo.gle/debugonly  
+mark {
+  reset: true
+  name: "warmup"
+}
+
+I0816 20:58:43.725778 3065027 qps_worker.cc:213] RunClientBody: Mark response given
+I0816 20:58:46.727367 3065027 qps_worker.cc:204] RunClientBody: Message read: goo.gle/debugonly  
+mark {
+  reset: true
+  name: "benchmark"
+}
+
+I0816 20:58:46.728724 3065027 qps_worker.cc:213] RunClientBody: Mark response given
+I0816 20:58:51.727292 3065027 qps_worker.cc:204] RunClientBody: Message read: goo.gle/debugonly  
+mark {
+  reset: true
+  name: "done"
+}
+
+I0816 20:58:51.728586 3065027 qps_worker.cc:213] RunClientBody: Mark response given
+I0816 20:58:51.728661 3065027 qps_worker.cc:216] RunClientBody: Awaiting Threads Completion
+I0816 20:58:51.729740 3065027 qps_worker.cc:219] RunClientBody: Returning
+I0816 20:58:51.730670 3065027 qps_worker.cc:116] RunClient: Returning
+I0816 20:58:51.735629 3065022 chttp2_transport.cc:2134] ipv6:%5B::1%5D:33242 SERVER: Sending goaway last_new_stream_id=1 err=UNKNOWN:Channel Destroyed
+I0816 20:58:51.760639 3065011 chttp2_transport.cc:2134] ipv6:%5B::1%5D:59628 SERVER: Sending goaway last_new_stream_id=1 err=UNKNOWN:Channel Destroyed
+*** SIGTERM received at time=1755377931 on cpu 88 ***
+PC: @     0x7dd6c84e57f8  (unknown)  clock_nanosleep
+    @     0x56806adb4f6c         64  absl::lts_20250512::WriteFailureInfo()
+    @     0x56806adb4bfe        272  absl::lts_20250512::AbslFailureSignalHandler()
+    @     0x7dd6c8442520  (unknown)  (unknown)
+    @     0x568069be35a3        224  grpc::testing::RunServer()
+    @     0x568069be3277        208  main
+    @     0x7dd6c8429d90  (unknown)  (unknown)

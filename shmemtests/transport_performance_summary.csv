@@ -1,0 +1,7 @@
+transport,throughput_gbps_mean,throughput_gbps_max,latency_us_mean,latency_us_min,size_count
+InProcess,0.834,2.009,37049.552,13.6,20
+MinInProcess,0.904,2.057,35905.773,8.856,20
+MinShmemTransport,0.832,1.759,33833.699,11.496,20
+MinTCP,0.593,1.703,50286.642,322.964,20
+ShmemTransport,0.815,1.677,34486.471,11.747,20
+TCP,0.551,1.493,53917.62,325.197,20
