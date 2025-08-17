@@ -96,6 +96,11 @@ class ShmemClientTransport final : public ClientTransport {
       MutexLock l(&state_mu_);
       state_tracker_.RemoveWatcher(op->stop_connectivity_watch);
     }
+    if (!op->disconnect_with_error.ok() || !op->goaway_error.ok()) {
+      MutexLock l(&state_mu_);
+      state_tracker_.SetState(GRPC_CHANNEL_SHUTDOWN, absl::OkStatus(),
+                              "shmem client disconnected");
+    }
     ExecCtx::Run(DEBUG_LOCATION, op->on_consumed, absl::OkStatus());
   }
 
@@ -178,12 +183,35 @@ class ShmemServerTransport final : public ServerTransport {
     MutexLock l(&state_tracker_mu_);
     state_tracker_.SetState(GRPC_CHANNEL_READY, absl::OkStatus(),
                             "accept function set");
+    // Wake any announcers waiting for the destination.
+    {
+      MutexLock rl(&ready_mu_);
+      ready_ = true;
+      ready_cv_.SignalAll();
+    }
+    // DEBUG: Force a quick check to see if this gets called
+    // by temporarily causing a crash here - remove after verification
+    // abort();  // UNCOMMENT TO TEST
   }
 
   void Orphan() override {
     // Transition to SHUTDOWN and notify watchers (important for server
     // shutdown).
     Disconnect(absl::UnavailableError("shmem transport closed"));
+    // Finish any remaining active calls with UNAVAILABLE (not CANCELLED).
+    {
+      absl::flat_hash_map<uint32_t, CallInitiator> snapshot;
+      {
+        MutexLock lk(&active_mu_);
+        snapshot = active_calls_;
+        active_calls_.clear();
+      }
+      // Ensure callbacks can be scheduled during shutdown.
+      ExecCtx exec_ctx;
+      for (auto& kv : snapshot) {
+        kv.second.SpawnCancel(absl::UnavailableError("server shutdown"));
+      }
+    }
     stop_.store(true, std::memory_order_relaxed);
     if (cb_ != nullptr) {
       // Wake any waiting reader thread so it can observe stop_ and exit.
@@ -212,6 +240,29 @@ class ShmemServerTransport final : public ServerTransport {
     if (op->stop_connectivity_watch != nullptr) {
       MutexLock l(&state_tracker_mu_);
       state_tracker_.RemoveWatcher(op->stop_connectivity_watch);
+    }
+    // Server-initiated disconnect: finish all in-flight calls with UNAVAILABLE.
+    if (!op->disconnect_with_error.ok()) {
+      absl::Status st = op->disconnect_with_error;
+      if (st.ok()) st = absl::UnavailableError("server shutdown");
+      Disconnect(st);
+      absl::flat_hash_map<uint32_t, CallInitiator> snapshot;
+      {
+        MutexLock lk(&active_mu_);
+        snapshot = active_calls_;
+        active_calls_.clear();
+      }
+      // Finish calls with UNAVAILABLE status to match test expectations
+      ExecCtx exec_ctx;
+      for (auto& kv : snapshot) {
+        kv.second.SpawnCancel(absl::UnavailableError("server shutdown"));
+      }
+    }
+    if (!op->goaway_error.ok()) {
+      absl::Status st = op->goaway_error;
+      if (st.ok()) st = absl::UnavailableError("server goaway");
+      // Publish SHUTDOWN; tests often expect watchers to observe this.
+      Disconnect(st);
     }
     ExecCtx::Run(DEBUG_LOCATION, op->on_consumed, absl::OkStatus());
   }
@@ -377,20 +428,10 @@ class ShmemServerTransport final : public ServerTransport {
               for (const auto& kv : kvs_in) {
                 if (kv.key == ":path") st.path = kv.value;
               }
-              // Decide if this should be dispatched or synthetic.
-              bool is_cancel_path = (st.path == "/cancel");
-              bool looks_like_rpc = false;
-              if (!st.path.empty() && st.path.size() > 1 && st.path[0] == '/') {
-                size_t second_slash = st.path.find('/', 1);
-                looks_like_rpc = second_slash != std::string::npos &&
-                                 second_slash + 1 < st.path.size();
-
-                // Special case: treat "/benchmark" as RPC-like for testing
-                if (!looks_like_rpc && st.path == "/benchmark") {
-                  looks_like_rpc = true;
-                }
-              }
-              if (looks_like_rpc && !is_cancel_path) {
+              // Default to **dispatched** (in-proc) for all real RPCs.
+              // Only use the synthetic ring path for the special "/cancel" hook.
+              const bool is_cancel_path = (st.path == "/cancel");
+              if (!is_cancel_path) {
                 st.synthetic = false;
                 // Stage 1: Buffer initial metadata for dispatched unary calls
                 st.dispatched_unary =
@@ -618,6 +659,14 @@ class ShmemServerTransport final : public ServerTransport {
   grpc_shmem::ControlBlock* cb_ = nullptr;
   RefCountedPtr<UnstartedCallDestination> dest_;
   Mutex dest_mu_;
+  // Signal when SetCallDestination() has installed the acceptor.
+  Mutex ready_mu_;
+  CondVar ready_cv_;
+  bool ready_ ABSL_GUARDED_BY(ready_mu_) = false;
+  // Track active dispatched calls for teardown/cancellation.
+  Mutex active_mu_;
+  absl::flat_hash_map<uint32_t, CallInitiator> active_calls_
+      ABSL_GUARDED_BY(active_mu_);
   Mutex stream_mu_;  // protects streams hash map
   std::thread reader_;
   std::atomic<bool> stop_{false};
@@ -666,7 +715,19 @@ class ShmemServerTransport final : public ServerTransport {
 };
 
 CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
-    uint32_t /*stream_id*/, ClientMetadataHandle md) {
+    uint32_t stream_id, ClientMetadataHandle md) {
+  // Ensure the server has installed a call destination before announcing.
+  // Without this, early client calls can race and d==nullptr, dropping the call.
+  {
+    MutexLock rl(&ready_mu_);
+    while (!ready_) {
+      ready_cv_.Wait(&ready_mu_);
+    }
+  }
+
+  // Ensure callbacks can be scheduled during call creation.
+  ExecCtx exec_ctx;
+
   auto arena = call_arena_allocator_->MakeArena();
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
   arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
@@ -676,7 +737,15 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
     MutexLock lock(&dest_mu_);
     d = dest_;
   }
-  if (d != nullptr) d->StartCall(std::move(call.handler));
+  // d must be non-null now; start the server-side call and record it active.
+  if (d == nullptr) {
+    return CallInitiator{};
+  }
+  d->StartCall(std::move(call.handler));
+  {
+    MutexLock lk(&active_mu_);
+    active_calls_.emplace(stream_id, call.initiator);
+  }
   return std::move(call.initiator);
 }
 
@@ -814,21 +883,12 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  path = std::string(p->as_string_view());
                }
 
-               bool is_cancel_path = (path == "/cancel");
-               bool looks_like_rpc = false;
-               if (!path.empty() && path.size() > 1 && path[0] == '/') {
-                 size_t second_slash = path.find('/', 1);
-                 looks_like_rpc = second_slash != std::string::npos &&
-                                  second_slash + 1 < path.size();
+               const bool is_cancel_path = (path == "/cancel");
 
-                 // Special case: treat "/benchmark" as RPC-like for testing
-                 if (!looks_like_rpc && path == "/benchmark") {
-                   looks_like_rpc = true;
-                 }
-               }
-
-               if (looks_like_rpc && !is_cancel_path) {
-                 // *** NEW: zero-sync in-proc bootstrap ***
+               // Default to **dispatched** (in-proc) for all real RPCs.
+               // Only use the synthetic ring path for the special "/cancel" hook.
+               if (!is_cancel_path) {
+                 // *** In-proc bootstrap (dispatched) ***
                  auto initiator =
                      server_->AnnounceAndGetInitiator(stream_id, std::move(md));
                  ForwardCall(child_call_handler, std::move(initiator),
@@ -838,6 +898,20 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                              });
                  return absl::OkStatus();
                } else {
+                 // *** Synthetic ring path (cancel test hook only) ***
+                 if (server_ != nullptr && server_->dispatch_only()) {
+                   // In dispatch-only mode the ring reader is disabled:
+                   // never route synthetic traffic in that mode.
+                   // Fall back to dispatched to ensure the test proceeds.
+                   auto initiator =
+                       server_->AnnounceAndGetInitiator(stream_id, std::move(md));
+                   ForwardCall(child_call_handler, std::move(initiator),
+                               [this, stream_id](ServerMetadata&) {
+                                 MutexLock lock(&mu_); handlers_.erase(stream_id);
+                               });
+                   return absl::OkStatus();
+                 }
+
                  // *** Old synthetic path (echo/cancel) keeps using the ring
                  // ***
 

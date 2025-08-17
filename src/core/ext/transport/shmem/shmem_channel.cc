@@ -75,28 +75,26 @@ static RefCountedPtr<Channel> MakeShmemChannel(
           .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS),
       /*socket_node=*/nullptr);
   if (!error.ok()) {
+    // DEBUG: SetupTransport failed - this means server transport was destroyed
+    // and SetCallDestination() will never be called, causing server_calls_created=0
     return MakeLameChannel("Failed to create server channel", std::move(error));
   }
   // SetupTransport takes ownership through the vtable; don't delete it here.
   (void)server_transport.release();
 
   // 3) Create a **promise-based direct channel** bound to our client transport.
-  //    Legacy channels (filter stacks) cannot be used with promise transports.
-  //    Use DirectChannel::Create to avoid the legacy builder entirely.
-  //
-  //    See legacy builder rejecting promise transports (your error) here:
-  //    src/core/lib/surface/legacy_channel.cc (channel stack builder
-  //    failed...).
-  auto channel_result = DirectChannel::Create(
-      "shmem",
+  //    Use ChannelCreate with GRPC_CLIENT_DIRECT_CHANNEL and explicit transport
+  //    parameter to ensure proper transport attachment (following inproc pattern).
+  auto channel_result = ChannelCreate(
+      /*target=*/"shmem",
       client_channel_args.Set(GRPC_ARG_DEFAULT_AUTHORITY, "shmem.authority")
-          .SetObject(client_transport.get()));
+          .Set(GRPC_ARG_USE_V3_STACK, true),
+      GRPC_CLIENT_DIRECT_CHANNEL,
+      /*optional_transport=*/client_transport.release());
   if (!channel_result.ok()) {
     return MakeLameChannel("Failed to create direct channel",
                            channel_result.status());
   }
-  // DirectChannel now owns the transport
-  (void)client_transport.release();
   return std::move(*channel_result);
 }
 
