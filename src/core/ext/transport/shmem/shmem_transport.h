@@ -16,11 +16,10 @@
 #define GRPC_SRC_CORE_EXT_TRANSPORT_SHMEM_SHMEM_TRANSPORT_H
 
 #include <atomic>
-#include <cstdint>
-
 #include <boost/interprocess/offset_ptr.hpp>
 #include <boost/interprocess/sync/interprocess_semaphore.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
+#include <cstdint>
 
 #include "src/core/lib/transport/transport.h"
 
@@ -34,7 +33,8 @@ struct Command;
 struct DataRingBuffer;
 struct ShmemQueues;
 
-// The master control block, located at the beginning of the shared memory segment.
+// The master control block, located at the beginning of the shared memory
+// segment.
 struct ControlBlock {
   uint64_t magic_number;
   uint32_t transport_version;
@@ -63,13 +63,14 @@ struct ControlBlock {
         client_state(0),
         c2s_sem(0),
         s2c_sem(0),
-  c2s_waiters(0),
-  s2c_waiters(0),
+        c2s_waiters(0),
+        s2c_waiters(0),
         c2s_queues(nullptr),
         s2c_queues(nullptr) {}
 };
 
-// Re-using FrameType concept to describe commands flowing over the command queue
+// Re-using FrameType concept to describe commands flowing over the command
+// queue
 enum class FrameType : uint8_t {
   C2S_INITIAL_METADATA = 0x01,
   C2S_MESSAGE = 0x02,
@@ -103,7 +104,8 @@ struct DataRingBuffer {
   boost::interprocess::offset_ptr<unsigned char> buffer{nullptr};
 };
 
-// Define the command queue type using boost::lockfree. Capacity must be a power of two.
+// Define the command queue type using boost::lockfree. Capacity must be a power
+// of two.
 constexpr size_t COMMAND_QUEUE_CAPACITY = 256;
 using CommandQueue = boost::lockfree::spsc_queue<
     Command, boost::lockfree::capacity<COMMAND_QUEUE_CAPACITY>>;

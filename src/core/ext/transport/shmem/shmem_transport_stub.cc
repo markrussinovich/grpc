@@ -20,9 +20,8 @@
 
 #include "src/core/ext/transport/inproc/inproc_transport.h"
 
-extern "C" grpc_channel* grpc_shmem_channel_create(grpc_server* server,
-                                                   const grpc_channel_args* args,
-                                                   void* reserved) {
+extern "C" grpc_channel* grpc_shmem_channel_create(
+    grpc_server* server, const grpc_channel_args* args, void* reserved) {
   // Temporary stub: forward to inproc for now
   // TODO: Replace with actual shmem transport implementation
   return grpc_inproc_channel_create(server, args, reserved);

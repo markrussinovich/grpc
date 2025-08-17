@@ -1,5 +1,17 @@
-// Copyright 2025
+// Copyright 2025 gRPC authors.
 //
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Shared-memory (shmem) in-process-style channel factory.
 // This follows the same structure as grpc_inproc_channel_create:
 //  * build a client/server transport pair
@@ -19,17 +31,16 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
-
-#include "src/core/client_channel/direct_channel.h"        // DirectChannel (promise stack)
-#include "src/core/ext/transport/shmem/shmem_transport.h"  // MakeShmemTransportPair
+#include "src/core/client_channel/direct_channel.h"  // DirectChannel (promise stack)
 #include "src/core/config/core_configuration.h"
-#include "src/core/util/ref_counted_ptr.h"
+#include "src/core/ext/transport/shmem/shmem_transport.h"  // MakeShmemTransportPair
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/resource_quota/resource_quota.h"
-#include "src/core/server/server.h"
 #include "src/core/lib/surface/channel_create.h"
 #include "src/core/lib/surface/lame_client.h"
 #include "src/core/lib/transport/transport.h"
+#include "src/core/server/server.h"
+#include "src/core/util/ref_counted_ptr.h"
 
 namespace grpc_core {
 namespace {
@@ -42,14 +53,13 @@ static RefCountedPtr<Channel> MakeLameChannel(absl::string_view why,
   if (grpc_error_get_int(error, StatusIntProperty::kRpcStatus, &integer)) {
     status = static_cast<grpc_status_code>(integer);
   }
-  return RefCountedPtr<Channel>(Channel::FromC(
-      grpc_lame_client_channel_create(/*target=*/nullptr, status,
-                                      std::string(why).c_str())));
+  return RefCountedPtr<Channel>(Channel::FromC(grpc_lame_client_channel_create(
+      /*target=*/nullptr, status, std::string(why).c_str())));
 }
 
 // Exact analog of MakeInprocChannel(...) but for shmem. [1]
-static RefCountedPtr<Channel> MakeShmemChannel(Server* server,
-                                               ChannelArgs client_channel_args) {
+static RefCountedPtr<Channel> MakeShmemChannel(
+    Server* server, ChannelArgs client_channel_args) {
   // 1) Build the transport pair using the server's ChannelArgs.
   auto transports = MakeShmemTransportPair(server->channel_args());
   auto client_transport = std::move(transports.first);
@@ -75,13 +85,15 @@ static RefCountedPtr<Channel> MakeShmemChannel(Server* server,
   //    Use DirectChannel::Create to avoid the legacy builder entirely.
   //
   //    See legacy builder rejecting promise transports (your error) here:
-  //    src/core/lib/surface/legacy_channel.cc (channel stack builder failed...).
+  //    src/core/lib/surface/legacy_channel.cc (channel stack builder
+  //    failed...).
   auto channel_result = DirectChannel::Create(
       "shmem",
       client_channel_args.Set(GRPC_ARG_DEFAULT_AUTHORITY, "shmem.authority")
-                          .SetObject(client_transport.get()));
+          .SetObject(client_transport.get()));
   if (!channel_result.ok()) {
-    return MakeLameChannel("Failed to create direct channel", channel_result.status());
+    return MakeLameChannel("Failed to create direct channel",
+                           channel_result.status());
   }
   // DirectChannel now owns the transport
   (void)client_transport.release();
@@ -91,16 +103,16 @@ static RefCountedPtr<Channel> MakeShmemChannel(Server* server,
 }  // namespace
 }  // namespace grpc_core
 
-extern "C" grpc_channel* grpc_shmem_channel_create(grpc_server* server,
-                                                   const grpc_channel_args* args,
-                                                   void* /*reserved*/) {
-  // Match inproc: ensure callback/exec contexts exist while we build channel. [2]
+extern "C" grpc_channel* grpc_shmem_channel_create(
+    grpc_server* server, const grpc_channel_args* args, void* /*reserved*/) {
+  // Match inproc: ensure callback/exec contexts exist while we build channel.
+  // [2]
   grpc_core::ExecCtx exec_ctx;
-  // Use the same channel-arg preconditioning as inproc before creating channel. [2]
-  auto client_args =
-      grpc_core::CoreConfiguration::Get()
-          .channel_args_preconditioning()
-          .PreconditionChannelArgs(args);
+  // Use the same channel-arg preconditioning as inproc before creating channel.
+  // [2]
+  auto client_args = grpc_core::CoreConfiguration::Get()
+                         .channel_args_preconditioning()
+                         .PreconditionChannelArgs(args);
   auto ch = grpc_core::MakeShmemChannel(grpc_core::Server::FromC(server),
                                         std::move(client_args));
   return ch.release()->c_ptr();
