@@ -11,13 +11,10 @@
 #include <optional>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/log/log.h"
 #include "src/core/call/metadata.h"
 #include <unistd.h>
-#include <optional>
 
 #include "absl/strings/str_cat.h"
-#include "grpc/support/log.h"
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/promise/map.h"
 #include "src/core/lib/promise/try_seq.h"
