@@ -60,7 +60,11 @@ class ShmemClientTransport final : public ClientTransport {
  public:
   ShmemClientTransport(RefCountedPtr<ShmemServerTransport> server,
                        grpc_shmem::ControlBlock* cb)
-      : server_(std::move(server)), cb_(cb) {}
+      : server_(std::move(server)), cb_(cb) {
+    MutexLock l(&state_mu_);
+    state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(), "init");
+    state_tracker_.SetState(GRPC_CHANNEL_READY, absl::OkStatus(), "shmem ready");
+  }
 
   void StartCall(CallHandler child_call_handler) override;
   void Orphan() override {
@@ -82,7 +86,18 @@ class ShmemClientTransport final : public ClientTransport {
   }
   void SetPollset(grpc_stream*, grpc_pollset*) override {}
   void SetPollsetSet(grpc_stream*, grpc_pollset_set*) override {}
-  void PerformOp(grpc_transport_op*) override {}
+  void PerformOp(grpc_transport_op* op) override {
+    if (op->start_connectivity_watch != nullptr) {
+      MutexLock l(&state_mu_);
+      state_tracker_.AddWatcher(op->start_connectivity_watch_state,
+                                std::move(op->start_connectivity_watch));
+    }
+    if (op->stop_connectivity_watch != nullptr) {
+      MutexLock l(&state_mu_);
+      state_tracker_.RemoveWatcher(op->stop_connectivity_watch);
+    }
+    ExecCtx::Run(DEBUG_LOCATION, op->on_consumed, absl::OkStatus());
+  }
 
  private:
   ~ShmemClientTransport() override = default;
@@ -95,6 +110,11 @@ class ShmemClientTransport final : public ClientTransport {
   std::thread reader_;
   std::atomic<uint32_t> next_stream_id_{1};
   int spin_iters_ = kDefaultSpinIters;
+
+  Mutex state_mu_;
+  ConnectivityStateTracker state_tracker_
+      ABSL_GUARDED_BY(state_mu_){"shmem_client_transport",
+                                 GRPC_CHANNEL_CONNECTING};
 
   Mutex mu_;
   absl::flat_hash_map<uint32_t, CallHandler> handlers_ ABSL_GUARDED_BY(mu_);

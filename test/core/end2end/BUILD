@@ -555,4 +555,5 @@ grpc_core_end2end_test_suite(
     deps = [
         "//:grpc_transport_shmem",
     ],
+    tags = ["no_windows"],
 )
