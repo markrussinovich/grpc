@@ -24,9 +24,11 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
                        uint64_t* out_offset) {
   if (size > rb->capacity) return false;
   
-  // For large messages (>1MB), use a more aggressive strategy
+  // For medium/large messages (>128KB), use a more aggressive strategy
+  // 256KB+ messages need more sophisticated handling due to fragmentation
+  const bool medium_message = size > (128 * 1024);
   const bool large_message = size > (1024 * 1024);
-  const int max_attempts = large_message ? 100 : 10;
+  const int max_attempts = large_message ? 100 : (medium_message ? 50 : 10);
   
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
     const uint64_t head = rb->head.load(std::memory_order_relaxed);
@@ -39,10 +41,12 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
         std::this_thread::yield();
       } else if (attempt < 20) {
         std::this_thread::sleep_for(std::chrono::nanoseconds(100));
-      } else if (large_message) {
-        // For large messages, aggressively advance tail to create space
-        const uint64_t advance_amount = std::min(static_cast<uint64_t>(size / 2), 
-                                                rb->capacity / 8);
+      } else if (medium_message) {
+        // For medium/large messages, aggressively advance tail to create space
+        // Use more conservative advancement for medium messages
+        const uint64_t advance_amount = large_message ? 
+          std::min(static_cast<uint64_t>(size / 2), rb->capacity / 8) :
+          std::min(static_cast<uint64_t>(size / 4), rb->capacity / 16);
         rb->tail.fetch_add(advance_amount, std::memory_order_acq_rel);
       } else {
         return false;
