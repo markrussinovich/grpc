@@ -4971,6 +4971,7 @@ grpc_cc_library(
     "//src/core/ext/transport/shmem:shmem_queue.cc",
     "//src/core/ext/transport/shmem:shmem_segment.cc",
     "//src/core/ext/transport/shmem:shmem_channel.cc",
+    "//src/core/ext/transport/shmem:shmem_legacy_transport.cc",
     ],
     hdrs = [
     "//src/core/ext/transport/shmem:shmem_transport.h",
@@ -4979,6 +4980,7 @@ grpc_cc_library(
     "//src/core/ext/transport/shmem:shmem_segment.h",
     "//src/core/ext/transport/shmem:shmem_protocol.h",
     "//src/core/ext/transport/shmem:shmem_memory.h",
+    "//src/core/ext/transport/shmem:shmem_legacy_transport.h",
     ],
     external_deps = [
         "absl/container:flat_hash_map",

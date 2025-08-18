@@ -34,6 +34,7 @@
 #include "src/core/client_channel/direct_channel.h"  // DirectChannel (promise stack)
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/shmem/shmem_transport.h"  // MakeShmemTransportPair
+#include "src/core/ext/transport/shmem/shmem_legacy_transport.h"  // legacy shim
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/resource_quota/resource_quota.h"
 #include "src/core/lib/surface/channel_create.h"
@@ -45,16 +46,45 @@
 namespace grpc_core {
 namespace {
 
-// Matches the lame-channel fallback used by inproc for error paths. [1]
-static RefCountedPtr<Channel> MakeLameChannel(absl::string_view why,
-                                              absl::Status error) {
+// Map absl::Status -> grpc_status_code, honoring kRpcStatus if present.
+static grpc_status_code MapToGrpcStatus(const absl::Status& st) {
   intptr_t integer;
-  grpc_status_code status = GRPC_STATUS_INTERNAL;
-  if (grpc_error_get_int(error, StatusIntProperty::kRpcStatus, &integer)) {
-    status = static_cast<grpc_status_code>(integer);
+  if (grpc_error_get_int(st, StatusIntProperty::kRpcStatus, &integer)) {
+    return static_cast<grpc_status_code>(integer);
   }
-  return RefCountedPtr<Channel>(Channel::FromC(grpc_lame_client_channel_create(
-      /*target=*/nullptr, status, std::string(why).c_str())));
+  using C = absl::StatusCode;
+  switch (st.code()) {
+    case C::kOk:                return GRPC_STATUS_OK;
+    case C::kCancelled:         return GRPC_STATUS_CANCELLED;
+    case C::kUnknown:           return GRPC_STATUS_UNKNOWN;
+    case C::kInvalidArgument:   return GRPC_STATUS_INVALID_ARGUMENT;
+    case C::kDeadlineExceeded:  return GRPC_STATUS_DEADLINE_EXCEEDED;
+    case C::kNotFound:          return GRPC_STATUS_NOT_FOUND;
+    case C::kAlreadyExists:     return GRPC_STATUS_ALREADY_EXISTS;
+    case C::kPermissionDenied:  return GRPC_STATUS_PERMISSION_DENIED;
+    case C::kResourceExhausted: return GRPC_STATUS_RESOURCE_EXHAUSTED;
+    case C::kFailedPrecondition:return GRPC_STATUS_FAILED_PRECONDITION;
+    case C::kAborted:           return GRPC_STATUS_ABORTED;
+    case C::kOutOfRange:        return GRPC_STATUS_OUT_OF_RANGE;
+    case C::kUnimplemented:     return GRPC_STATUS_UNIMPLEMENTED;
+    case C::kInternal:          return GRPC_STATUS_INTERNAL;
+    case C::kUnavailable:       return GRPC_STATUS_UNAVAILABLE;
+    case C::kDataLoss:          return GRPC_STATUS_DATA_LOSS;
+    case C::kUnauthenticated:   return GRPC_STATUS_UNAUTHENTICATED;
+    default:                    return GRPC_STATUS_INTERNAL;
+  }
+}
+
+// Build a lame channel using the mapped status + the original error message.
+static RefCountedPtr<Channel> MakeLameChannelFromStatus(const absl::Status& st,
+                                                        absl::string_view fallback_why) {
+  const grpc_status_code code = MapToGrpcStatus(st);
+  const std::string msg = st.message().empty()
+                              ? std::string(fallback_why)
+                              : std::string(st.message());
+  return RefCountedPtr<Channel>(
+      Channel::FromC(grpc_lame_client_channel_create(/*target=*/nullptr,
+                                                     code, msg.c_str())));
 }
 
 // Exact analog of MakeInprocChannel(...) but for shmem. [1]
@@ -74,10 +104,15 @@ static RefCountedPtr<Channel> MakeShmemChannel(
           .Remove(GRPC_ARG_MAX_CONNECTION_IDLE_MS)
           .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS),
       /*socket_node=*/nullptr);
+  
   if (!error.ok()) {
-    // DEBUG: SetupTransport failed - this means server transport was destroyed
-    // and SetCallDestination() will never be called, causing server_calls_created=0
-    return MakeLameChannel("Failed to create server channel", std::move(error));
+    // Check if this is a v3-incompatible filter error that needs legacy fallback
+    if (absl::StrContains(error.message(), "has no v3-callstack vtable")) {
+      // This filter cannot run on v3/promise stack, fallback to legacy
+      return MakeLegacyShmemChannel(server, client_channel_args);
+    }
+    // For other errors, propagate the original status/message 
+    return MakeLameChannelFromStatus(error, "server channel init failed");
   }
   // SetupTransport takes ownership through the vtable; don't delete it here.
   (void)server_transport.release();
@@ -92,8 +127,8 @@ static RefCountedPtr<Channel> MakeShmemChannel(
       GRPC_CLIENT_DIRECT_CHANNEL,
       /*optional_transport=*/client_transport.release());
   if (!channel_result.ok()) {
-    return MakeLameChannel("Failed to create direct channel",
-                           channel_result.status());
+    return MakeLameChannelFromStatus(channel_result.status(),
+                                     "direct channel creation failed");
   }
   return std::move(*channel_result);
 }

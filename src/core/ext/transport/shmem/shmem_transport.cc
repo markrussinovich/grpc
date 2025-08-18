@@ -68,13 +68,22 @@ class ShmemClientTransport final : public ClientTransport {
 
   void StartCall(CallHandler child_call_handler) override;
   void Orphan() override {
+    // Ensure callbacks can be scheduled during transport shutdown.
+    ExecCtx exec_ctx(GRPC_EXEC_CTX_FLAG_IS_FINISHED |
+                     GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP);
     stop_.store(true, std::memory_order_relaxed);
-    if (cb_ != nullptr) {
-      // Wake any waiting reader thread so it can observe stop_ and exit.
-      cb_->s2c_sem.post();
-      cb_->c2s_sem.post();
+    
+    // Only wake semaphores if a ring reader thread was started.
+    // In dispatch-only (in-proc) paths, no reader was started and the segment
+    // may have been unmapped already on the server side.
+    if (reader_started_.load(std::memory_order_acquire)) {
+      if (cb_ != nullptr) {
+        // Wake any waiting reader so it can observe stop_ and exit.
+        cb_->s2c_sem.post();
+        cb_->c2s_sem.post();
+      }
+      if (reader_.joinable()) reader_.join();
     }
-    if (reader_.joinable()) reader_.join();
     Unref();
   }
   FilterStackTransport* filter_stack_transport() override { return nullptr; }
@@ -207,18 +216,23 @@ class ShmemServerTransport final : public ServerTransport {
         active_calls_.clear();
       }
       // Ensure callbacks can be scheduled during shutdown.
-      ExecCtx exec_ctx;
+      ExecCtx exec_ctx(GRPC_EXEC_CTX_FLAG_IS_FINISHED |
+                       GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP);
       for (auto& kv : snapshot) {
         kv.second.SpawnCancel(absl::UnavailableError("server shutdown"));
       }
     }
     stop_.store(true, std::memory_order_relaxed);
-    if (cb_ != nullptr) {
-      // Wake any waiting reader thread so it can observe stop_ and exit.
-      cb_->c2s_sem.post();
-      cb_->s2c_sem.post();
+    
+    // Only post semaphores if the ring server loop was actually started.
+    if (reader_started_.load(std::memory_order_acquire)) {
+      if (cb_ != nullptr) {
+        // Wake any waiting reader thread so it can observe stop_ and exit.
+        cb_->c2s_sem.post();
+        cb_->s2c_sem.post();
+      }
+      if (reader_.joinable()) reader_.join();
     }
-    if (reader_.joinable()) reader_.join();
     Unref();
   }
   FilterStackTransport* filter_stack_transport() override { return nullptr; }
@@ -243,6 +257,8 @@ class ShmemServerTransport final : public ServerTransport {
     }
     // Server-initiated disconnect: finish all in-flight calls with UNAVAILABLE.
     if (!op->disconnect_with_error.ok()) {
+      ExecCtx exec_ctx(GRPC_EXEC_CTX_FLAG_IS_FINISHED |
+                       GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP);
       absl::Status st = op->disconnect_with_error;
       if (st.ok()) st = absl::UnavailableError("server shutdown");
       Disconnect(st);
@@ -253,7 +269,6 @@ class ShmemServerTransport final : public ServerTransport {
         active_calls_.clear();
       }
       // Finish calls with UNAVAILABLE status to match test expectations
-      ExecCtx exec_ctx;
       for (auto& kv : snapshot) {
         kv.second.SpawnCancel(absl::UnavailableError("server shutdown"));
       }
@@ -726,7 +741,8 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
   }
 
   // Ensure callbacks can be scheduled during call creation.
-  ExecCtx exec_ctx;
+  ExecCtx exec_ctx(GRPC_EXEC_CTX_FLAG_IS_FINISHED |
+                   GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP);
 
   auto arena = call_arena_allocator_->MakeArena();
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
