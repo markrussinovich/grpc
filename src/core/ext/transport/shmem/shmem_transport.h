@@ -125,7 +125,8 @@ namespace grpc_core {
 // Factory entry point used by tests and the surface integration later on.
 // Implemented in shmem_transport.cc.
 std::pair<OrphanablePtr<Transport>, OrphanablePtr<Transport>>
-MakeShmemTransportPair(const ChannelArgs& server_channel_args);
+MakeShmemTransportPair(const ChannelArgs& server_channel_args,
+                       const ChannelArgs& client_channel_args);
 
 }  // namespace grpc_core
 

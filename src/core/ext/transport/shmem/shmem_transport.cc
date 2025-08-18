@@ -44,6 +44,7 @@
 #include "src/core/lib/slice/slice.h"
 #include "src/core/lib/transport/connectivity_state.h"
 #include "src/core/lib/transport/transport.h"
+#include "src/core/channelz/channelz.h"
 
 namespace grpc_core {
 namespace {
@@ -59,7 +60,7 @@ class ShmemServerTransport;
 class ShmemClientTransport final : public ClientTransport {
  public:
   ShmemClientTransport(RefCountedPtr<ShmemServerTransport> server,
-                       grpc_shmem::ControlBlock* cb)
+                       grpc_shmem::ControlBlock* cb, const ChannelArgs& args)
       : server_(std::move(server)), cb_(cb) {
     MutexLock l(&state_mu_);
     state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(), "init");
@@ -68,9 +69,7 @@ class ShmemClientTransport final : public ClientTransport {
 
   void StartCall(CallHandler child_call_handler) override;
   void Orphan() override {
-    // Ensure callbacks can be scheduled during transport shutdown.
-    ExecCtx exec_ctx(GRPC_EXEC_CTX_FLAG_IS_FINISHED |
-                     GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP);
+    ExecCtx exec_ctx;
     stop_.store(true, std::memory_order_relaxed);
     
     // Only wake semaphores if a ring reader thread was started.
@@ -133,6 +132,7 @@ class ShmemClientTransport final : public ClientTransport {
   Mutex mu_;
   absl::flat_hash_map<uint32_t, CallHandler> handlers_ ABSL_GUARDED_BY(mu_);
   std::atomic<bool> reader_started_{false};
+
 };
 
 class ShmemServerTransport final : public ServerTransport {
@@ -147,6 +147,7 @@ class ShmemServerTransport final : public ServerTransport {
     }
     spin_iters_ = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
     dispatch_only_ = args.GetBool(kArgShmemDispatchOnly).value_or(true);
+    
     // Initialize call arena allocator from resource quota (or create one).
     ResourceQuota* rq = args.GetObject<ResourceQuota>();
     if (rq == nullptr) {
@@ -171,6 +172,7 @@ class ShmemServerTransport final : public ServerTransport {
     spin_iters_ = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
     dispatch_only_ = args.GetBool(kArgShmemDispatchOnly).value_or(true);
     cb_ = segment_ ? segment_->control() : nullptr;
+    
     // Initialize call arena allocator from resource quota (or create one).
     ResourceQuota* rq = args.GetObject<ResourceQuota>();
     if (rq == nullptr) {
@@ -720,6 +722,11 @@ class ShmemServerTransport final : public ServerTransport {
   ConnectivityStateTracker state_tracker_ ABSL_GUARDED_BY(state_tracker_mu_){
       "shmem_server_transport", GRPC_CHANNEL_CONNECTING};
 
+  // Channelz + tracing
+  std::atomic<uint64_t> calls_started_{0};
+  std::atomic<uint64_t> calls_succeeded_{0};
+  std::atomic<uint64_t> calls_failed_{0};
+
   void Disconnect(absl::Status error) {
     if (disconnecting_.exchange(true)) return;
     state_.store(ConnectionState::kDisconnected, std::memory_order_relaxed);
@@ -741,8 +748,7 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
   }
 
   // Ensure callbacks can be scheduled during call creation.
-  ExecCtx exec_ctx(GRPC_EXEC_CTX_FLAG_IS_FINISHED |
-                   GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP);
+  ExecCtx exec_ctx;
 
   auto arena = call_arena_allocator_->MakeArena();
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
@@ -761,6 +767,8 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
   {
     MutexLock lk(&active_mu_);
     active_calls_.emplace(stream_id, call.initiator);
+    // Count started calls for Channelz
+    calls_started_.fetch_add(1, std::memory_order_relaxed);
   }
   return std::move(call.initiator);
 }
@@ -908,9 +916,11 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  auto initiator =
                      server_->AnnounceAndGetInitiator(stream_id, std::move(md));
                  ForwardCall(child_call_handler, std::move(initiator),
-                             [this, stream_id](ServerMetadata&) {
+                             [this, stream_id](ServerMetadata& md) {
+                               // Only erase if we ever inserted (synthetic).
                                MutexLock lock(&mu_);
-                               handlers_.erase(stream_id);
+                               auto it = handlers_.find(stream_id);
+                               if (it != handlers_.end()) handlers_.erase(it);
                              });
                  return absl::OkStatus();
                } else {
@@ -922,7 +932,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                    auto initiator =
                        server_->AnnounceAndGetInitiator(stream_id, std::move(md));
                    ForwardCall(child_call_handler, std::move(initiator),
-                               [this, stream_id](ServerMetadata&) {
+                               [this, stream_id](ServerMetadata& md) {
                                  MutexLock lock(&mu_); handlers_.erase(stream_id);
                                });
                    return absl::OkStatus();
@@ -978,25 +988,32 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
 }  // namespace
 
 std::pair<OrphanablePtr<Transport>, OrphanablePtr<Transport>>
-MakeShmemTransportPair(const ChannelArgs& server_channel_args) {
-  // Create a shared memory segment for this pair.
+MakeShmemTransportPair(const ChannelArgs& server_channel_args,
+                       const ChannelArgs& client_channel_args) {
+  // Create a shared memory segment only if we will use ring queues.
   static std::atomic<uint64_t> pair_id{0};
-  grpc_shmem::SegmentConfig cfg;
-  cfg.name = absl::StrCat("grpc_shmem_", getpid(), "_", pair_id.fetch_add(1));
-  cfg.data_ring_capacity =
-      8 * 1024 * 1024;  // 8 MiB per-direction to support concurrency
-  // Allocate enough space for two rings plus control structures and allocator
-  // overhead.
-  cfg.size = 32 * 1024 * 1024;  // 32 MiB segment
-  grpc_shmem::ShmemSegment::RemoveIfExists(cfg.name);
-  auto segment = std::make_unique<grpc_shmem::ShmemSegment>(
-      grpc_shmem::ShmemSegment::Create(cfg));
-  auto cb = segment->control();
+  // Reuse same arg key as above:
+  const bool dispatch_only =
+      server_channel_args.GetBool("grpc.shmem.dispatch_only").value_or(true);
+
+  std::unique_ptr<grpc_shmem::ShmemSegment> segment;
+  grpc_shmem::ControlBlock* cb = nullptr;
+
+  if (!dispatch_only) {
+    grpc_shmem::SegmentConfig cfg;
+    cfg.name = absl::StrCat("grpc_shmem_", getpid(), "_", pair_id.fetch_add(1));
+    cfg.data_ring_capacity = 8 * 1024 * 1024;
+    cfg.size = 32 * 1024 * 1024;
+    grpc_shmem::ShmemSegment::RemoveIfExists(cfg.name);
+    auto s = grpc_shmem::ShmemSegment::Create(cfg);
+    segment = std::make_unique<grpc_shmem::ShmemSegment>(std::move(s));
+    cb = segment->control();
+  }
 
   auto server_transport = MakeOrphanable<ShmemServerTransport>(
       server_channel_args, std::move(segment));
   auto client_transport = MakeOrphanable<ShmemClientTransport>(
-      server_transport->RefAsSubclass<ShmemServerTransport>(), cb);
+      server_transport->RefAsSubclass<ShmemServerTransport>(), cb, client_channel_args);
   return {std::move(client_transport), std::move(server_transport)};
 }
 

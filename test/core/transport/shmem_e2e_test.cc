@@ -36,7 +36,7 @@ TEST(ShmemE2E, MetadataOnlyUnaryReturnsUnimplemented) {
                          .PreconditionChannelArgs(nullptr);
 
   // Create a transport pair.
-  auto pair = MakeShmemTransportPair(args);
+  auto pair = MakeShmemTransportPair(args, args);
   auto client = std::move(pair.first);
   auto server = std::move(pair.second);
 

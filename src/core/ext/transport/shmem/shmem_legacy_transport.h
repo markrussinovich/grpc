@@ -15,4 +15,9 @@ RefCountedPtr<Channel> MakeLegacyShmemChannel(Server* server, const ChannelArgs&
 
 }  // namespace grpc_core
 
+// Legacy shmem channel creation function (extern "C" for compatibility)
+extern "C" grpc_channel* grpc_legacy_shmem_channel_create(grpc_server* server,
+                                                         const grpc_channel_args* args,
+                                                         void* reserved);
+
 #endif

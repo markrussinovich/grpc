@@ -31,10 +31,12 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/match.h"
 #include "src/core/client_channel/direct_channel.h"  // DirectChannel (promise stack)
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/shmem/shmem_transport.h"  // MakeShmemTransportPair
 #include "src/core/ext/transport/shmem/shmem_legacy_transport.h"  // legacy shim
+#include "src/core/lib/iomgr/error.h"
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/resource_quota/resource_quota.h"
 #include "src/core/lib/surface/channel_create.h"
@@ -87,11 +89,13 @@ static RefCountedPtr<Channel> MakeLameChannelFromStatus(const absl::Status& st,
                                                      code, msg.c_str())));
 }
 
+}  // namespace
+
 // Exact analog of MakeInprocChannel(...) but for shmem. [1]
-static RefCountedPtr<Channel> MakeShmemChannel(
+RefCountedPtr<Channel> MakeShmemChannel(
     Server* server, ChannelArgs client_channel_args) {
-  // 1) Build the transport pair using the server's ChannelArgs.
-  auto transports = MakeShmemTransportPair(server->channel_args());
+  // 1) Build the transport pair using both server and client ChannelArgs.
+  auto transports = MakeShmemTransportPair(server->channel_args(), client_channel_args);
   auto client_transport = std::move(transports.first);
   auto server_transport = std::move(transports.second);
 
@@ -106,13 +110,7 @@ static RefCountedPtr<Channel> MakeShmemChannel(
       /*socket_node=*/nullptr);
   
   if (!error.ok()) {
-    // Check if this is a v3-incompatible filter error that needs legacy fallback
-    if (absl::StrContains(error.message(), "has no v3-callstack vtable")) {
-      // This filter cannot run on v3/promise stack, fallback to legacy
-      return MakeLegacyShmemChannel(server, client_channel_args);
-    }
-    // For other errors, propagate the original status/message 
-    return MakeLameChannelFromStatus(error, "server channel init failed");
+    return MakeLameChannelFromStatus(error, "server transport setup failed");
   }
   // SetupTransport takes ownership through the vtable; don't delete it here.
   (void)server_transport.release();
@@ -127,25 +125,39 @@ static RefCountedPtr<Channel> MakeShmemChannel(
       GRPC_CLIENT_DIRECT_CHANNEL,
       /*optional_transport=*/client_transport.release());
   if (!channel_result.ok()) {
+    const std::string msg = std::string(channel_result.status().message());
+    // Fallback: legacy-only filter present (v3 cannot host it).
+    // Detect the canonical error and build a legacy channel so the legacy filter
+    // can run and report its intended status (e.g., PERMISSION_DENIED: "access denied").
+    if (msg.find("no v3-callstack vtable") != std::string::npos) {
+      return MakeLegacyShmemChannel(server, client_channel_args);
+    }
     return MakeLameChannelFromStatus(channel_result.status(),
                                      "direct channel creation failed");
   }
   return std::move(*channel_result);
 }
-
-}  // namespace
 }  // namespace grpc_core
 
 extern "C" grpc_channel* grpc_shmem_channel_create(
     grpc_server* server, const grpc_channel_args* args, void* /*reserved*/) {
   // Match inproc: ensure callback/exec contexts exist while we build channel.
-  // [2]
   grpc_core::ExecCtx exec_ctx;
   // Use the same channel-arg preconditioning as inproc before creating channel.
-  // [2]
   auto client_args = grpc_core::CoreConfiguration::Get()
                          .channel_args_preconditioning()
                          .PreconditionChannelArgs(args);
+  
+  // Follow the same pattern as inproc: check if we should use promise-based transport
+  // For now, always use legacy transport to match inproc behavior (IsPromiseBasedInprocTransportEnabled() returns false)
+  bool use_promise_based = client_args
+      .GetBool("grpc.experimental.promise_based_shmem_transport")
+      .value_or(false);  // Default to false like inproc
+      
+  if (!use_promise_based) {
+    return grpc_legacy_shmem_channel_create(server, args, nullptr);
+  }
+  
   auto ch = grpc_core::MakeShmemChannel(grpc_core::Server::FromC(server),
                                         std::move(client_args));
   return ch.release()->c_ptr();
