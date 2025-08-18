@@ -1,0 +1,12 @@
+2025-08-18T03:15:12+00:00
+Running ./bazel-bin/test/cpp/microbenchmarks/bm_fullstack_unary_ping_pong
+Run on (96 X 2445.44 MHz CPU s)
+CPU Caches:
+  L1 Data 32 KiB (x96)
+  L1 Instruction 32 KiB (x96)
+  L2 Unified 512 KiB (x96)
+  L3 Unified 32768 KiB (x12)
+Load Average: 0.95, 0.46, 1.78
+name,iterations,real_time,cpu_time,time_unit,bytes_per_second,items_per_second,label,error_occurred,error_message
+"BM_UnaryPingPong<TCP, NoOpMutator, NoOpMutator>/0/0",12185,214470,110787,ns,0,,,,
+"BM_UnaryPingPong<TCP, NoOpMutator, NoOpMutator>/1/0",12637,218159,113610,ns,8802.06,,,,

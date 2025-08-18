@@ -5004,6 +5004,7 @@ grpc_cc_library(
         "grpc_base",
         "grpc_public_hdrs",
         "grpc_trace",
+        "//src/core:grpc_transport_inproc",
         "iomgr",
         "promise",
         "//src/core:map",

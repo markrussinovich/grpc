@@ -35,7 +35,7 @@
 #include "src/core/client_channel/direct_channel.h"  // DirectChannel (promise stack)
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/shmem/shmem_transport.h"  // MakeShmemTransportPair
-#include "src/core/ext/transport/shmem/shmem_legacy_transport.h"  // legacy shim
+#include "src/core/ext/transport/inproc/inproc_transport.h"  // legacy inproc creator
 #include "src/core/lib/iomgr/error.h"
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/resource_quota/resource_quota.h"
@@ -130,7 +130,18 @@ RefCountedPtr<Channel> MakeShmemChannel(
     // Detect the canonical error and build a legacy channel so the legacy filter
     // can run and report its intended status (e.g., PERMISSION_DENIED: "access denied").
     if (msg.find("no v3-callstack vtable") != std::string::npos) {
-      return MakeLegacyShmemChannel(server, client_channel_args);
+      // Use inproc legacy for full legacy filter+CQ behavior; preserve args except v3 flag.
+      auto legacy_args = client_channel_args.Remove(GRPC_ARG_USE_V3_STACK);
+      // inproc owns server transport setup internally.
+      grpc_channel* c = grpc_inproc_channel_create(server->c_ptr(),
+                                                   legacy_args.ToC().get(),
+                                                   /*reserved=*/nullptr);
+      if (c == nullptr) {
+        return MakeLameChannelFromStatus(
+            absl::InternalError("inproc legacy channel creation failed"),
+            "inproc legacy channel creation failed");
+      }
+      return RefCountedPtr<Channel>(Channel::FromC(c));
     }
     return MakeLameChannelFromStatus(channel_result.status(),
                                      "direct channel creation failed");
@@ -155,7 +166,8 @@ extern "C" grpc_channel* grpc_shmem_channel_create(
       .value_or(false);  // Default to false like inproc
       
   if (!use_promise_based) {
-    return grpc_legacy_shmem_channel_create(server, args, nullptr);
+    // Use inproc legacy for full legacy filter+CQ behavior; use original args.
+    return grpc_inproc_channel_create(server, args, nullptr);
   }
   
   auto ch = grpc_core::MakeShmemChannel(grpc_core::Server::FromC(server),
