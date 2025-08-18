@@ -15,7 +15,7 @@ The shared memory transport uses a dual-queue design with a shared data ring buf
 - **Command Queues**: Bidirectional lock-free queues (client-to-server and server-to-client) for control messages
 - **Data Ring Buffer**: Shared circular buffer for efficient large message transfer
 - **Control Block**: Shared metadata structure containing synchronization primitives and transport state
-- **Lightweight Synchronization**: Uses boost::interprocess semaphores for thread wake-up coordination
+- **Lightweight Synchronization**: Uses Linux eventfd-based semaphores for thread wake-up coordination
 
 ## Files
 
@@ -31,7 +31,8 @@ The shared memory transport uses a dual-queue design with a shared data ring buf
 ### Protocol Components
 * `shmem_protocol.h`: Protocol constants, magic numbers, and configuration defaults
 * `shmem_framer.h`, `shmem_framer.cc`: Message framing and serialization for the shared memory protocol
-* `shmem_queue.h`, `shmem_queue.cc`: Lock-free queue implementation using boost::lockfree::spsc_queue
+* `shmem_queue.h`, `shmem_queue.cc`: Lock-free queue implementation using custom SPSC queue
+* `shmem_lockfree_queue.h`: Custom single-producer single-consumer lock-free queue implementation
 
 ### Build Configuration
 * `BUILD`: Bazel build configuration defining the shmem transport library and dependencies
@@ -46,13 +47,13 @@ The shared memory transport uses a dual-queue design with a shared data ring buf
 ## Key Features
 
 ### Performance Optimizations
-* **Lock-free queues**: Uses boost::lockfree::spsc_queue for command passing
+* **Lock-free queues**: Uses custom SPSC (single-producer single-consumer) queue for command passing
 * **Zero-copy data transfer**: Large messages use shared ring buffer to avoid copying
 * **Configurable spinning**: Optional busy-waiting to reduce latency for high-frequency workloads
 * **Dispatch-only mode**: Optimized for event-driven applications
 
 ### Synchronization Model
-* **Lightweight semaphores**: boost::interprocess::interprocess_semaphore for thread coordination
+* **Lightweight semaphores**: EventFdSemaphore using Linux eventfd() for thread coordination
 * **Atomic state management**: Lock-free connection state tracking
 * **Efficient wake-up**: Producers only signal when consumers are waiting
 
@@ -85,7 +86,7 @@ Shared Memory Segment:
 ## Notes
 
 * The shared memory transport is designed for high-performance inter-process communication on the same machine. It is not suitable for network communication.
-* The transport uses boost::interprocess for cross-platform shared memory support, making it portable across different operating systems.
+* The transport uses POSIX shared memory (memfd_create/shm_open + mmap) for efficient memory management on Linux and other POSIX systems.
 * The lock-free queue design ensures high throughput and low latency, making it suitable for latency-critical applications.
 * Memory safety is ensured through careful lifetime management of shared memory segments and proper cleanup on transport destruction.
 * The transport supports both streaming and unary RPC patterns with full gRPC feature compatibility.

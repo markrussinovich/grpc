@@ -16,14 +16,11 @@
 #define GRPC_SRC_CORE_EXT_TRANSPORT_SHMEM_SHMEM_TRANSPORT_H
 
 #include <atomic>
-#include <boost/lockfree/spsc_queue.hpp>
 #include <cstdint>
 
 #include "src/core/lib/transport/transport.h"
 #include "src/core/ext/transport/shmem/shmem_semaphore.h"
-
-// Forward declarations for boost lockfree's spsc_queue template live in the
-// boost headers; we include the actual header above.
+#include "src/core/ext/transport/shmem/shmem_lockfree_queue.h"
 
 namespace grpc_shmem {
 
@@ -101,11 +98,10 @@ struct DataRingBuffer {
   unsigned char* buffer = nullptr;
 };
 
-// Define the command queue type using boost::lockfree. Capacity must be a power
-// of two.
+// Define the command queue type using our custom lock-free SPSC queue. 
+// Capacity must be a power of two.
 constexpr size_t COMMAND_QUEUE_CAPACITY = 256;
-using CommandQueue = boost::lockfree::spsc_queue<
-    Command, boost::lockfree::capacity<COMMAND_QUEUE_CAPACITY>>;
+using CommandQueue = SPSCQueue<Command, COMMAND_QUEUE_CAPACITY>;
 
 // Holds the pair of queues used for one direction of communication.
 struct ShmemQueues {

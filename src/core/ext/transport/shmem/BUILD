@@ -15,5 +15,6 @@ exports_files([
 	"shmem_memory.h",
 	"shmem_legacy_transport.h",
 	"shmem_semaphore.h",
+	"shmem_lockfree_queue.h",
 ])
 
