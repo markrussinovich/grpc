@@ -54,12 +54,16 @@ static void StreamingPingPongArgs(benchmark::internal::Benchmark* b) {
 
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, TCP, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
+BENCHMARK_TEMPLATE(BM_StreamingPingPong, UDS, NoOpMutator, NoOpMutator)
+    ->Apply(StreamingPingPongArgs);
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, InProcess, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, ShmemTransport, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
 
 BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, TCP, NoOpMutator, NoOpMutator)
+    ->Range(0, kMaxMessageSize);
+BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, UDS, NoOpMutator, NoOpMutator)
     ->Range(0, kMaxMessageSize);
 BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, InProcess, NoOpMutator,
                    NoOpMutator)
@@ -69,12 +73,16 @@ BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, ShmemTransport, NoOpMutator, NoOpMu
 
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, MinTCP, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
+BENCHMARK_TEMPLATE(BM_StreamingPingPong, MinUDS, NoOpMutator, NoOpMutator)
+    ->Apply(StreamingPingPongArgs);
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, MinInProcess, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
 BENCHMARK_TEMPLATE(BM_StreamingPingPong, MinShmemTransport, NoOpMutator, NoOpMutator)
     ->Apply(StreamingPingPongArgs);
 
 BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, MinTCP, NoOpMutator, NoOpMutator)
+    ->Range(0, kMaxMessageSize);
+BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, MinUDS, NoOpMutator, NoOpMutator)
     ->Range(0, kMaxMessageSize);
 BENCHMARK_TEMPLATE(BM_StreamingPingPongMsgs, MinInProcess, NoOpMutator,
                    NoOpMutator)

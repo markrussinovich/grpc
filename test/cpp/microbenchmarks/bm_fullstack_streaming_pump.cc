@@ -35,18 +35,24 @@ BENCHMARK_TEMPLATE(BM_PumpStreamClientToServer, UDS)
     ->Range(0, 128 * 1024 * 1024);
 BENCHMARK_TEMPLATE(BM_PumpStreamClientToServer, InProcess)
     ->Range(0, 128 * 1024 * 1024);
+BENCHMARK_TEMPLATE(BM_PumpStreamClientToServer, ShmemTransport)
+    ->Range(0, 128 * 1024 * 1024);
 BENCHMARK_TEMPLATE(BM_PumpStreamServerToClient, TCP)
     ->Range(0, 128 * 1024 * 1024);
 BENCHMARK_TEMPLATE(BM_PumpStreamServerToClient, UDS)
     ->Range(0, 128 * 1024 * 1024);
 BENCHMARK_TEMPLATE(BM_PumpStreamServerToClient, InProcess)
     ->Range(0, 128 * 1024 * 1024);
+BENCHMARK_TEMPLATE(BM_PumpStreamServerToClient, ShmemTransport)
+    ->Range(0, 128 * 1024 * 1024);
 BENCHMARK_TEMPLATE(BM_PumpStreamClientToServer, MinTCP)->Arg(0);
 BENCHMARK_TEMPLATE(BM_PumpStreamClientToServer, MinUDS)->Arg(0);
 BENCHMARK_TEMPLATE(BM_PumpStreamClientToServer, MinInProcess)->Arg(0);
+BENCHMARK_TEMPLATE(BM_PumpStreamClientToServer, MinShmemTransport)->Arg(0);
 BENCHMARK_TEMPLATE(BM_PumpStreamServerToClient, MinTCP)->Arg(0);
 BENCHMARK_TEMPLATE(BM_PumpStreamServerToClient, MinUDS)->Arg(0);
 BENCHMARK_TEMPLATE(BM_PumpStreamServerToClient, MinInProcess)->Arg(0);
+BENCHMARK_TEMPLATE(BM_PumpStreamServerToClient, MinShmemTransport)->Arg(0);
 
 }  // namespace testing
 }  // namespace grpc

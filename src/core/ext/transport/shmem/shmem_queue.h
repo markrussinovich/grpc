@@ -39,6 +39,10 @@ inline uint64_t RingFreeBytes(const DataRingBuffer& rb) {
 // spinning until space is available. This function is SPSC-safe.
 bool ReserveContiguous(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset);
 
+// Reserve space allowing wrapping - for very large messages
+// Returns true and fills out_offset. May wrap around ring buffer.
+bool ReserveWrapping(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset);
+
 // Release 'size' bytes previously consumed starting from some offset; simply
 // advance tail (consumer side responsibility).
 inline void Release(DataRingBuffer* rb, uint32_t size) {
