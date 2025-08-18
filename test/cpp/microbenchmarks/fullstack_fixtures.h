@@ -184,18 +184,7 @@ class ShmemTransport : public BaseFixture {
         grpc_core::Server::FromC(server_->c_server());
     grpc_core::ChannelArgs server_args = core_server->channel_args();
     
-    // Create shmem transport pair
-    auto transport_pair = grpc_core::MakeShmemTransportPair(server_args);
-    
-    // Set up server transport
-    server_transport_ = transport_pair.second.get();
-    CHECK(GRPC_LOG_IF_ERROR(
-        "SetupTransport", 
-        core_server->SetupTransport(transport_pair.second.get(),
-                                   nullptr, server_args)));
-    std::ignore = transport_pair.second.release();  // consumed by SetupTransport
-    
-    // Create client channel with the client transport
+    // Create client channel args
     grpc_core::ChannelArgs c_args;
     {
       ChannelArguments args;
@@ -210,6 +199,17 @@ class ShmemTransport : public BaseFixture {
     
     // Set v3 stack flag after preconditioning to avoid being overridden
     c_args = c_args.Set(GRPC_ARG_USE_V3_STACK, 1);
+    
+    // Create shmem transport pair
+    auto transport_pair = grpc_core::MakeShmemTransportPair(server_args, c_args);
+    
+    // Set up server transport
+    server_transport_ = transport_pair.second.get();
+    CHECK(GRPC_LOG_IF_ERROR(
+        "SetupTransport", 
+        core_server->SetupTransport(transport_pair.second.get(),
+                                   nullptr, server_args)));
+    std::ignore = transport_pair.second.release();  // consumed by SetupTransport
 
     client_transport_ = transport_pair.first.get();
     

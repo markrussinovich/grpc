@@ -14,5 +14,6 @@ exports_files([
 	"shmem_protocol.h",
 	"shmem_memory.h",
 	"shmem_legacy_transport.h",
+	"shmem_semaphore.h",
 ])
 

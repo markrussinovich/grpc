@@ -16,12 +16,11 @@
 #define GRPC_SRC_CORE_EXT_TRANSPORT_SHMEM_SHMEM_TRANSPORT_H
 
 #include <atomic>
-#include <boost/interprocess/offset_ptr.hpp>
-#include <boost/interprocess/sync/interprocess_semaphore.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
 #include <cstdint>
 
 #include "src/core/lib/transport/transport.h"
+#include "src/core/ext/transport/shmem/shmem_semaphore.h"
 
 // Forward declarations for boost lockfree's spsc_queue template live in the
 // boost headers; we include the actual header above.
@@ -44,16 +43,16 @@ struct ControlBlock {
   // --- Lightweight Synchronization Semaphores ---
   // Used to wake a sleeping reader thread when the command queue transitions
   // from empty to non-empty.
-  boost::interprocess::interprocess_semaphore c2s_sem;
-  boost::interprocess::interprocess_semaphore s2c_sem;
+  EventFdSemaphore c2s_sem;
+  EventFdSemaphore s2c_sem;
   // Set by the consumer just before sleeping; producers check this to avoid
   // spurious posts. 0 = not waiting, 1 = waiting.
   std::atomic<uint32_t> c2s_waiters{0};
   std::atomic<uint32_t> s2c_waiters{0};
 
   // --- Pointers to the new queue structures ---
-  boost::interprocess::offset_ptr<ShmemQueues> c2s_queues;
-  boost::interprocess::offset_ptr<ShmemQueues> s2c_queues;
+  ShmemQueues* c2s_queues;
+  ShmemQueues* s2c_queues;
 
   // Constructor to initialize fields and semaphores
   ControlBlock()
@@ -61,8 +60,6 @@ struct ControlBlock {
         transport_version(1),
         server_state(0),
         client_state(0),
-        c2s_sem(0),
-        s2c_sem(0),
         c2s_waiters(0),
         s2c_waiters(0),
         c2s_queues(nullptr),
@@ -101,7 +98,7 @@ struct DataRingBuffer {
   // head is advanced by the producer, tail by the consumer.
   std::atomic<uint64_t> head{0};
   std::atomic<uint64_t> tail{0};
-  boost::interprocess::offset_ptr<unsigned char> buffer{nullptr};
+  unsigned char* buffer = nullptr;
 };
 
 // Define the command queue type using boost::lockfree. Capacity must be a power

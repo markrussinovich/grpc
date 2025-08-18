@@ -37,7 +37,7 @@ grpc_slice MakeSliceFromRing(DataRingBuffer* rb, uint64_t offset,
                              uint32_t size) {
   // Note: we assume caller guaranteed contiguous region [offset, offset+size)
   // within the ring bounds (offset+size <= capacity).
-  unsigned char* ptr = rb->buffer.get() + offset;
+  unsigned char* ptr = rb->buffer + offset;
   auto* ud = new TailRelease{rb, size};
   return grpc_slice_new_with_user_data(ptr, size, &ReleaseTail, ud);
 }

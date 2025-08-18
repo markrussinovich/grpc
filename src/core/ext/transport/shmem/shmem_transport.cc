@@ -420,7 +420,7 @@ class ShmemServerTransport final : public ServerTransport {
       if (stop_.load(std::memory_order_relaxed)) break;
       grpc_shmem::Command cmd;
       bool has_command = grpc_shmem::PopCommandHybrid(
-          cb_->c2s_queues.get(), cb_, grpc_shmem::Direction::kC2S, spin_iters_,
+          cb_->c2s_queues, cb_, grpc_shmem::Direction::kC2S, spin_iters_,
           &cmd);
 
       if (!has_command) {
@@ -439,7 +439,7 @@ class ShmemServerTransport final : public ServerTransport {
               std::vector<grpc_shmem::KVPair> kvs_in;
               if (cmd.data_size > 0) {
                 const unsigned char* p =
-                    cb_->c2s_queues->data_rb.buffer.get() + cmd.data_offset;
+                    cb_->c2s_queues->data_rb.buffer + cmd.data_offset;
                 kvs_in = grpc_shmem::DeserializeMetadataKVs(p, cmd.data_size);
               }
               for (const auto& kv : kvs_in) {
@@ -469,7 +469,7 @@ class ShmemServerTransport final : public ServerTransport {
                 uint64_t off = 0;
                 grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
                                               buf.size(), &off);
-                std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off,
+                std::memcpy(cb_->s2c_queues->data_rb.buffer + off,
                             buf.data(), buf.size());
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -477,7 +477,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = 0;
-                grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
                                         grpc_shmem::Direction::kS2C, out);
               }
               st.sent_initial = true;
@@ -489,7 +489,7 @@ class ShmemServerTransport final : public ServerTransport {
           }
           case grpc_shmem::FrameType::C2S_MESSAGE: {
             const unsigned char* p =
-                cb_->c2s_queues->data_rb.buffer.get() + cmd.data_offset;
+                cb_->c2s_queues->data_rb.buffer + cmd.data_offset;
             // Synthetic cancel-by-payload (only for synthetic streams)
             if (st.synthetic && !st.sent_trailing && st.path == "/cancel" &&
                 cmd.data_size == 6 && memcmp(p, "cancel", 6) == 0) {
@@ -506,7 +506,7 @@ class ShmemServerTransport final : public ServerTransport {
                 uint64_t off = 0;
                 grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
                                               buf.size(), &off);
-                std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off,
+                std::memcpy(cb_->s2c_queues->data_rb.buffer + off,
                             buf.data(), buf.size());
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -514,7 +514,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = GRPC_STATUS_CANCELLED;
-                grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
                                         grpc_shmem::Direction::kS2C, out);
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
@@ -529,7 +529,7 @@ class ShmemServerTransport final : public ServerTransport {
               uint64_t off = 0;
               grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
                                             cmd.data_size, &off);
-              std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off, p,
+              std::memcpy(cb_->s2c_queues->data_rb.buffer + off, p,
                           cmd.data_size);
               grpc_shmem::Command out{};
               out.stream_id = cmd.stream_id;
@@ -537,7 +537,7 @@ class ShmemServerTransport final : public ServerTransport {
               out.data_offset = off;
               out.data_size = cmd.data_size;
               out.grpc_status_code = 0;
-              grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_,
+              grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
                                       grpc_shmem::Direction::kS2C, out);
               cb_->c2s_queues->data_rb.tail.fetch_add(
                   cmd.data_size, std::memory_order_release);
@@ -565,7 +565,7 @@ class ShmemServerTransport final : public ServerTransport {
                 uint64_t off = 0;
                 grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
                                               buf.size(), &off);
-                std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off,
+                std::memcpy(cb_->s2c_queues->data_rb.buffer + off,
                             buf.data(), buf.size());
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -573,7 +573,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = code;
-                grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
                                         grpc_shmem::Direction::kS2C, out);
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
@@ -603,7 +603,7 @@ class ShmemServerTransport final : public ServerTransport {
                 uint64_t off = 0;
                 grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
                                               buf.size(), &off);
-                std::memcpy(cb_->s2c_queues->data_rb.buffer.get() + off,
+                std::memcpy(cb_->s2c_queues->data_rb.buffer + off,
                             buf.data(), buf.size());
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -611,7 +611,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = GRPC_STATUS_CANCELLED;
-                grpc_shmem::PushCommand(cb_->s2c_queues.get(), cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
                                         grpc_shmem::Direction::kS2C, out);
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
@@ -786,7 +786,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
       for (;;) {
         if (stop_.load(std::memory_order_relaxed)) break;
         grpc_shmem::Command cmd;
-        if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues.get(), cb_,
+        if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues, cb_,
                                           grpc_shmem::Direction::kS2C,
                                           spin_iters_, &cmd)) {
           continue;
@@ -801,7 +801,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
         if (!handler) continue;
         switch (cmd.type) {
           case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
-            auto data = cb_->s2c_queues->data_rb.buffer.get() + cmd.data_offset;
+            auto data = cb_->s2c_queues->data_rb.buffer + cmd.data_offset;
             auto kvs = grpc_shmem::DeserializeMetadataKVs(data, cmd.data_size);
             handler->SpawnInfallible(
                 "push-initial", [kvs = std::move(kvs), h = *handler]() mutable {
@@ -846,7 +846,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
             break;
           }
           case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
-            auto data = cb_->s2c_queues->data_rb.buffer.get() + cmd.data_offset;
+            auto data = cb_->s2c_queues->data_rb.buffer + cmd.data_offset;
             auto kvs = grpc_shmem::DeserializeMetadataKVs(data, cmd.data_size);
             handler->SpawnInfallible(
                 "push-trailing", [kvs = std::move(kvs), h = *handler,
@@ -970,14 +970,14 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  uint64_t off = 0;
                  grpc_shmem::ReserveContiguous(&cb->c2s_queues->data_rb,
                                                vec.size(), &off);
-                 std::memcpy(cb->c2s_queues->data_rb.buffer.get() + off,
+                 std::memcpy(cb->c2s_queues->data_rb.buffer + off,
                              vec.data(), vec.size());
                  grpc_shmem::Command cmd{};
                  cmd.stream_id = stream_id;
                  cmd.type = grpc_shmem::FrameType::C2S_INITIAL_METADATA;
                  cmd.data_offset = off;
                  cmd.data_size = static_cast<uint32_t>(vec.size());
-                 grpc_shmem::PushCommand(cb->c2s_queues.get(), cb,
+                 grpc_shmem::PushCommand(cb->c2s_queues, cb,
                                          grpc_shmem::Direction::kC2S, cmd);
 
                  return absl::OkStatus();

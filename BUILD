@@ -4981,6 +4981,7 @@ grpc_cc_library(
     "//src/core/ext/transport/shmem:shmem_protocol.h",
     "//src/core/ext/transport/shmem:shmem_memory.h",
     "//src/core/ext/transport/shmem:shmem_legacy_transport.h",
+    "//src/core/ext/transport/shmem:shmem_semaphore.h",
     ],
     external_deps = [
         "absl/container:flat_hash_map",

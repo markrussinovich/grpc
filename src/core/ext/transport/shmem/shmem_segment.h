@@ -16,13 +16,17 @@
 #ifndef GRPC_SRC_CORE_EXT_TRANSPORT_SHMEM_SHMEM_SEGMENT_H
 #define GRPC_SRC_CORE_EXT_TRANSPORT_SHMEM_SHMEM_SEGMENT_H
 
-#include <boost/interprocess/managed_shared_memory.hpp>
-#include <boost/interprocess/shared_memory_object.hpp>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <string>
 
 #include "src/core/ext/transport/shmem/shmem_protocol.h"
 #include "src/core/ext/transport/shmem/shmem_transport.h"
+#include "src/core/ext/transport/shmem/shmem_semaphore.h"
 
 namespace grpc_shmem {
 
@@ -36,7 +40,7 @@ struct SegmentConfig {
 class ShmemSegment {
  public:
   ShmemSegment() = default;
-  ~ShmemSegment() = default;
+  ~ShmemSegment() { Unmap(); }
   ShmemSegment(ShmemSegment&& other) noexcept { MoveFrom(std::move(other)); }
   ShmemSegment& operator=(ShmemSegment&& other) noexcept {
     if (this != &other) MoveFrom(std::move(other));
@@ -60,25 +64,30 @@ class ShmemSegment {
   ControlBlock* control() const { return control_; }
 
  private:
-  explicit ShmemSegment(
-      std::string name,
-      std::unique_ptr<boost::interprocess::managed_shared_memory> seg,
-      ControlBlock* cb)
-      : name_(std::move(name)), segment_(std::move(seg)), control_(cb) {}
+  ShmemSegment(std::string name, void* base, size_t size, ControlBlock* cb, int fd)
+      : name_(std::move(name)), base_(base), size_(size), control_(cb), fd_(fd) {}
 
   void MoveFrom(ShmemSegment&& other) {
     name_ = std::move(other.name_);
-    segment_ = std::move(other.segment_);
-    control_ = other.control_;
-    other.control_ = nullptr;
+    base_ = other.base_;
+    size_ = other.size_;
+    control_ = other.control_; other.control_ = nullptr;
+    fd_ = other.fd_; other.fd_ = -1;
   }
 
-  static void InitQueues(boost::interprocess::managed_shared_memory& seg,
-                         ControlBlock* cb, std::size_t data_ring_capacity);
+  static void InitQueues(void* base, size_t size, ControlBlock* cb,
+                         std::size_t data_ring_capacity);
+
+  static int CreateFd(const std::string& name, size_t size, std::string* created_name);
+  static int OpenFd(const std::string& name, size_t* size_out);
+  static void* Map(int fd, size_t size);
+  void Unmap();
 
   std::string name_;
-  std::unique_ptr<boost::interprocess::managed_shared_memory> segment_;
+  void* base_ = nullptr;
+  size_t size_ = 0;
   ControlBlock* control_ = nullptr;  // points into segment_
+  int fd_ = -1;
 };
 
 }  // namespace grpc_shmem
