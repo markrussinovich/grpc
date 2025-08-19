@@ -43,14 +43,30 @@ class GreeterServiceImpl final : public Greeter::Service {
 };
 
 void RunServer() {
+  std::cout << "Starting server..." << std::endl;
   std::string server_address("shmem://grpc_shmem_example");
+  
+  std::cout << "Creating service..." << std::endl;
   GreeterServiceImpl service;
+  
+  std::cout << "Enabling health check..." << std::endl;
   grpc::EnableDefaultHealthCheckService(true);
+  
+  std::cout << "Initializing reflection..." << std::endl;
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+  
+  std::cout << "Creating ServerBuilder..." << std::endl;
   ServerBuilder builder;
+  
+  std::cout << "Adding listening port: " << server_address << std::endl;
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  
+  std::cout << "Registering service..." << std::endl;
   builder.RegisterService(&service);
+  
+  std::cout << "Building and starting server..." << std::endl;
   std::unique_ptr<Server> server(builder.BuildAndStart());
+  
   std::cout << "Server listening on " << server_address << " ... ";
   server->Wait();
 }

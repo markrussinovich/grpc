@@ -1,0 +1,19 @@
+#!/bin/bash
+# Simple test to isolate the crash
+
+set -e
+
+echo "Testing basic server construction..."
+timeout 1s ./bazel-bin/examples/cpp/shmem/server &
+SERVER_PID=$!
+sleep 0.1
+
+if kill -0 $SERVER_PID 2>/dev/null; then
+    echo "Server is still running after 0.1s - good sign"
+    kill $SERVER_PID 2>/dev/null || true
+    wait $SERVER_PID 2>/dev/null || true
+    echo "Server test completed"
+else
+    echo "Server crashed immediately"
+    exit 1
+fi

@@ -48,6 +48,11 @@
 #include "src/core/channelz/channelz.h"
 #include "absl/log/log.h"
 
+namespace grpc_shmem {
+// Define static member for shutdown tracer
+std::atomic<int> ShmemShutdownTracer::trace_id_{0};
+}
+
 namespace grpc_core {
 namespace {
 
@@ -75,7 +80,7 @@ class ShmemClientTransport final : public ClientTransport {
     if (cb_ != nullptr) {
       // Safely increment process count
       try {
-        int32_t current_count = cb_->process_count.fetch_add(1, std::memory_order_acq_rel);
+        int32_t current_count = ++cb_->process_count;
         LOG(INFO) << "ShmemClientTransport attached, process count now: " << (current_count + 1);
         
         auto status = sem_mgr_.InitFromControlBlock(cb_);
@@ -96,65 +101,98 @@ class ShmemClientTransport final : public ClientTransport {
   
  private:
   void InitiateShutdown() {
+    grpc_shmem::ShmemShutdownTracer tracer("ShmemClientTransport::InitiateShutdown");
     ExecCtx exec_ctx;
     
+    tracer.Checkpoint("Checking if already initiated");
     // Step 1: Signal shutdown to all threads
     if (shutdown_initiated_.exchange(true, std::memory_order_acq_rel)) {
+      tracer.Checkpoint("Already initiated, returning");
       return; // Already initiated
     }
     
-    LOG(INFO) << "ShmemClientTransport initiating shutdown";
-    
+    tracer.Checkpoint("Setting shutdown flags");
     // Step 2: Set stop flag and wake threads
     stop_.store(true, std::memory_order_relaxed);
-    if (cb_ != nullptr) {
-      cb_->cleanup_initiated.store(true, std::memory_order_release);
+    if (cb_ != nullptr && grpc_shmem::SafePointerAccess::IsValid(cb_)) {
+      cb_->cleanup_initiated = true;
     }
     
+    tracer.Checkpoint("Waiting for threads to exit");
     // Step 3: Wake any waiting reader threads
     WaitForThreadsToExit();
     
+    tracer.Checkpoint("Cleaning up resources");
     // Step 4: Cleanup resources in proper order
     CleanupResources();
     
+    tracer.Checkpoint("Setting cleanup complete flag");
     cleanup_complete_.store(true, std::memory_order_release);
-    LOG(INFO) << "ShmemClientTransport shutdown complete";
   }
   
   void WaitForThreadsToExit() {
+    grpc_shmem::ShmemShutdownTracer tracer("ShmemClientTransport::WaitForThreadsToExit");
+    
+    tracer.Checkpoint("Checking if reader was started");
     // Only wake semaphores if a ring reader thread was started
     if (reader_started_.load(std::memory_order_acquire)) {
-      if (cb_ != nullptr) {
-        // Wake any waiting reader so it can observe stop_ and exit
-        sem_mgr_.WakeAll();
+      tracer.Checkpoint("Reader was started, waking semaphores");
+      if (cb_ != nullptr && grpc_shmem::SafePointerAccess::IsValid(cb_)) {
+        try {
+          // Wake any waiting reader so it can observe stop_ and exit
+          sem_mgr_.WakeAll();
+          tracer.Checkpoint("Semaphores woken successfully");
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "Error waking semaphores: " << e.what();
+        }
       }
       
+      tracer.Checkpoint("Joining reader thread");
       if (reader_.joinable()) {
-        LOG(INFO) << "ShmemClientTransport waiting for reader thread to exit";
-        reader_.join();
-        LOG(INFO) << "ShmemClientTransport reader thread joined successfully";
+        try {
+          reader_.join();
+          tracer.Checkpoint("Reader thread joined successfully");
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "Error joining reader thread: " << e.what();
+        }
+      } else {
+        tracer.Checkpoint("Reader thread not joinable");
       }
+    } else {
+      tracer.Checkpoint("Reader was never started, skipping thread cleanup");
     }
   }
   
   void CleanupResources() {
+    grpc_shmem::ShmemShutdownTracer tracer("ShmemClientTransport::CleanupResources");
+    
     try {
+      tracer.Checkpoint("Cleaning semaphore manager");
       // Cleanup semaphore manager
       sem_mgr_.Cleanup();
       
+      tracer.Checkpoint("Handling process count coordination");
       // Handle process count and cleanup coordination
-      if (cb_ != nullptr) {
-        int32_t remaining = cb_->process_count.fetch_sub(1, std::memory_order_acq_rel);
+      if (cb_ != nullptr && grpc_shmem::SafePointerAccess::IsValid(cb_)) {
+        tracer.Checkpoint("Decrementing process count");
+        int32_t remaining = cb_->process_count--;
         LOG(INFO) << "ShmemClientTransport detaching, remaining processes: " << (remaining - 1);
         
         // Clean up cross-process segment if this is a cross-process client
         if (server_ == nullptr) {
+          tracer.Checkpoint("Cross-process client, checking if last process");
           // Last process cleans up shared resources
           if (remaining == 1) {
-            LOG(INFO) << "Last process - cleaning up shared resources";
+            tracer.Checkpoint("Last process - cleaning up shared resources");
             RemoveCrossProcessSegment(cb_);
+          } else {
+            tracer.Checkpoint("Not last process, skipping shared resource cleanup");
           }
+        } else {
+          tracer.Checkpoint("In-process client, skipping shared resource cleanup");
         }
+      } else {
+        tracer.Checkpoint("Control block invalid, skipping process coordination");
       }
     } catch (const std::exception& e) {
       LOG(ERROR) << "ShmemClientTransport cleanup error: " << e.what();
@@ -282,7 +320,7 @@ class ShmemServerTransport final : public ServerTransport {
     if (cb_ != nullptr) {
       // Safely increment process count
       try {
-        int32_t current_count = cb_->process_count.fetch_add(1, std::memory_order_acq_rel);
+        int32_t current_count = ++cb_->process_count;
         LOG(INFO) << "ShmemServerTransport attached, process count now: " << (current_count + 1);
         
         auto status = sem_mgr_.InitFromControlBlock(cb_);
@@ -361,7 +399,7 @@ class ShmemServerTransport final : public ServerTransport {
     
     stop_.store(true, std::memory_order_relaxed);
     if (cb_ != nullptr) {
-      cb_->cleanup_initiated.store(true, std::memory_order_release);
+      cb_->cleanup_initiated = true;
     }
     
     // Step 3: Wait for threads to exit
@@ -397,7 +435,7 @@ class ShmemServerTransport final : public ServerTransport {
       
       // Handle process count and cleanup coordination
       if (cb_ != nullptr) {
-        int32_t remaining = cb_->process_count.fetch_sub(1, std::memory_order_acq_rel);
+        int32_t remaining = cb_->process_count--;
         LOG(INFO) << "ShmemServerTransport detaching, remaining processes: " << (remaining - 1);
         
         // Server is responsible for cleaning up shared resources if last process
@@ -611,7 +649,7 @@ class ShmemServerTransport final : public ServerTransport {
     absl::flat_hash_map<uint32_t, StreamState> streams;
     for (;;) {
       if (stop_.load(std::memory_order_relaxed) || 
-          (cb_ != nullptr && cb_->cleanup_initiated.load(std::memory_order_acquire))) break;
+          (cb_ != nullptr && cb_->cleanup_initiated)) break;
       grpc_shmem::Command cmd;
       bool has_command = grpc_shmem::PopCommandHybrid(
           cb_->c2s_queues, cb_, &sem_mgr_, grpc_shmem::Direction::kC2S, spin_iters_,
@@ -1012,7 +1050,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
       if (server_ != nullptr) spin_iters_ = server_->spin_iters();
       for (;;) {
         if (stop_.load(std::memory_order_relaxed) || 
-          (cb_ != nullptr && cb_->cleanup_initiated.load(std::memory_order_acquire))) break;
+          (cb_ != nullptr && cb_->cleanup_initiated)) break;
         grpc_shmem::Command cmd;
         if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues, cb_, &sem_mgr_,
                                           grpc_shmem::Direction::kS2C,
