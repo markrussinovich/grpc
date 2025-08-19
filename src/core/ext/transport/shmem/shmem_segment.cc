@@ -219,9 +219,9 @@ ShmemSegment ShmemSegment::Open(const std::string& name) {
     return {};
   }
 
-  // Verify the control block
+  // Verify the control block using atomic load
   auto* cb = reinterpret_cast<ControlBlock*>(base);
-  if (cb->magic_number != 0x47525043534D454Dull) {  // "GRPCSMEM"
+  if (cb->magic_number.load(std::memory_order_acquire) != 0x47525043534D454Dull) {  // "GRPCSMEM"
     ::munmap(base, size);
     ::close(fd);
     return {};

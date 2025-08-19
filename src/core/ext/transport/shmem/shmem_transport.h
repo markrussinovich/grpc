@@ -73,8 +73,8 @@ class SafePointerAccess {
 // The master control block, located at the beginning of the shared memory
 // segment.
 struct ControlBlock {
-  uint64_t magic_number;
-  uint32_t transport_version;
+  std::atomic<uint64_t> magic_number;
+  std::atomic<uint32_t> transport_version;
   std::atomic<uint32_t> server_state;
   std::atomic<uint32_t> client_state;
 

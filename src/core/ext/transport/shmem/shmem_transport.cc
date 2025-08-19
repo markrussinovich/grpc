@@ -351,7 +351,7 @@ class ShmemServerTransport final : public ServerTransport {
       LOG(INFO) << "Got control block: " << cb_;
       
       if (cb_) {
-        LOG(INFO) << "ControlBlock magic: " << std::hex << cb_->magic_number;
+        LOG(INFO) << "ControlBlock magic: " << std::hex << cb_->magic_number.load(std::memory_order_acquire);
         LOG(INFO) << "ControlBlock c2s_queues: " << cb_->GetC2SQueues();
         LOG(INFO) << "ControlBlock s2c_queues: " << cb_->GetS2CQueues();
         
@@ -656,16 +656,21 @@ class ShmemServerTransport final : public ServerTransport {
     printf("DEBUG: cb_ is valid, checking basic fields\n");
     fflush(stdout);
     
-    // Check if we can read basic fields
+    // Check if we can read basic fields using atomic operations
     try {
-      printf("DEBUG: Reading magic number...\n");
+      printf("DEBUG: Reading magic number with atomic load...\n");
       fflush(stdout);
-      auto magic = cb_->magic_number;
-      printf("DEBUG: Reading version...\n");
+      uint64_t magic = cb_->magic_number.load(std::memory_order_acquire);
+      printf("DEBUG: Reading version with atomic load...\n");
       fflush(stdout);
-      auto version = cb_->transport_version;
-      printf("DEBUG: ControlBlock magic: 0x%lx, version: %u\n", magic, version);
+      uint32_t version = cb_->transport_version.load(std::memory_order_acquire);
+      printf("DEBUG: ControlBlock magic: 0x%lx, version: %u (GRPCSMEM=0x47525043534D454D)\n", magic, version);
       fflush(stdout);
+      
+      if (magic != 0x47525043534D454Dull) {  // "GRPCSMEM" magic
+        printf("DEBUG: WARNING - Invalid magic number, expected 0x47525043534D454D\n");
+        fflush(stdout);
+      }
     } catch (...) {
       printf("DEBUG: FATAL - Cannot read ControlBlock basic fields!\n");
       fflush(stdout);
