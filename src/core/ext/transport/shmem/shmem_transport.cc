@@ -821,17 +821,42 @@ class ShmemServerTransport final : public ServerTransport {
       st.dispatched_unary->call_announced = true;
     };
     absl::flat_hash_map<uint32_t, StreamState> streams;
+    int loop_count = 0;
+    printf("DEBUG: ServerLoop: Starting command processing loop\n");
+    fflush(stdout);
+    
     for (;;) {
       if (stop_.load(std::memory_order_relaxed)) break;  // REVERTED: Remove cleanup_initiated check
+      loop_count++;
+      
+      // Log every 50 iterations to show server is alive
+      if (loop_count % 50 == 0) {
+        printf("DEBUG: ServerLoop: Iteration %d, checking for commands\n", loop_count);
+        fflush(stdout);
+        
+        // Check if we can access queues
+        auto* c2s_queues = cb_->GetC2SQueues();
+        if (!c2s_queues) {
+          printf("DEBUG: WARNING - C2S queues pointer is null\n");
+          fflush(stdout);
+        }
+      }
+      
       grpc_shmem::Command cmd;
       bool has_command = grpc_shmem::PopCommandHybrid(
           cb_->GetC2SQueues(), cb_, grpc_shmem::Direction::kC2S, spin_iters_,
           &cmd, sem_adapter_.get());
-
-      if (!has_command) {
-        // No command available - check stop flag again before continuing
-        // This handles the case where we're using in-process bootstrap and no
-        // C2S commands are coming
+      
+      if (has_command) {
+        printf("DEBUG: ServerLoop: GOT COMMAND! Type: %d, Stream ID: %u (iteration %d)\n", 
+               static_cast<int>(cmd.type), cmd.stream_id, loop_count);
+        fflush(stdout);
+      } else {
+        // Only log on first few iterations and then every 100 iterations
+        if (loop_count <= 5 || (loop_count % 100 == 0)) {
+          printf("DEBUG: ServerLoop: No command available (iteration %d)\n", loop_count);
+          fflush(stdout);
+        }
         continue;
       }
 
