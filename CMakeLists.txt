@@ -2344,12 +2344,9 @@ add_library(grpc
   src/core/ext/transport/chttp2/transport/writing.cc
   src/core/ext/transport/inproc/inproc_transport.cc
   src/core/ext/transport/inproc/legacy_inproc_transport.cc
-  src/core/ext/transport/shmem/shmem_transport.cc
-  src/core/ext/transport/shmem/shmem_segment.cc
-  src/core/ext/transport/shmem/shmem_queue.cc
-  src/core/ext/transport/shmem/shmem_framer.cc
-# TODO(shmem): add proper find_package(Boost COMPONENTS interprocess) and
-# target_link_libraries once the transport wires into a dedicated target.
+# Shmem transport - Linux-specific implementation
+  src/core/ext/transport/shmem/shmem_channel.cc
+  src/core/ext/transport/shmem/shmem_legacy_transport.cc
   src/core/ext/upb-gen/envoy/admin/v3/certs.upb_minitable.c
   src/core/ext/upb-gen/envoy/admin/v3/clusters.upb_minitable.c
   src/core/ext/upb-gen/envoy/admin/v3/config_dump.upb_minitable.c
@@ -3055,6 +3052,19 @@ add_library(grpc
   src/core/xds/xds_client/xds_bootstrap.cc
   src/core/xds/xds_client/xds_client.cc
 )
+
+# Add shmem transport sources conditionally for Linux
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_sources(grpc PRIVATE
+    src/core/ext/transport/shmem/shmem_transport.cc
+    src/core/ext/transport/shmem/shmem_segment.cc
+    src/core/ext/transport/shmem/shmem_queue.cc
+    src/core/ext/transport/shmem/shmem_framer.cc)
+  target_compile_definitions(grpc PRIVATE GRPC_SHMEM_LINUX)
+else()
+  target_sources(grpc PRIVATE
+    src/core/ext/transport/shmem/shmem_transport_stub.cc)
+endif()
 
 target_compile_features(grpc PUBLIC cxx_std_17)
 

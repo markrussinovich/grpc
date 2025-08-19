@@ -153,6 +153,13 @@ bloaty-build/
 
 # cmake build files
 **/cmake/build/
+cmake_build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+gRPCConfig*.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
 
 # Visual Studio Code artifacts
 .cache/*
@@ -193,3 +200,6 @@ fuzz-*.log
 # bazel module files
 third_party/**/MODULE.bazel
 MODULE.bazel.lock
+
+# shmem build artifacts
+src/core/ext/transport/shmem/*.o
