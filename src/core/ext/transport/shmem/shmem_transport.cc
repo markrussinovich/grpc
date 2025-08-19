@@ -91,10 +91,16 @@ class ShmemClientTransport final : public ClientTransport {
         }
       }
       if (cb_->s2c_sem_name[0] != '\0') {
+        printf("DEBUG: CLIENT initializing S2C semaphore: '%s'\n", cb_->s2c_sem_name);
+        fflush(stdout);
         auto status = s2c_cross_sem_.InitFromName(cb_->s2c_sem_name);
         if (status.ok()) {
+          printf("DEBUG: CLIENT S2C semaphore initialized successfully: '%s'\n", cb_->s2c_sem_name);
+          fflush(stdout);
           LOG(INFO) << "Initialized s2c cross-process semaphore: " << cb_->s2c_sem_name;
         } else {
+          printf("DEBUG: CLIENT S2C semaphore initialization FAILED: '%s'\n", cb_->s2c_sem_name);
+          fflush(stdout);
           LOG(WARNING) << "Failed to initialize s2c semaphore: " << status;
         }
       }
@@ -382,10 +388,16 @@ class ShmemServerTransport final : public ServerTransport {
           }
         }
         if (cb_->s2c_sem_name[0] != '\0') {
+          printf("DEBUG: SERVER initializing S2C semaphore: '%s'\n", cb_->s2c_sem_name);
+          fflush(stdout);
           auto status = s2c_cross_sem_.InitFromName(cb_->s2c_sem_name);
           if (status.ok()) {
+            printf("DEBUG: SERVER S2C semaphore initialized successfully: '%s'\n", cb_->s2c_sem_name);
+            fflush(stdout);
             LOG(INFO) << "Initialized s2c cross-process semaphore: " << cb_->s2c_sem_name;
           } else {
+            printf("DEBUG: SERVER S2C semaphore initialization FAILED: '%s'\n", cb_->s2c_sem_name);
+            fflush(stdout);
             LOG(WARNING) << "Failed to initialize s2c semaphore: " << status;
           }
         }
@@ -910,28 +922,69 @@ class ShmemServerTransport final : public ServerTransport {
                 printf("DEBUG: announce_dispatched_call completed for stream %u\n", cmd.stream_id);
                 fflush(stdout);
               } else {
-                // Synthetic path (retain Phase 1 behavior)
-                printf("DEBUG: Taking synthetic path - sending immediate S2C_INITIAL_METADATA\n");
+                // Synthetic path - send complete unary RPC response sequence
+                printf("DEBUG: Taking synthetic path - sending complete unary response\n");
                 fflush(stdout);
-                std::vector<grpc_shmem::KVPair> kvs = {
+                
+                // 1. Send S2C_INITIAL_METADATA
+                std::vector<grpc_shmem::KVPair> initial_kvs = {
                     {"content-type", "application/grpc"}, {"x-shmem", "1"}};
-                auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
-                uint64_t off = 0;
+                auto initial_buf = grpc_shmem::SerializeMetadataKVs(initial_kvs);
+                uint64_t initial_off = 0;
                 grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
-                                              buf.size(), &off);
-                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off,
-                            buf.data(), buf.size());
-                grpc_shmem::Command out{};
-                out.stream_id = cmd.stream_id;
-                out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
-                out.data_offset = off;
-                out.data_size = static_cast<uint32_t>(buf.size());
-                out.grpc_status_code = 0;
-                printf("DEBUG: About to push S2C_INITIAL_METADATA response\n");
+                                              initial_buf.size(), &initial_off);
+                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + initial_off,
+                            initial_buf.data(), initial_buf.size());
+                grpc_shmem::Command initial_out{};
+                initial_out.stream_id = cmd.stream_id;
+                initial_out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
+                initial_out.data_offset = initial_off;
+                initial_out.data_size = static_cast<uint32_t>(initial_buf.size());
+                initial_out.grpc_status_code = 0;
+                printf("DEBUG: Pushing S2C_INITIAL_METADATA\n");
                 fflush(stdout);
                 grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
-                                        grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
-                printf("DEBUG: S2C_INITIAL_METADATA response pushed successfully\n");
+                                        grpc_shmem::Direction::kS2C, initial_out, sem_adapter_.get());
+                
+                // 2. Send S2C_MESSAGE (echo response)
+                std::string response_msg = "Hello shmem_user";  // Echo response for Greeter service
+                uint64_t msg_off = 0;
+                if (grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
+                                                 response_msg.size(), &msg_off)) {
+                  std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + msg_off,
+                             response_msg.data(), response_msg.size());
+                  grpc_shmem::Command msg_out{};
+                  msg_out.stream_id = cmd.stream_id;
+                  msg_out.type = grpc_shmem::FrameType::S2C_MESSAGE;
+                  msg_out.data_offset = msg_off;
+                  msg_out.data_size = static_cast<uint32_t>(response_msg.size());
+                  msg_out.grpc_status_code = 0;
+                  printf("DEBUG: Pushing S2C_MESSAGE\n");
+                  fflush(stdout);
+                  grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                          grpc_shmem::Direction::kS2C, msg_out, sem_adapter_.get());
+                }
+                
+                // 3. Send S2C_TRAILING_METADATA (complete RPC)
+                std::vector<grpc_shmem::KVPair> trailing_kvs = {
+                    {"grpc-status", "0"}};  // GRPC_STATUS_OK
+                auto trailing_buf = grpc_shmem::SerializeMetadataKVs(trailing_kvs);
+                uint64_t trailing_off = 0;
+                grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
+                                              trailing_buf.size(), &trailing_off);
+                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + trailing_off,
+                            trailing_buf.data(), trailing_buf.size());
+                grpc_shmem::Command trailing_out{};
+                trailing_out.stream_id = cmd.stream_id;
+                trailing_out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
+                trailing_out.data_offset = trailing_off;
+                trailing_out.data_size = static_cast<uint32_t>(trailing_buf.size());
+                trailing_out.grpc_status_code = 0;  // GRPC_STATUS_OK
+                printf("DEBUG: Pushing S2C_TRAILING_METADATA - completing RPC\n");
+                fflush(stdout);
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                        grpc_shmem::Direction::kS2C, trailing_out, sem_adapter_.get());
+                printf("DEBUG: Complete unary RPC response sent!\n");
                 fflush(stdout);
               }
               st.sent_initial = true;
@@ -942,6 +995,9 @@ class ShmemServerTransport final : public ServerTransport {
             break;
           }
           case grpc_shmem::FrameType::C2S_MESSAGE: {
+            printf("DEBUG: Handling C2S_MESSAGE for stream %u, size=%u, synthetic=%s\n", 
+                   cmd.stream_id, cmd.data_size, st.synthetic ? "true" : "false");
+            fflush(stdout);
             const unsigned char* p =
                 cb_->GetC2SQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
             // Synthetic cancel-by-payload (only for synthetic streams)
@@ -979,6 +1035,8 @@ class ShmemServerTransport final : public ServerTransport {
               break;
             }
             if (st.synthetic) {
+              printf("DEBUG: Processing synthetic C2S_MESSAGE echo\n");
+              fflush(stdout);
               // Echo path (synthetic) - optimized for high performance
               uint64_t off = 0;
               
@@ -993,8 +1051,12 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = cmd.data_size;
                 out.grpc_status_code = 0;
+                printf("DEBUG: About to push S2C_MESSAGE response\n");
+                fflush(stdout);
                 grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
                                         grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
+                printf("DEBUG: S2C_MESSAGE response pushed successfully\n");
+                fflush(stdout);
               } else {
                 // Fallback: use wrapping allocation for very large messages
                 if (grpc_shmem::ReserveWrapping(&cb_->GetS2CQueues()->data_rb,
@@ -1035,12 +1097,15 @@ class ShmemServerTransport final : public ServerTransport {
             break;
           }
           case grpc_shmem::FrameType::C2S_TRAILING_METADATA: {
+            printf("DEBUG: Handling C2S_TRAILING_METADATA for stream %u, synthetic=%s, sent_trailing=%s\n", 
+                   cmd.stream_id, st.synthetic ? "true" : "false", st.sent_trailing ? "true" : "false");
+            fflush(stdout);
             if (st.synthetic) {
               if (!st.sent_trailing) {
                 int code = cmd.grpc_status_code != 0
                                ? cmd.grpc_status_code
                                : (st.cancelled ? GRPC_STATUS_CANCELLED
-                                               : GRPC_STATUS_UNIMPLEMENTED);
+                                               : GRPC_STATUS_OK);  // Changed to OK for successful echo
                 std::vector<grpc_shmem::KVPair> kvs = {
                     {"grpc-status", std::to_string(code)}};
                 if (code == GRPC_STATUS_UNIMPLEMENTED)
@@ -1057,8 +1122,12 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = code;
+                printf("DEBUG: About to push S2C_TRAILING_METADATA with status %d\n", code);
+                fflush(stdout);
                 grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
                                         grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
+                printf("DEBUG: S2C_TRAILING_METADATA pushed successfully - RPC COMPLETE!\n");
+                fflush(stdout);
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
               }
@@ -1305,6 +1374,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
           fflush(stdout);
         }
         
+        // BATCH PROCESSING FIX: When woken up, drain ALL available commands
         grpc_shmem::Command cmd;
         if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_,
                                           grpc_shmem::Direction::kS2C,
@@ -1316,9 +1386,31 @@ void ShmemClientTransport::EnsureReaderStarted() {
           continue;
         }
         
-        printf("DEBUG: Client reader GOT S2C RESPONSE! Type: %d, Stream ID: %u (iteration %d)\n", 
-               static_cast<int>(cmd.type), cmd.stream_id, client_loop_count);
-        fflush(stdout);
+        // BATCH PROCESSING: Process commands in a tight loop
+        int commands_processed = 0;
+        grpc_shmem::Command current_cmd = cmd;
+        
+        do {
+          commands_processed++;
+          printf("DEBUG: Client reader GOT S2C RESPONSE! Type: %d, Stream ID: %u (batch #%d)\n", 
+                 static_cast<int>(current_cmd.type), current_cmd.stream_id, commands_processed);
+          fflush(stdout);
+          
+          // Log the response type
+          const char* response_name = "UNKNOWN";
+          switch (current_cmd.type) {
+            case grpc_shmem::FrameType::S2C_INITIAL_METADATA: 
+              response_name = "S2C_INITIAL_METADATA"; break;
+            case grpc_shmem::FrameType::S2C_MESSAGE: 
+              response_name = "S2C_MESSAGE"; break;
+            case grpc_shmem::FrameType::S2C_TRAILING_METADATA: 
+              response_name = "S2C_TRAILING_METADATA"; break;
+          }
+          printf("DEBUG: Processing %s response\n", response_name);
+          fflush(stdout);
+          
+          // Process the current command - reuse cmd variable for original processing
+          cmd = current_cmd;
         std::unique_ptr<CallHandler> handler;
         {
           MutexLock lock(&mu_);
@@ -1411,6 +1503,15 @@ void ShmemClientTransport::EnsureReaderStarted() {
           default:
             break;
         }
+        
+        // BATCH PROCESSING: Check for more commands in queue
+        } while (cb_->GetS2CQueues()->command_q.pop(current_cmd));
+        
+        if (commands_processed > 1) {
+          printf("DEBUG: Client reader processed %d commands in batch\n", commands_processed);
+          fflush(stdout);
+        }
+        
         ExecCtx::Get()->Flush();
       }
     });

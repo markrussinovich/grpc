@@ -145,36 +145,71 @@ bool ReserveWrapping(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset) {
 }
 
 static inline void Post(ControlBlock* cb, Direction dir, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
+  const char* dir_name = (dir == Direction::kC2S) ? "C2S" : "S2C";
+  printf("DEBUG: Post %s - sem_adapter: %p\n", dir_name, sem_adapter);
+  fflush(stdout);
   if (sem_adapter) {
+    printf("DEBUG: Post %s - calling sem_adapter->Post\n", dir_name);
+    fflush(stdout);
     // Use cross-process semaphores via semaphore adapter
     sem_adapter->Post(cb, dir == Direction::kC2S);
+    printf("DEBUG: Post %s - sem_adapter->Post completed\n", dir_name);
+    fflush(stdout);
   } else {
     // Fallback: Skip posting if no semaphore adapter available
+    printf("DEBUG: Post %s - no semaphore adapter available!\n", dir_name);
+    fflush(stdout);
     LOG(WARNING) << "Post() called without semaphore adapter - skipping";
   }
 }
 
 static inline void Wait(ControlBlock* cb, Direction dir, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
+  const char* dir_name = (dir == Direction::kC2S) ? "C2S" : "S2C";
+  printf("DEBUG: Wait %s - sem_adapter: %p\n", dir_name, sem_adapter);
+  fflush(stdout);
   if (sem_adapter) {
+    printf("DEBUG: Wait %s - calling sem_adapter->Wait\n", dir_name);
+    fflush(stdout);
     // Use cross-process semaphores via semaphore adapter
     sem_adapter->Wait(dir == Direction::kC2S);
+    printf("DEBUG: Wait %s - sem_adapter->Wait returned (woke up!)\n", dir_name);
+    fflush(stdout);
   } else {
     // Fallback: Skip waiting if no semaphore adapter available
+    printf("DEBUG: Wait %s - no semaphore adapter available!\n", dir_name);
+    fflush(stdout);
     LOG(WARNING) << "Wait() called without semaphore adapter - skipping";
   }
 }
 
 bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
                  const Command& cmd, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
+  const char* dir_name = (dir == Direction::kC2S) ? "C2S" : "S2C";
+  printf("DEBUG: PushCommand %s - queue empty: %s\n", dir_name, q->command_q.empty() ? "true" : "false");
+  fflush(stdout);
+  
   // Check if queue was empty before pushing - if so, we need to signal
   const bool was_empty = q->command_q.empty();
   const bool ok = q->command_q.push(cmd);
+  printf("DEBUG: PushCommand %s - push result: %s\n", dir_name, ok ? "success" : "failed");
+  fflush(stdout);
+  
   if (ok && was_empty) {
+    // Memory barrier to ensure command is visible before checking waiters
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    
     // Only post if queue was empty AND consumer is waiting
-    // Further reduces kernel transitions by checking waiter state
     std::atomic<uint32_t>* waiters = (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
-    if (waiters->load(std::memory_order_relaxed)) {
+    uint32_t waiter_count = waiters->load(std::memory_order_acquire);
+    printf("DEBUG: PushCommand %s - queue was empty, waiter count: %u\n", dir_name, waiter_count);
+    fflush(stdout);
+    if (waiter_count > 0) {
+      printf("DEBUG: PushCommand %s - posting semaphore\n", dir_name);
+      fflush(stdout);
       Post(cb, dir, sem_adapter);
+    } else {
+      printf("DEBUG: PushCommand %s - no waiters, skipping semaphore post\n", dir_name);
+      fflush(stdout);
     }
   }
   return ok;
@@ -182,6 +217,15 @@ bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
 
 bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
                       int spin_iters, Command* out, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
+  const char* dir_name = (dir == Direction::kC2S) ? "C2S" : "S2C";
+  static int pop_call_count = 0;
+  pop_call_count++;
+  
+  if (pop_call_count <= 10 || pop_call_count % 50 == 0) {
+    printf("DEBUG: PopCommandHybrid %s - call #%d\n", dir_name, pop_call_count);
+    fflush(stdout);
+  }
+  
   Command tmp;
   
   // Adaptive spinning: more spins for high throughput scenarios  
@@ -189,6 +233,10 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   for (int i = 0; i < effective_spins; ++i) {
     if (q->command_q.pop(tmp)) {
       *out = tmp;
+      if (pop_call_count <= 10) {
+        printf("DEBUG: PopCommandHybrid %s - found command in spin loop\n", dir_name);
+        fflush(stdout);
+      }
       return true;
     }
     // Yield every few iterations to avoid excessive CPU usage
@@ -200,16 +248,23 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   // Declare intent to sleep, then re-check before actually sleeping to avoid
   // lost wakeups
   std::atomic<uint32_t>* waiters = (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
+  if (pop_call_count <= 10) {
+    printf("DEBUG: PopCommandHybrid %s - setting waiter flag\n", dir_name);
+    fflush(stdout);
+  }
   waiters->store(1, std::memory_order_release);
   
-  // One last check after setting waiters flag
+  // Memory barrier to ensure waiter flag is visible before checking queue
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  
+  // One last check after setting waiters flag and memory barrier
   if (q->command_q.pop(tmp)) {
     *out = tmp;
     waiters->store(0, std::memory_order_relaxed);
     return true;
   }
   
-  // Sleep until woken up by producer
+  // Sleep until woken up by producer (event-driven)
   Wait(cb, dir, sem_adapter);
   waiters->store(0, std::memory_order_relaxed);
   
