@@ -195,22 +195,14 @@ bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
   fflush(stdout);
   
   if (ok && was_empty) {
-    // Memory barrier to ensure command is visible before checking waiters
+    // Memory barrier to ensure command is visible before posting
     std::atomic_thread_fence(std::memory_order_seq_cst);
     
-    // Only post if queue was empty AND consumer is waiting
-    std::atomic<uint32_t>* waiters = (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
-    uint32_t waiter_count = waiters->load(std::memory_order_acquire);
-    printf("DEBUG: PushCommand %s - queue was empty, waiter count: %u\n", dir_name, waiter_count);
+    // Always post when queue transitions from empty to non-empty
+    // This ensures reliable event-driven wakeup regardless of timing races
+    printf("DEBUG: PushCommand %s - queue was empty, posting semaphore (event-driven)\n", dir_name);
     fflush(stdout);
-    if (waiter_count > 0) {
-      printf("DEBUG: PushCommand %s - posting semaphore\n", dir_name);
-      fflush(stdout);
-      Post(cb, dir, sem_adapter);
-    } else {
-      printf("DEBUG: PushCommand %s - no waiters, skipping semaphore post\n", dir_name);
-      fflush(stdout);
-    }
+    Post(cb, dir, sem_adapter);
   }
   return ok;
 }

@@ -898,7 +898,7 @@ class ShmemServerTransport final : public ServerTransport {
               // dispatch_only_ = false indicates ring mode (cross-process)
               const bool is_cancel_path = (st.path == "/cancel");
               const bool is_cross_process = !dispatch_only_;
-              const bool use_synthetic = is_cancel_path || is_cross_process;
+              const bool use_synthetic = is_cancel_path || is_cross_process;  // Use synthetic for cross-process demo
               printf("DEBUG: is_cancel_path = %s, is_cross_process = %s, using %s path\n", 
                      is_cancel_path ? "true" : "false",
                      is_cross_process ? "true" : "false",
@@ -1405,6 +1405,12 @@ void ShmemClientTransport::EnsureReaderStarted() {
               response_name = "S2C_MESSAGE"; break;
             case grpc_shmem::FrameType::S2C_TRAILING_METADATA: 
               response_name = "S2C_TRAILING_METADATA"; break;
+            case grpc_shmem::FrameType::C2S_INITIAL_METADATA:
+            case grpc_shmem::FrameType::C2S_MESSAGE:
+            case grpc_shmem::FrameType::C2S_TRAILING_METADATA:
+            case grpc_shmem::FrameType::C2S_CANCEL:
+            default:
+              response_name = "UNEXPECTED_FRAME_TYPE"; break;
           }
           printf("DEBUG: Processing %s response\n", response_name);
           fflush(stdout);
@@ -1473,10 +1479,17 @@ void ShmemClientTransport::EnsureReaderStarted() {
                                   stream_id = cmd.stream_id, this]() mutable {
                   auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
                   grpc_status_code status = GRPC_STATUS_UNKNOWN;
+                  printf("DEBUG: Processing S2C_TRAILING_METADATA, parsing %zu kvs\n", kvs.size());
+                  fflush(stdout);
                   for (const auto& kv : kvs) {
+                    printf("DEBUG: KV pair: '%s' = '%s'\n", kv.key.c_str(), kv.value.c_str());
+                    fflush(stdout);
                     if (kv.key == "grpc-status") {
                       status =
                           static_cast<grpc_status_code>(atoi(kv.value.c_str()));
+                      printf("DEBUG: Parsed grpc-status: %d (%s)\n", status, 
+                             status == GRPC_STATUS_OK ? "GRPC_STATUS_OK" : "ERROR");
+                      fflush(stdout);
                     } else if (kv.key == "grpc-message") {
                       md->Set(GrpcMessageMetadata(),
                               Slice::FromCopiedString(kv.value));
@@ -1485,6 +1498,8 @@ void ShmemClientTransport::EnsureReaderStarted() {
                                  [](absl::string_view, const Slice&) {});
                     }
                   }
+                  printf("DEBUG: Setting final status: %d, calling SpawnPushServerTrailingMetadata\n", status);
+                  fflush(stdout);
                   md->Set(GrpcStatusMetadata(), status);
                   h.SpawnPushServerTrailingMetadata(std::move(md));
 
@@ -1504,13 +1519,12 @@ void ShmemClientTransport::EnsureReaderStarted() {
             break;
         }
         
-        // BATCH PROCESSING: Check for more commands in queue
-        } while (cb_->GetS2CQueues()->command_q.pop(current_cmd));
+        // Process one command at a time for proper gRPC sequencing
+        // This ensures each message is fully processed before the next
+        } while (false);  // Only process one command per wake-up
         
-        if (commands_processed > 1) {
-          printf("DEBUG: Client reader processed %d commands in batch\n", commands_processed);
-          fflush(stdout);
-        }
+        printf("DEBUG: Client reader processed 1 command (sequential processing)\n");
+        fflush(stdout);
         
         ExecCtx::Get()->Flush();
       }
