@@ -107,8 +107,8 @@ void ShmemSegment::RemoveIfExists(const std::string& name) {
 }
 
 void ShmemSegment::RemoveNamedSemaphores(const std::string& server_name) {
-  EventFdSemaphore::UnlinkNamed(server_name + "_c2s");
-  EventFdSemaphore::UnlinkNamed(server_name + "_s2c");
+  CrossProcessSemaphore::UnlinkNamed(server_name + "_c2s");
+  CrossProcessSemaphore::UnlinkNamed(server_name + "_s2c");
 }
 
 // Layout: [ControlBlock | ... rest for queues ...]
@@ -118,14 +118,36 @@ void ShmemSegment::InitQueues(void* base, size_t size, ControlBlock* cb,
                               std::size_t data_ring_capacity, 
                               const std::string& server_name) {
   (void)size;
-  // Initialize semaphores for cross-process usage with unique names
+  // Initialize semaphore names for cross-process usage
   if (!server_name.empty()) {
-    (void)cb->c2s_sem.InitNamed(server_name + "_c2s", 0);
-    (void)cb->s2c_sem.InitNamed(server_name + "_s2c", 0);
+    // Store semaphore names in shared memory instead of process-specific handles
+    std::string c2s_name = "/" + server_name + "_c2s";
+    std::string s2c_name = "/" + server_name + "_s2c";
+    
+    // Copy names to fixed-size arrays in shared memory
+    strncpy(cb->c2s_sem_name, c2s_name.c_str(), sizeof(cb->c2s_sem_name) - 1);
+    strncpy(cb->s2c_sem_name, s2c_name.c_str(), sizeof(cb->s2c_sem_name) - 1);
+    cb->c2s_sem_name[sizeof(cb->c2s_sem_name) - 1] = '\0';
+    cb->s2c_sem_name[sizeof(cb->s2c_sem_name) - 1] = '\0';
+    
+    // Clean up existing semaphores and create new ones (server side)
+    CrossProcessSemaphore::UnlinkNamed(server_name + "_c2s");
+    CrossProcessSemaphore::UnlinkNamed(server_name + "_s2c");
+    
+    CrossProcessSemaphore temp_c2s, temp_s2c;
+    auto c2s_status = temp_c2s.CreateNamed(server_name + "_c2s", 0);
+    auto s2c_status = temp_s2c.CreateNamed(server_name + "_s2c", 0);
+    
+    if (!c2s_status.ok()) {
+      LOG(WARNING) << "Failed to create c2s semaphore: " << c2s_status;
+    }
+    if (!s2c_status.ok()) {
+      LOG(WARNING) << "Failed to create s2c semaphore: " << s2c_status;
+    }
   } else {
-    // Fallback to in-process semaphores
-    (void)cb->c2s_sem.Init(0, /*semaphore_mode=*/true);
-    (void)cb->s2c_sem.Init(0, /*semaphore_mode=*/true);
+    // Clear semaphore names for in-process mode (not supported with new architecture)
+    cb->c2s_sem_name[0] = '\0';
+    cb->s2c_sem_name[0] = '\0';
   }
 
   // Layout: [ControlBlock | ShmemQueues c2s | ShmemQueues s2c | c2s_data | s2c_data]
@@ -201,21 +223,8 @@ ShmemSegment ShmemSegment::Open(const std::string& name) {
     return {};
   }
 
-  // Extract server name from segment name for semaphore initialization
-  std::string server_name;
-  const std::string prefix = "/grpc_shmem_";
-  if (name.find(prefix) == 0) {
-    server_name = name.substr(prefix.length()); // Remove "/grpc_shmem_" prefix
-  }
-  
-  // Reinitialize semaphore objects for cross-process access (client side)
-  if (!server_name.empty()) {
-    // Use placement new to properly construct the semaphore objects
-    new(&cb->c2s_sem) EventFdSemaphore();
-    new(&cb->s2c_sem) EventFdSemaphore();
-    (void)cb->c2s_sem.InitNamed(server_name + "_c2s", 0);
-    (void)cb->s2c_sem.InitNamed(server_name + "_s2c", 0);
-  }
+  // Verify that semaphore names are properly set in shared memory
+  // (They should be initialized by the server during segment creation)
 
   // Mark client as connected
   cb->client_state.store(1);

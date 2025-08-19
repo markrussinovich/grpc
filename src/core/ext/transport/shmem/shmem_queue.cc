@@ -144,24 +144,20 @@ bool ReserveWrapping(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset) {
   return false;
 }
 
-static inline void Post(ControlBlock* cb, Direction dir) {
-  if (dir == Direction::kC2S) {
-    // Use relaxed ordering since eventfd provides synchronization
-    if (cb->c2s_waiters.load(std::memory_order_relaxed)) cb->c2s_sem.post();
-  } else {
-    if (cb->s2c_waiters.load(std::memory_order_relaxed)) cb->s2c_sem.post();
+static inline void Post(ControlBlock* cb, SemaphoreManager* sem_mgr, Direction dir) {
+  if (sem_mgr != nullptr) {
+    sem_mgr->Post(cb, dir == Direction::kC2S);
   }
 }
 
-static inline void Wait(ControlBlock* cb, Direction dir) {
-  if (dir == Direction::kC2S)
-    cb->c2s_sem.wait();
-  else
-    cb->s2c_sem.wait();
+static inline void Wait(SemaphoreManager* sem_mgr, Direction dir) {
+  if (sem_mgr != nullptr) {
+    sem_mgr->Wait(dir == Direction::kC2S);
+  }
 }
 
-bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
-                 const Command& cmd) {
+bool PushCommand(ShmemQueues* q, ControlBlock* cb, SemaphoreManager* sem_mgr,
+                 Direction dir, const Command& cmd) {
   // Check if queue was empty before pushing - if so, we need to signal
   const bool was_empty = q->command_q.empty();
   const bool ok = q->command_q.push(cmd);
@@ -170,14 +166,14 @@ bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
     // Further reduces kernel transitions by checking waiter state
     std::atomic<uint32_t>* waiters = (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
     if (waiters->load(std::memory_order_relaxed)) {
-      Post(cb, dir);
+      Post(cb, sem_mgr, dir);
     }
   }
   return ok;
 }
 
-bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
-                      int spin_iters, Command* out) {
+bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, SemaphoreManager* sem_mgr,
+                      Direction dir, int spin_iters, Command* out) {
   Command tmp;
   
   // Adaptive spinning: more spins for high throughput scenarios  
@@ -206,7 +202,7 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   }
   
   // Sleep until woken up by producer
-  Wait(cb, dir);
+  Wait(sem_mgr, dir);
   waiters->store(0, std::memory_order_relaxed);
   
   // Upon wake, try again (one attempt)

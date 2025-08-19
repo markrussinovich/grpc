@@ -70,6 +70,14 @@ class ShmemClientTransport final : public ClientTransport {
     MutexLock l(&state_mu_);
     state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(), "init");
     state_tracker_.SetState(GRPC_CHANNEL_READY, absl::OkStatus(), "shmem ready");
+    
+    // Initialize semaphore manager for cross-process communication
+    if (cb_ != nullptr) {
+      auto status = sem_mgr_.InitFromControlBlock(cb_);
+      if (!status.ok()) {
+        LOG(WARNING) << "Failed to initialize semaphore manager: " << status;
+      }
+    }
   }
 
   void StartCall(CallHandler child_call_handler) override;
@@ -83,8 +91,7 @@ class ShmemClientTransport final : public ClientTransport {
     if (reader_started_.load(std::memory_order_acquire)) {
       if (cb_ != nullptr) {
         // Wake any waiting reader so it can observe stop_ and exit.
-        cb_->s2c_sem.post();
-        cb_->c2s_sem.post();
+        sem_mgr_.WakeAll();
       }
       if (reader_.joinable()) reader_.join();
     }
@@ -135,6 +142,7 @@ class ShmemClientTransport final : public ClientTransport {
   std::thread reader_;
   std::atomic<uint32_t> next_stream_id_{1};
   int spin_iters_ = kDefaultSpinIters;
+  grpc_shmem::SemaphoreManager sem_mgr_;  // Cross-process semaphore manager
 
   Mutex state_mu_;
   ConnectivityStateTracker state_tracker_
@@ -209,6 +217,14 @@ class ShmemServerTransport final : public ServerTransport {
     dispatch_only_ = args.GetBool(kArgShmemDispatchOnly).value_or(true);
     cb_ = segment_ ? segment_->control() : nullptr;
     
+    // Initialize semaphore manager for cross-process communication
+    if (cb_ != nullptr) {
+      auto status = sem_mgr_.InitFromControlBlock(cb_);
+      if (!status.ok()) {
+        LOG(WARNING) << "Failed to initialize semaphore manager: " << status;
+      }
+    }
+    
     // Initialize call arena allocator from resource quota (or create one).
     ResourceQuota* rq = args.GetObject<ResourceQuota>();
     if (rq == nullptr) {
@@ -266,8 +282,7 @@ class ShmemServerTransport final : public ServerTransport {
     if (reader_started_.load(std::memory_order_acquire)) {
       if (cb_ != nullptr) {
         // Wake any waiting reader thread so it can observe stop_ and exit.
-        cb_->c2s_sem.post();
-        cb_->s2c_sem.post();
+        sem_mgr_.WakeAll();
       }
       if (reader_.joinable()) reader_.join();
     }
@@ -456,7 +471,7 @@ class ShmemServerTransport final : public ServerTransport {
       if (stop_.load(std::memory_order_relaxed)) break;
       grpc_shmem::Command cmd;
       bool has_command = grpc_shmem::PopCommandHybrid(
-          cb_->c2s_queues, cb_, grpc_shmem::Direction::kC2S, spin_iters_,
+          cb_->c2s_queues, cb_, &sem_mgr_, grpc_shmem::Direction::kC2S, spin_iters_,
           &cmd);
 
       if (!has_command) {
@@ -513,7 +528,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = 0;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
                                         grpc_shmem::Direction::kS2C, out);
               }
               st.sent_initial = true;
@@ -550,7 +565,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = GRPC_STATUS_CANCELLED;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
                                         grpc_shmem::Direction::kS2C, out);
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
@@ -575,7 +590,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = cmd.data_size;
                 out.grpc_status_code = 0;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
                                         grpc_shmem::Direction::kS2C, out);
               } else {
                 // Fallback: use wrapping allocation for very large messages
@@ -599,7 +614,7 @@ class ShmemServerTransport final : public ServerTransport {
                   out.data_offset = off;
                   out.data_size = cmd.data_size;
                   out.grpc_status_code = 0;
-                  grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
+                  grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
                                           grpc_shmem::Direction::kS2C, out);
                 }
                 // If both allocations fail, drop the message (better than hanging)
@@ -639,7 +654,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = code;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
                                         grpc_shmem::Direction::kS2C, out);
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
@@ -677,7 +692,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = GRPC_STATUS_CANCELLED;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_,
+                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
                                         grpc_shmem::Direction::kS2C, out);
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
@@ -740,6 +755,7 @@ class ShmemServerTransport final : public ServerTransport {
 
   std::unique_ptr<grpc_shmem::ShmemSegment> segment_;
   grpc_shmem::ControlBlock* cb_ = nullptr;
+  grpc_shmem::SemaphoreManager sem_mgr_;  // Cross-process semaphore manager
   RefCountedPtr<UnstartedCallDestination> dest_;
   Mutex dest_mu_;
   // Signal when SetCallDestination() has installed the acceptor.
@@ -852,7 +868,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
       for (;;) {
         if (stop_.load(std::memory_order_relaxed)) break;
         grpc_shmem::Command cmd;
-        if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues, cb_,
+        if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues, cb_, &sem_mgr_,
                                           grpc_shmem::Direction::kS2C,
                                           spin_iters_, &cmd)) {
           continue;
@@ -1050,7 +1066,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  cmd.type = grpc_shmem::FrameType::C2S_INITIAL_METADATA;
                  cmd.data_offset = off;
                  cmd.data_size = static_cast<uint32_t>(vec.size());
-                 grpc_shmem::PushCommand(cb->c2s_queues, cb,
+                 grpc_shmem::PushCommand(cb->c2s_queues, cb, &sem_mgr_,
                                          grpc_shmem::Direction::kC2S, cmd);
 
                  return absl::OkStatus();

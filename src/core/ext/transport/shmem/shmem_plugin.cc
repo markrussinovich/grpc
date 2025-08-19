@@ -112,7 +112,8 @@ class ShmemEndpointTransport final : public EndpointTransport {
     
     // Create direct channel with the client transport
     ChannelArgs args_with_transport = client_args
-        .SetObject(client_transport.get());
+        .SetObject(client_transport.get())
+        .Set(GRPC_ARG_DEFAULT_AUTHORITY, server_name);  // Set default authority
     client_transport.release(); // Channel takes ownership
     
     auto channel = DirectChannel::Create("shmem://" + server_name, args_with_transport);

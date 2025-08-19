@@ -28,6 +28,7 @@ namespace grpc_shmem {
 struct Command;
 struct DataRingBuffer;
 struct ShmemQueues;
+class CrossProcessSemaphore;
 
 // The master control block, located at the beginning of the shared memory
 // segment.
@@ -37,11 +38,11 @@ struct ControlBlock {
   std::atomic<uint32_t> server_state;
   std::atomic<uint32_t> client_state;
 
-  // --- Lightweight Synchronization Semaphores ---
-  // Used to wake a sleeping reader thread when the command queue transitions
-  // from empty to non-empty.
-  EventFdSemaphore c2s_sem;
-  EventFdSemaphore s2c_sem;
+  // --- Cross-Process Semaphore Names ---
+  // Store semaphore names instead of process-specific handles
+  char c2s_sem_name[32];  // Name for client-to-server semaphore
+  char s2c_sem_name[32];  // Name for server-to-client semaphore
+  
   // Set by the consumer just before sleeping; producers check this to avoid
   // spurious posts. 0 = not waiting, 1 = waiting.
   std::atomic<uint32_t> c2s_waiters{0};
@@ -51,7 +52,7 @@ struct ControlBlock {
   ShmemQueues* c2s_queues;
   ShmemQueues* s2c_queues;
 
-  // Constructor to initialize fields and semaphores
+  // Constructor to initialize fields
   ControlBlock()
       : magic_number(0x47525043534D454Dull /* "GRPCSMEM" */),
         transport_version(1),
@@ -60,7 +61,11 @@ struct ControlBlock {
         c2s_waiters(0),
         s2c_waiters(0),
         c2s_queues(nullptr),
-        s2c_queues(nullptr) {}
+        s2c_queues(nullptr) {
+    // Initialize semaphore name fields to empty
+    c2s_sem_name[0] = '\0';
+    s2c_sem_name[0] = '\0';
+  }
 };
 
 // Re-using FrameType concept to describe commands flowing over the command
@@ -109,6 +114,75 @@ struct ShmemQueues {
   CommandQueue command_q;
   // Backing data ring buffer for payloads referenced by commands.
   DataRingBuffer data_rb;
+};
+
+// Helper class to manage cross-process semaphore operations for transports
+class SemaphoreManager {
+ public:
+  SemaphoreManager() = default;
+  ~SemaphoreManager() = default;
+
+  // Initialize semaphores from control block names
+  absl::Status InitFromControlBlock(ControlBlock* cb) {
+    if (cb == nullptr) {
+      return absl::InvalidArgumentError("Null control block");
+    }
+    
+    LOG(INFO) << "SemaphoreManager::InitFromControlBlock: c2s_name='" << cb->c2s_sem_name 
+              << "', s2c_name='" << cb->s2c_sem_name << "'";
+    
+    if (cb->c2s_sem_name[0] != '\0') {
+      auto status = c2s_sem_.InitFromName(cb->c2s_sem_name);
+      if (!status.ok()) {
+        LOG(ERROR) << "Failed to init c2s semaphore: " << status;
+        return status;
+      }
+      LOG(INFO) << "Successfully initialized c2s semaphore: " << cb->c2s_sem_name;
+    }
+    
+    if (cb->s2c_sem_name[0] != '\0') {
+      auto status = s2c_sem_.InitFromName(cb->s2c_sem_name);
+      if (!status.ok()) {
+        LOG(ERROR) << "Failed to init s2c semaphore: " << status;
+        return status;
+      }
+      LOG(INFO) << "Successfully initialized s2c semaphore: " << cb->s2c_sem_name;
+    }
+    
+    return absl::OkStatus();
+  }
+
+  // Post to semaphore based on direction
+  void Post(ControlBlock* cb, bool c2s_direction) {
+    if (c2s_direction) {
+      if (cb->c2s_waiters.load(std::memory_order_relaxed)) {
+        c2s_sem_.post();
+      }
+    } else {
+      if (cb->s2c_waiters.load(std::memory_order_relaxed)) {
+        s2c_sem_.post();
+      }
+    }
+  }
+
+  // Wait on semaphore based on direction
+  void Wait(bool c2s_direction) {
+    if (c2s_direction) {
+      c2s_sem_.wait();
+    } else {
+      s2c_sem_.wait();
+    }
+  }
+
+  // Wake all waiters for shutdown
+  void WakeAll() {
+    c2s_sem_.post();
+    s2c_sem_.post();
+  }
+
+ private:
+  CrossProcessSemaphore c2s_sem_;
+  CrossProcessSemaphore s2c_sem_;
 };
 
 }  // namespace grpc_shmem
