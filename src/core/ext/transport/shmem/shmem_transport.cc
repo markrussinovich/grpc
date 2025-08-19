@@ -73,36 +73,95 @@ class ShmemClientTransport final : public ClientTransport {
     
     // Initialize semaphore manager for cross-process communication
     if (cb_ != nullptr) {
-      auto status = sem_mgr_.InitFromControlBlock(cb_);
-      if (!status.ok()) {
-        LOG(WARNING) << "Failed to initialize semaphore manager: " << status;
+      // Safely increment process count
+      try {
+        int32_t current_count = cb_->process_count.fetch_add(1, std::memory_order_acq_rel);
+        LOG(INFO) << "ShmemClientTransport attached, process count now: " << (current_count + 1);
+        
+        auto status = sem_mgr_.InitFromControlBlock(cb_);
+        if (!status.ok()) {
+          LOG(WARNING) << "Failed to initialize semaphore manager: " << status;
+        }
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "Error during client transport initialization: " << e.what();
       }
     }
   }
 
   void StartCall(CallHandler child_call_handler) override;
   void Orphan() override {
-    ExecCtx exec_ctx;
-    stop_.store(true, std::memory_order_relaxed);
-    
-    // Only wake semaphores if a ring reader thread was started.
-    // In dispatch-only (in-proc) paths, no reader was started and the segment
-    // may have been unmapped already on the server side.
-    if (reader_started_.load(std::memory_order_acquire)) {
-      if (cb_ != nullptr) {
-        // Wake any waiting reader so it can observe stop_ and exit.
-        sem_mgr_.WakeAll();
-      }
-      if (reader_.joinable()) reader_.join();
-    }
-    
-    // Clean up cross-process segment if this is a cross-process client
-    if (cb_ != nullptr && server_ == nullptr) {
-      RemoveCrossProcessSegment(cb_);
-    }
-    
+    InitiateShutdown();
     Unref();
   }
+  
+ private:
+  void InitiateShutdown() {
+    ExecCtx exec_ctx;
+    
+    // Step 1: Signal shutdown to all threads
+    if (shutdown_initiated_.exchange(true, std::memory_order_acq_rel)) {
+      return; // Already initiated
+    }
+    
+    LOG(INFO) << "ShmemClientTransport initiating shutdown";
+    
+    // Step 2: Set stop flag and wake threads
+    stop_.store(true, std::memory_order_relaxed);
+    if (cb_ != nullptr) {
+      cb_->cleanup_initiated.store(true, std::memory_order_release);
+    }
+    
+    // Step 3: Wake any waiting reader threads
+    WaitForThreadsToExit();
+    
+    // Step 4: Cleanup resources in proper order
+    CleanupResources();
+    
+    cleanup_complete_.store(true, std::memory_order_release);
+    LOG(INFO) << "ShmemClientTransport shutdown complete";
+  }
+  
+  void WaitForThreadsToExit() {
+    // Only wake semaphores if a ring reader thread was started
+    if (reader_started_.load(std::memory_order_acquire)) {
+      if (cb_ != nullptr) {
+        // Wake any waiting reader so it can observe stop_ and exit
+        sem_mgr_.WakeAll();
+      }
+      
+      if (reader_.joinable()) {
+        LOG(INFO) << "ShmemClientTransport waiting for reader thread to exit";
+        reader_.join();
+        LOG(INFO) << "ShmemClientTransport reader thread joined successfully";
+      }
+    }
+  }
+  
+  void CleanupResources() {
+    try {
+      // Cleanup semaphore manager
+      sem_mgr_.Cleanup();
+      
+      // Handle process count and cleanup coordination
+      if (cb_ != nullptr) {
+        int32_t remaining = cb_->process_count.fetch_sub(1, std::memory_order_acq_rel);
+        LOG(INFO) << "ShmemClientTransport detaching, remaining processes: " << (remaining - 1);
+        
+        // Clean up cross-process segment if this is a cross-process client
+        if (server_ == nullptr) {
+          // Last process cleans up shared resources
+          if (remaining == 1) {
+            LOG(INFO) << "Last process - cleaning up shared resources";
+            RemoveCrossProcessSegment(cb_);
+          }
+        }
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "ShmemClientTransport cleanup error: " << e.what();
+    }
+  }
+  
+ public:
   FilterStackTransport* filter_stack_transport() override { return nullptr; }
   ClientTransport* client_transport() override { return this; }
   ServerTransport* server_transport() override { return nullptr; }
@@ -139,6 +198,8 @@ class ShmemClientTransport final : public ClientTransport {
   grpc_shmem::ControlBlock* cb_ = nullptr;
   std::unique_ptr<grpc_shmem::ShmemSegment> client_segment_;  // for cross-process
   std::atomic<bool> stop_{false};
+  std::atomic<bool> shutdown_initiated_{false};
+  std::atomic<bool> cleanup_complete_{false};
   std::thread reader_;
   std::atomic<uint32_t> next_stream_id_{1};
   int spin_iters_ = kDefaultSpinIters;
@@ -219,9 +280,17 @@ class ShmemServerTransport final : public ServerTransport {
     
     // Initialize semaphore manager for cross-process communication
     if (cb_ != nullptr) {
-      auto status = sem_mgr_.InitFromControlBlock(cb_);
-      if (!status.ok()) {
-        LOG(WARNING) << "Failed to initialize semaphore manager: " << status;
+      // Safely increment process count
+      try {
+        int32_t current_count = cb_->process_count.fetch_add(1, std::memory_order_acq_rel);
+        LOG(INFO) << "ShmemServerTransport attached, process count now: " << (current_count + 1);
+        
+        auto status = sem_mgr_.InitFromControlBlock(cb_);
+        if (!status.ok()) {
+          LOG(WARNING) << "Failed to initialize semaphore manager: " << status;
+        }
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "Error during server transport initialization: " << e.what();
       }
     }
     
@@ -261,7 +330,20 @@ class ShmemServerTransport final : public ServerTransport {
     // Transition to SHUTDOWN and notify watchers (important for server
     // shutdown).
     Disconnect(absl::UnavailableError("shmem transport closed"));
-    // Finish any remaining active calls with UNAVAILABLE (not CANCELLED).
+    InitiateShutdown();
+    Unref();
+  }
+  
+ private:
+  void InitiateShutdown() {
+    // Step 1: Signal shutdown to all threads
+    if (shutdown_initiated_.exchange(true, std::memory_order_acq_rel)) {
+      return; // Already initiated
+    }
+    
+    LOG(INFO) << "ShmemServerTransport initiating shutdown";
+    
+    // Step 2: Finish any remaining active calls with UNAVAILABLE (not CANCELLED).
     {
       absl::flat_hash_map<uint32_t, CallInitiator> snapshot;
       {
@@ -276,18 +358,78 @@ class ShmemServerTransport final : public ServerTransport {
         kv.second.SpawnCancel(absl::UnavailableError("server shutdown"));
       }
     }
-    stop_.store(true, std::memory_order_relaxed);
     
-    // Only post semaphores if the ring server loop was actually started.
+    stop_.store(true, std::memory_order_relaxed);
+    if (cb_ != nullptr) {
+      cb_->cleanup_initiated.store(true, std::memory_order_release);
+    }
+    
+    // Step 3: Wait for threads to exit
+    WaitForThreadsToExit();
+    
+    // Step 4: Cleanup resources
+    CleanupResources();
+    
+    cleanup_complete_.store(true, std::memory_order_release);
+    LOG(INFO) << "ShmemServerTransport shutdown complete";
+  }
+  
+  void WaitForThreadsToExit() {
+    // Only post semaphores if the ring server loop was actually started
     if (reader_started_.load(std::memory_order_acquire)) {
       if (cb_ != nullptr) {
-        // Wake any waiting reader thread so it can observe stop_ and exit.
+        // Wake any waiting reader thread so it can observe stop_ and exit
         sem_mgr_.WakeAll();
       }
-      if (reader_.joinable()) reader_.join();
+      
+      if (reader_.joinable()) {
+        LOG(INFO) << "ShmemServerTransport waiting for reader thread to exit";
+        reader_.join();
+        LOG(INFO) << "ShmemServerTransport reader thread joined successfully";
+      }
     }
-    Unref();
   }
+  
+  void CleanupResources() {
+    try {
+      // Cleanup semaphore manager
+      sem_mgr_.Cleanup();
+      
+      // Handle process count and cleanup coordination
+      if (cb_ != nullptr) {
+        int32_t remaining = cb_->process_count.fetch_sub(1, std::memory_order_acq_rel);
+        LOG(INFO) << "ShmemServerTransport detaching, remaining processes: " << (remaining - 1);
+        
+        // Server is responsible for cleaning up shared resources if last process
+        if (remaining == 1) {
+          LOG(INFO) << "Last process - server cleaning up shared resources";
+          CleanupSharedResources();
+        }
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "ShmemServerTransport cleanup error: " << e.what();
+    }
+  }
+  
+  void CleanupSharedResources() {
+    try {
+      if (cb_ != nullptr && cb_->c2s_sem_name[0] != '\0') {
+        std::string name = std::string(cb_->c2s_sem_name);
+        if (name[0] == '/') name = name.substr(1); // Remove leading '/'
+        grpc_shmem::CrossProcessSemaphore::UnlinkNamed(name);
+      }
+      if (cb_ != nullptr && cb_->s2c_sem_name[0] != '\0') {
+        std::string name = std::string(cb_->s2c_sem_name);
+        if (name[0] == '/') name = name.substr(1); // Remove leading '/'  
+        grpc_shmem::CrossProcessSemaphore::UnlinkNamed(name);
+      }
+      LOG(INFO) << "Server cleaned up shared semaphores";
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Error cleaning up shared resources: " << e.what();
+    }
+  }
+  
+ public:
   FilterStackTransport* filter_stack_transport() override { return nullptr; }
   ClientTransport* client_transport() override { return nullptr; }
   ServerTransport* server_transport() override { return this; }
@@ -468,7 +610,8 @@ class ShmemServerTransport final : public ServerTransport {
     };
     absl::flat_hash_map<uint32_t, StreamState> streams;
     for (;;) {
-      if (stop_.load(std::memory_order_relaxed)) break;
+      if (stop_.load(std::memory_order_relaxed) || 
+          (cb_ != nullptr && cb_->cleanup_initiated.load(std::memory_order_acquire))) break;
       grpc_shmem::Command cmd;
       bool has_command = grpc_shmem::PopCommandHybrid(
           cb_->c2s_queues, cb_, &sem_mgr_, grpc_shmem::Direction::kC2S, spin_iters_,
@@ -756,6 +899,8 @@ class ShmemServerTransport final : public ServerTransport {
   std::unique_ptr<grpc_shmem::ShmemSegment> segment_;
   grpc_shmem::ControlBlock* cb_ = nullptr;
   grpc_shmem::SemaphoreManager sem_mgr_;  // Cross-process semaphore manager
+  std::atomic<bool> shutdown_initiated_{false};
+  std::atomic<bool> cleanup_complete_{false};
   RefCountedPtr<UnstartedCallDestination> dest_;
   Mutex dest_mu_;
   // Signal when SetCallDestination() has installed the acceptor.
@@ -866,7 +1011,8 @@ void ShmemClientTransport::EnsureReaderStarted() {
       // Initialize client config lazily from server's config
       if (server_ != nullptr) spin_iters_ = server_->spin_iters();
       for (;;) {
-        if (stop_.load(std::memory_order_relaxed)) break;
+        if (stop_.load(std::memory_order_relaxed) || 
+          (cb_ != nullptr && cb_->cleanup_initiated.load(std::memory_order_acquire))) break;
         grpc_shmem::Command cmd;
         if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues, cb_, &sem_mgr_,
                                           grpc_shmem::Direction::kS2C,
