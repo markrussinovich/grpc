@@ -28,48 +28,40 @@ namespace grpc_shmem {
 // -------- platform helpers --------
 
 int ShmemSegment::CreateFd(const std::string& name, size_t size, std::string* created_name) {
-  // Try memfd_create first if available, fallback to shm_open
-  int fd = -1;
+  // For cross-process access, always use shm_open to create a named segment
+  // that both server and client processes can access
+  std::string shm_name = (!name.empty() && name[0] == '/') ? name : "/" + name;
   
-#ifdef __linux__
-  // Try memfd_create if available (Linux 3.17+)
-  #ifndef MFD_CLOEXEC
-  #define MFD_CLOEXEC 0x0001U
-  #endif
-  #ifdef __NR_memfd_create
-  fd = static_cast<int>(syscall(__NR_memfd_create, name.c_str(), MFD_CLOEXEC));
-  if (fd != -1) {
-    if (::ftruncate(fd, static_cast<off_t>(size)) != 0) { ::close(fd); return -1; }
-    if (created_name) *created_name = name;
-    return fd;
-  }
-  #endif
-#endif
-
-  // Fallback to shm_open on all POSIX systems
-  std::string shm_name = "/" + name;
-  fd = ::shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0600);
+  // Remove existing segment if it exists
+  ::shm_unlink(shm_name.c_str());
+  
+  int fd = ::shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
   if (fd == -1) return -1;
-  if (::ftruncate(fd, static_cast<off_t>(size)) != 0) { ::close(fd); return -1; }
+  
+  if (::ftruncate(fd, static_cast<off_t>(size)) != 0) { 
+    ::close(fd); 
+    ::shm_unlink(shm_name.c_str());
+    return -1; 
+  }
+  
   if (created_name) *created_name = shm_name;
   return fd;
 }
 
 int ShmemSegment::OpenFd(const std::string& name, size_t* size_out) {
-#ifdef __linux__
-  (void)size_out; // not used for memfd
-  // For memfd, we rely on caller to know size. If needed, fstat to get st_size.
-  // This path is not currently used; keeping for completeness.
-  return -1;
-#else
-  int fd = ::shm_open(name.c_str(), O_RDWR, 0600);
+  // For cross-process access, we need to use shm_open on all platforms
+  std::string shm_name = (!name.empty() && name[0] == '/') ? name : "/" + name;
+  int fd = ::shm_open(shm_name.c_str(), O_RDWR, 0600);
   if (fd == -1) return -1;
-  // Obtain size via fstat:
+  
+  // Obtain size via fstat
   struct stat st{};
-  if (::fstat(fd, &st) != 0) { ::close(fd); return -1; }
+  if (::fstat(fd, &st) != 0) { 
+    ::close(fd); 
+    return -1; 
+  }
   if (size_out) *size_out = static_cast<size_t>(st.st_size);
   return fd;
-#endif
 }
 
 void* ShmemSegment::Map(int fd, size_t size) {
@@ -114,15 +106,27 @@ void ShmemSegment::RemoveIfExists(const std::string& name) {
 #endif
 }
 
+void ShmemSegment::RemoveNamedSemaphores(const std::string& server_name) {
+  EventFdSemaphore::UnlinkNamed(server_name + "_c2s");
+  EventFdSemaphore::UnlinkNamed(server_name + "_s2c");
+}
+
 // Layout: [ControlBlock | ... rest for queues ...]
 static inline size_t Align(size_t x, size_t a) { return (x + (a-1)) & ~(a-1); }
 
 void ShmemSegment::InitQueues(void* base, size_t size, ControlBlock* cb,
-                              std::size_t data_ring_capacity) {
+                              std::size_t data_ring_capacity, 
+                              const std::string& server_name) {
   (void)size;
-  // Initialize semaphores
-  (void)cb->c2s_sem.Init(0, /*semaphore_mode=*/true);
-  (void)cb->s2c_sem.Init(0, /*semaphore_mode=*/true);
+  // Initialize semaphores for cross-process usage with unique names
+  if (!server_name.empty()) {
+    (void)cb->c2s_sem.InitNamed(server_name + "_c2s", 0);
+    (void)cb->s2c_sem.InitNamed(server_name + "_s2c", 0);
+  } else {
+    // Fallback to in-process semaphores
+    (void)cb->c2s_sem.Init(0, /*semaphore_mode=*/true);
+    (void)cb->s2c_sem.Init(0, /*semaphore_mode=*/true);
+  }
 
   // Layout: [ControlBlock | ShmemQueues c2s | ShmemQueues s2c | c2s_data | s2c_data]
   char* mem = static_cast<char*>(base);
@@ -166,24 +170,57 @@ ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
   void* base = Map(fd, cfg.size);
   if (base == nullptr) { ::close(fd); return {}; }
 
-  // Place control block at the start.
-  auto* cb = reinterpret_cast<ControlBlock*>(base);
-  ::memset(cb, 0, sizeof(ControlBlock));
+  // Place control block at the start and initialize it properly
+  auto* cb = new(base) ControlBlock();  // Placement new to call constructor
   
-  // Initialize ControlBlock fields
-  cb->magic_number = 0x47525043534D454Dull;  // "GRPCSMEM"
-  cb->transport_version = 1;
+  // Set additional fields not initialized by constructor
   cb->server_state.store(1);  // listening
   cb->client_state.store(0);
   
-  InitQueues(base, cfg.size, cb, cfg.data_ring_capacity);
+  InitQueues(base, cfg.size, cb, cfg.data_ring_capacity, cfg.server_name);
 
   return ShmemSegment(created_name, base, cfg.size, cb, fd);
 }
 
-ShmemSegment ShmemSegment::Open(const std::string& /*name*/) {
-  // Cross-process Open() isn't used in the current in-proc design; return empty.
-  return {};
+ShmemSegment ShmemSegment::Open(const std::string& name) {
+  size_t size = 0;
+  int fd = OpenFd(name, &size);
+  if (fd == -1) return {};
+  
+  void* base = Map(fd, size);
+  if (base == nullptr) { 
+    ::close(fd); 
+    return {};
+  }
+
+  // Verify the control block
+  auto* cb = reinterpret_cast<ControlBlock*>(base);
+  if (cb->magic_number != 0x47525043534D454Dull) {  // "GRPCSMEM"
+    ::munmap(base, size);
+    ::close(fd);
+    return {};
+  }
+
+  // Extract server name from segment name for semaphore initialization
+  std::string server_name;
+  const std::string prefix = "/grpc_shmem_";
+  if (name.find(prefix) == 0) {
+    server_name = name.substr(prefix.length()); // Remove "/grpc_shmem_" prefix
+  }
+  
+  // Reinitialize semaphore objects for cross-process access (client side)
+  if (!server_name.empty()) {
+    // Use placement new to properly construct the semaphore objects
+    new(&cb->c2s_sem) EventFdSemaphore();
+    new(&cb->s2c_sem) EventFdSemaphore();
+    (void)cb->c2s_sem.InitNamed(server_name + "_c2s", 0);
+    (void)cb->s2c_sem.InitNamed(server_name + "_s2c", 0);
+  }
+
+  // Mark client as connected
+  cb->client_state.store(1);
+  
+  return ShmemSegment(name, base, size, cb, fd);
 }
 
 }  // namespace grpc_shmem

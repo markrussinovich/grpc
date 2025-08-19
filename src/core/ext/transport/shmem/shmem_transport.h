@@ -121,6 +121,16 @@ std::pair<OrphanablePtr<Transport>, OrphanablePtr<Transport>>
 MakeShmemTransportPair(const ChannelArgs& server_channel_args,
                        const ChannelArgs& client_channel_args);
 
+// Factory entry point for creating a server transport with a predictable name
+// that clients can connect to cross-process. Returns server transport only.
+OrphanablePtr<Transport> MakeNamedShmemServerTransport(
+    const std::string& server_name, const ChannelArgs& server_channel_args);
+
+// Factory entry point for connecting to an existing named server transport.
+// Returns client transport only.
+OrphanablePtr<Transport> ConnectToShmemServerTransport(
+    const std::string& server_name, const ChannelArgs& client_channel_args);
+
 }  // namespace grpc_core
 
 #endif  // GRPC_SRC_CORE_EXT_TRANSPORT_SHMEM_SHMEM_TRANSPORT_H

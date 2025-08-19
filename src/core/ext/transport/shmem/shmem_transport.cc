@@ -24,6 +24,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -58,6 +59,9 @@ constexpr int kDefaultSpinIters =
 
 class ShmemServerTransport;
 
+// Forward declarations for cross-process segment management
+void RemoveCrossProcessSegment(grpc_shmem::ControlBlock* cb);
+
 class ShmemClientTransport final : public ClientTransport {
  public:
   ShmemClientTransport(RefCountedPtr<ShmemServerTransport> server,
@@ -84,6 +88,12 @@ class ShmemClientTransport final : public ClientTransport {
       }
       if (reader_.joinable()) reader_.join();
     }
+    
+    // Clean up cross-process segment if this is a cross-process client
+    if (cb_ != nullptr && server_ == nullptr) {
+      RemoveCrossProcessSegment(cb_);
+    }
+    
     Unref();
   }
   FilterStackTransport* filter_stack_transport() override { return nullptr; }
@@ -120,6 +130,7 @@ class ShmemClientTransport final : public ClientTransport {
 
   RefCountedPtr<ShmemServerTransport> server_;
   grpc_shmem::ControlBlock* cb_ = nullptr;
+  std::unique_ptr<grpc_shmem::ShmemSegment> client_segment_;  // for cross-process
   std::atomic<bool> stop_{false};
   std::thread reader_;
   std::atomic<uint32_t> next_stream_id_{1};
@@ -968,6 +979,10 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                // Only use the synthetic ring path for the special "/cancel" hook.
                if (!is_cancel_path) {
                  // *** In-proc bootstrap (dispatched) ***
+                 if (server_ == nullptr) {
+                   // Cross-process mode: can't use direct dispatch
+                   return absl::InternalError("Cross-process dispatch not supported");
+                 }
                  auto initiator =
                      server_->AnnounceAndGetInitiator(stream_id, std::move(md));
                  ForwardCall(child_call_handler, std::move(initiator),
@@ -984,6 +999,9 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                    // In dispatch-only mode the ring reader is disabled:
                    // never route synthetic traffic in that mode.
                    // Fall back to dispatched to ensure the test proceeds.
+                   if (server_ == nullptr) {
+                     return absl::InternalError("Cross-process fallback not supported");
+                   }
                    auto initiator =
                        server_->AnnounceAndGetInitiator(stream_id, std::move(md));
                    ForwardCall(child_call_handler, std::move(initiator),
@@ -1040,6 +1058,24 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
              }));
 }
 
+// Global storage for cross-process segments (keyed by control block pointer)
+static std::mutex g_cross_process_segments_mu;
+static std::unordered_map<grpc_shmem::ControlBlock*, 
+                         std::unique_ptr<grpc_shmem::ShmemSegment>> g_cross_process_segments;
+
+// Helper to store cross-process segment for cleanup
+void StoreCrossProcessSegment(grpc_shmem::ControlBlock* cb, 
+                             std::unique_ptr<grpc_shmem::ShmemSegment> segment) {
+  std::lock_guard<std::mutex> lock(g_cross_process_segments_mu);
+  g_cross_process_segments[cb] = std::move(segment);
+}
+
+// Helper to remove cross-process segment 
+void RemoveCrossProcessSegment(grpc_shmem::ControlBlock* cb) {
+  std::lock_guard<std::mutex> lock(g_cross_process_segments_mu);
+  g_cross_process_segments.erase(cb);
+}
+
 }  // namespace
 
 std::pair<OrphanablePtr<Transport>, OrphanablePtr<Transport>>
@@ -1072,6 +1108,58 @@ MakeShmemTransportPair(const ChannelArgs& server_channel_args,
   auto client_transport = MakeOrphanable<ShmemClientTransport>(
       server_transport->RefAsSubclass<ShmemServerTransport>(), cb, client_channel_args);
   return {std::move(client_transport), std::move(server_transport)};
+}
+
+OrphanablePtr<Transport> MakeNamedShmemServerTransport(
+    const std::string& server_name, const ChannelArgs& server_channel_args) {
+  // Force ring mode for cross-process server
+  ChannelArgs ring_mode_args = server_channel_args
+      .Set("grpc.shmem.dispatch_only", false);
+
+  std::unique_ptr<grpc_shmem::ShmemSegment> segment;
+  
+  grpc_shmem::SegmentConfig cfg;
+  cfg.name = absl::StrCat("grpc_shmem_", server_name);
+  cfg.server_name = server_name;  // For named semaphores
+  cfg.data_ring_capacity = 64 * 1024 * 1024;
+  cfg.size = 192 * 1024 * 1024;
+  grpc_shmem::ShmemSegment::RemoveIfExists(cfg.name);
+  auto s = grpc_shmem::ShmemSegment::Create(cfg);
+  if (s.control() == nullptr) {
+    LOG(ERROR) << "Failed to create named shmem segment: " << cfg.name;
+    return nullptr;
+  }
+  segment = std::make_unique<grpc_shmem::ShmemSegment>(std::move(s));
+
+  auto server_transport = MakeOrphanable<ShmemServerTransport>(
+      ring_mode_args, std::move(segment));
+  return std::move(server_transport);
+}
+
+OrphanablePtr<Transport> ConnectToShmemServerTransport(
+    const std::string& server_name, const ChannelArgs& client_channel_args) {
+  const bool dispatch_only =
+      client_channel_args.GetBool("grpc.shmem.dispatch_only").value_or(false);
+
+  if (dispatch_only) {
+    LOG(ERROR) << "Cross-process shmem requires ring mode (not dispatch-only)";
+    return nullptr;
+  }
+
+  std::string segment_name = absl::StrCat("grpc_shmem_", server_name);
+  auto segment = grpc_shmem::ShmemSegment::Open(segment_name);
+  if (segment.control() == nullptr) {
+    LOG(ERROR) << "Failed to connect to shmem server: " << server_name;
+    return nullptr;
+  }
+
+  grpc_shmem::ControlBlock* cb = segment.control();
+  auto segment_ptr = std::make_unique<grpc_shmem::ShmemSegment>(std::move(segment));
+  
+  // Store segment for cleanup
+  StoreCrossProcessSegment(cb, std::move(segment_ptr));
+  
+  return MakeOrphanable<ShmemClientTransport>(nullptr, cb, client_channel_args);
 }
 
 }  // namespace grpc_core

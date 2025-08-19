@@ -17,6 +17,7 @@ grpc_cc_library(
         "shmem_channel.cc",
         "shmem_memory.cc",
         "shmem_resolver.cc",
+        "shmem_plugin.cc",
     ] + select({
         "//conditions:default": ["shmem_transport_stub.cc"],
         ":linux": [],
@@ -45,6 +46,8 @@ grpc_cc_library(
         "//src/core:memory_quota",
         "//src/core:direct_channel",
         "//src/core:grpc_transport_inproc",
+        "//:uri",
+        "//:server",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

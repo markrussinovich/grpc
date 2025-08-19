@@ -72,6 +72,7 @@ extern void RegisterConnectedChannel(CoreConfiguration::Builder* builder);
 extern void RegisterLoadBalancedCallDestination(
     CoreConfiguration::Builder* builder);
 extern void RegisterChttp2Transport(CoreConfiguration::Builder* builder);
+extern void RegisterShmemTransport(CoreConfiguration::Builder* builder);
 extern void RegisterFusedFilters(CoreConfiguration::Builder* builder);
 #ifndef GRPC_NO_RLS
 extern void RegisterRlsLbPolicy(CoreConfiguration::Builder* builder);
@@ -102,6 +103,7 @@ void BuildCoreConfiguration(CoreConfiguration::Builder* builder) {
   RegisterHttpConnectHandshaker(builder);
   RegisterTCPConnectHandshaker(builder);
   RegisterChttp2Transport(builder);
+  RegisterShmemTransport(builder);
 #ifndef GRPC_MINIMAL_LB_POLICY
   RegisterPriorityLbPolicy(builder);
   RegisterOutlierDetectionLbPolicy(builder);

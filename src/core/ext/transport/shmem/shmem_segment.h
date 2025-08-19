@@ -32,6 +32,7 @@ namespace grpc_shmem {
 
 struct SegmentConfig {
   std::string name;
+  std::string server_name;  // for cross-process semaphore naming
   std::size_t size = 0;  // total shared memory size in bytes
   std::size_t data_ring_capacity =
       kDefaultDataRingCapacityBytes;  // per-direction
@@ -53,6 +54,9 @@ class ShmemSegment {
   // Note: To avoid cross-test interference, the implementation removes a
   // process-suffixed name; see shmem_segment.cc for details.
   static void RemoveIfExists(const std::string& name);
+  
+  // Remove named semaphores for cross-process cleanup
+  static void RemoveNamedSemaphores(const std::string& server_name);
 
   // Create a new segment and initialize ControlBlock and queues.
   static ShmemSegment Create(const SegmentConfig& cfg);
@@ -76,7 +80,8 @@ class ShmemSegment {
   }
 
   static void InitQueues(void* base, size_t size, ControlBlock* cb,
-                         std::size_t data_ring_capacity);
+                         std::size_t data_ring_capacity,
+                         const std::string& server_name = "");
 
   static int CreateFd(const std::string& name, size_t size, std::string* created_name);
   static int OpenFd(const std::string& name, size_t* size_out);

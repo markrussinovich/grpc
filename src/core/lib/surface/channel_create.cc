@@ -24,6 +24,7 @@
 #include "absl/log/check.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/match.h"
 #include "src/core/channelz/channelz.h"
 #include "src/core/client_channel/client_channel.h"
 #include "src/core/client_channel/direct_channel.h"
@@ -120,9 +121,16 @@ absl::StatusOr<grpc_channel*> CreateClientEndpointChannel(
   }
   if (creds == nullptr) return absl::InternalError("No credentials provided");
   auto final_args = creds->update_arguments(args.SetObject(creds->Ref()));
+  
+  // Auto-detect transport protocol based on target scheme
+  std::string default_protocol = "h2";
+  if (absl::StartsWith(absl::string_view(target), "shmem://")) {
+    default_protocol = "shmem";
+  }
+  
   std::vector<absl::string_view> transport_preferences = absl::StrSplit(
       final_args.GetString(GRPC_ARG_PREFERRED_TRANSPORT_PROTOCOLS)
-          .value_or("h2"),
+          .value_or(default_protocol),
       ',');
   if (transport_preferences.size() != 1) {
     return absl::InternalError(absl::StrCat(

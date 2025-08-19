@@ -16,6 +16,8 @@
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "absl/strings/match.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/credentials/transport/transport_credentials.h"
 #include "src/core/lib/channel/channel_args.h"
@@ -59,8 +61,14 @@ int grpc_server_add_http2_port(grpc_server* server, const char* addr,
     }
     args = args.SetObject(creds->Ref()).SetObject(sc);
   }
+  // Auto-detect transport protocol based on address scheme
+  std::string default_protocol = "h2";
+  if (absl::StartsWith(absl::string_view(addr), "shmem://")) {
+    default_protocol = "shmem";
+  }
+  
   std::vector<absl::string_view> transport_preferences = absl::StrSplit(
-      args.GetString(GRPC_ARG_PREFERRED_TRANSPORT_PROTOCOLS).value_or("h2"),
+      args.GetString(GRPC_ARG_PREFERRED_TRANSPORT_PROTOCOLS).value_or(default_protocol),
       ',');
   if (transport_preferences.size() != 1) {
     LOG(ERROR) << "Failed to add port to server: "
