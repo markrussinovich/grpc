@@ -27,8 +27,8 @@ namespace grpc_shmem {
 
 // Create a grpc_slice that references memory inside the DataRingBuffer without
 // copying. The slice destructor advances rb->tail by size to free space.
-grpc_slice MakeSliceFromRing(DataRingBuffer* rb, uint64_t offset,
-                             uint32_t size);
+grpc_slice MakeSliceFromRing(DataRingBuffer* rb, void* segment_base, 
+                             uint64_t offset, uint32_t size);
 
 // Simple metadata key/value representation.
 struct KVPair {

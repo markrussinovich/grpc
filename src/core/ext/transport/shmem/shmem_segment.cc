@@ -130,24 +130,23 @@ void ShmemSegment::InitQueues(void* base, size_t size, ControlBlock* cb,
     cb->c2s_sem_name[sizeof(cb->c2s_sem_name) - 1] = '\0';
     cb->s2c_sem_name[sizeof(cb->s2c_sem_name) - 1] = '\0';
     
-    // Clean up existing semaphores and create new ones (server side)
+    LOG(INFO) << "Phase 2B: Set semaphore names: c2s='" << cb->c2s_sem_name 
+              << "', s2c='" << cb->s2c_sem_name << "'";
+    
+    // Phase 2C: Create the c2s cross-process semaphore (s2c stays as EventFdSemaphore)
     CrossProcessSemaphore::UnlinkNamed(server_name + "_c2s");
-    CrossProcessSemaphore::UnlinkNamed(server_name + "_s2c");
-    
-    CrossProcessSemaphore temp_c2s, temp_s2c;
+    CrossProcessSemaphore temp_c2s;
     auto c2s_status = temp_c2s.CreateNamed(server_name + "_c2s", 0);
-    auto s2c_status = temp_s2c.CreateNamed(server_name + "_s2c", 0);
-    
     if (!c2s_status.ok()) {
-      LOG(WARNING) << "Failed to create c2s semaphore: " << c2s_status;
-    }
-    if (!s2c_status.ok()) {
-      LOG(WARNING) << "Failed to create s2c semaphore: " << s2c_status;
+      LOG(WARNING) << "Phase 2C: Failed to create c2s cross-process semaphore: " << c2s_status;
+    } else {
+      LOG(INFO) << "Phase 2C: Created c2s cross-process semaphore successfully";
     }
   } else {
-    // Clear semaphore names for in-process mode (not supported with new architecture)
+    // Clear semaphore names for in-process mode
     cb->c2s_sem_name[0] = '\0';
     cb->s2c_sem_name[0] = '\0';
+    LOG(INFO) << "Phase 2B: Cleared semaphore names for in-process mode";
   }
 
   // Layout: [ControlBlock | ShmemQueues c2s | ShmemQueues s2c | c2s_data | s2c_data]
@@ -169,29 +168,34 @@ void ShmemSegment::InitQueues(void* base, size_t size, ControlBlock* cb,
   new(c2s) ShmemQueues();
   new(s2c) ShmemQueues();
 
-  // Initialize data ring buffers
+  // Store offsets in control block (relative to segment base for cross-process compatibility)
+  char* segment_base = reinterpret_cast<char*>(cb);
+  
+  // Initialize data ring buffers with cross-process compatible offsets
   c2s->data_rb.capacity = data_ring_capacity;
   c2s->data_rb.head.store(0);
   c2s->data_rb.tail.store(0);
-  c2s->data_rb.buffer = c2s_buf;
+  c2s->data_rb.buffer_offset = reinterpret_cast<char*>(c2s_buf) - segment_base;
 
   s2c->data_rb.capacity = data_ring_capacity;
   s2c->data_rb.head.store(0);
   s2c->data_rb.tail.store(0);
-  s2c->data_rb.buffer = s2c_buf;
-
-  // Store pointers in control block
-  cb->c2s_queues = c2s;
-  cb->s2c_queues = s2c;
+  s2c->data_rb.buffer_offset = reinterpret_cast<char*>(s2c_buf) - segment_base;
+  cb->c2s_queues_offset = reinterpret_cast<char*>(c2s) - segment_base;
+  cb->s2c_queues_offset = reinterpret_cast<char*>(s2c) - segment_base;
 }
 
 ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
   std::string created_name;
   int fd = CreateFd(cfg.name, cfg.size, &created_name);
   if (fd == -1) return {};
+  
   void* base = Map(fd, cfg.size);
-  if (base == nullptr) { ::close(fd); return {}; }
-
+  if (base == nullptr) { 
+    ::close(fd); 
+    return {}; 
+  }
+  
   // Place control block at the start and initialize it properly
   auto* cb = new(base) ControlBlock();  // Placement new to call constructor
   

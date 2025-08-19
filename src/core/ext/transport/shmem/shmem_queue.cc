@@ -144,20 +144,28 @@ bool ReserveWrapping(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset) {
   return false;
 }
 
-static inline void Post(ControlBlock* cb, SemaphoreManager* sem_mgr, Direction dir) {
-  if (sem_mgr != nullptr) {
-    sem_mgr->Post(cb, dir == Direction::kC2S);
+static inline void Post(ControlBlock* cb, Direction dir, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
+  if (sem_adapter) {
+    // Use cross-process semaphores via semaphore adapter
+    sem_adapter->Post(cb, dir == Direction::kC2S);
+  } else {
+    // Fallback: Skip posting if no semaphore adapter available
+    LOG(WARNING) << "Post() called without semaphore adapter - skipping";
   }
 }
 
-static inline void Wait(SemaphoreManager* sem_mgr, Direction dir) {
-  if (sem_mgr != nullptr) {
-    sem_mgr->Wait(dir == Direction::kC2S);
+static inline void Wait(ControlBlock* cb, Direction dir, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
+  if (sem_adapter) {
+    // Use cross-process semaphores via semaphore adapter
+    sem_adapter->Wait(dir == Direction::kC2S);
+  } else {
+    // Fallback: Skip waiting if no semaphore adapter available
+    LOG(WARNING) << "Wait() called without semaphore adapter - skipping";
   }
 }
 
-bool PushCommand(ShmemQueues* q, ControlBlock* cb, SemaphoreManager* sem_mgr,
-                 Direction dir, const Command& cmd) {
+bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
+                 const Command& cmd, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
   // Check if queue was empty before pushing - if so, we need to signal
   const bool was_empty = q->command_q.empty();
   const bool ok = q->command_q.push(cmd);
@@ -166,14 +174,14 @@ bool PushCommand(ShmemQueues* q, ControlBlock* cb, SemaphoreManager* sem_mgr,
     // Further reduces kernel transitions by checking waiter state
     std::atomic<uint32_t>* waiters = (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
     if (waiters->load(std::memory_order_relaxed)) {
-      Post(cb, sem_mgr, dir);
+      Post(cb, dir, sem_adapter);
     }
   }
   return ok;
 }
 
-bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, SemaphoreManager* sem_mgr,
-                      Direction dir, int spin_iters, Command* out) {
+bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
+                      int spin_iters, Command* out, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
   Command tmp;
   
   // Adaptive spinning: more spins for high throughput scenarios  
@@ -202,7 +210,7 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, SemaphoreManager* sem_mg
   }
   
   // Sleep until woken up by producer
-  Wait(sem_mgr, dir);
+  Wait(cb, dir, sem_adapter);
   waiters->store(0, std::memory_order_relaxed);
   
   // Upon wake, try again (one attempt)

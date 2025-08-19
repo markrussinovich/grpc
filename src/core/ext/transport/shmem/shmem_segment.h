@@ -73,8 +73,8 @@ class ShmemSegment {
 
   void MoveFrom(ShmemSegment&& other) {
     name_ = std::move(other.name_);
-    base_ = other.base_;
-    size_ = other.size_;
+    base_ = other.base_; other.base_ = nullptr;  // FIX: Clear base_ to prevent double unmap
+    size_ = other.size_; other.size_ = 0;        // FIX: Clear size_ for consistency  
     control_ = other.control_; other.control_ = nullptr;
     fd_ = other.fd_; other.fd_ = -1;
   }

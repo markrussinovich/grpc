@@ -25,17 +25,19 @@ TEST(ShmemZeroCopyTest, SliceAdvancesTailOnDestroy) {
   rb.capacity = cap;
   rb.head.store(0);
   rb.tail.store(0);
-  rb.buffer = storage;
+  // Use storage as fake segment base, so buffer_offset = 0 points to storage
+  void* fake_segment_base = storage;
+  rb.buffer_offset = 0;  // Offset 0 from fake_segment_base points to storage
 
   // Reserve and write some payload
   const char* msg = "hello world";
   const uint32_t sz = static_cast<uint32_t>(strlen(msg));
   uint64_t off = 0;
   ASSERT_TRUE(ReserveContiguous(&rb, sz, &off));
-  std::memcpy(rb.buffer.get() + off, msg, sz);
+  std::memcpy(rb.GetBuffer(fake_segment_base) + off, msg, sz);
 
   // Create zero-copy slice and ensure contents match
-  grpc_slice s = MakeSliceFromRing(&rb, off, sz);
+  grpc_slice s = MakeSliceFromRing(&rb, fake_segment_base, off, sz);
   ASSERT_EQ(rb.tail.load(), 0u);
   EXPECT_EQ(GRPC_SLICE_LENGTH(s), sz);
   EXPECT_EQ(std::memcmp(GRPC_SLICE_START_PTR(s), msg, sz), 0);

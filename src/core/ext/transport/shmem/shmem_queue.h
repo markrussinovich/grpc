@@ -25,7 +25,7 @@ namespace grpc_shmem {
 
 enum class Direction { kC2S, kS2C };
 
-class SemaphoreManager;  // Forward declaration
+// REVERTED: Remove SemaphoreManager forward declaration for baseline testing
 
 // Compute free space in the ring (in bytes), using monotonic head/tail.
 inline uint64_t RingFreeBytes(const DataRingBuffer& rb) {
@@ -51,16 +51,19 @@ inline void Release(DataRingBuffer* rb, uint32_t size) {
   rb->tail.fetch_add(size, std::memory_order_release);
 }
 
+// Forward declaration for semaphore adapter
+class TransportSemaphoreAdapter;
+
 // Push a command and optionally wake the sleeping peer if the queue was empty
 // before the push. Returns true if the command was pushed.
-bool PushCommand(ShmemQueues* q, ControlBlock* cb, SemaphoreManager* sem_mgr,
-                 Direction dir, const Command& cmd);
+bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
+                 const Command& cmd, TransportSemaphoreAdapter* sem_adapter = nullptr);
 
 // Pop a command using hybrid spin-then-wait. Spins for spin_iters attempts;
 // upon empty, waits on the appropriate semaphore. Returns true with a command
 // when successful.
-bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, SemaphoreManager* sem_mgr,
-                      Direction dir, int spin_iters, Command* out);
+bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
+                      int spin_iters, Command* out, TransportSemaphoreAdapter* sem_adapter = nullptr);
 
 }  // namespace grpc_shmem
 

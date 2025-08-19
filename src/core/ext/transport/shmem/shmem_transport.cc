@@ -76,20 +76,32 @@ class ShmemClientTransport final : public ClientTransport {
     state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(), "init");
     state_tracker_.SetState(GRPC_CHANNEL_READY, absl::OkStatus(), "shmem ready");
     
-    // Initialize semaphore manager for cross-process communication
-    if (cb_ != nullptr) {
-      // Safely increment process count
-      try {
-        int32_t current_count = ++cb_->process_count;
-        LOG(INFO) << "ShmemClientTransport attached, process count now: " << (current_count + 1);
-        
-        auto status = sem_mgr_.InitFromControlBlock(cb_);
-        if (!status.ok()) {
-          LOG(WARNING) << "Failed to initialize semaphore manager: " << status;
+    // Track process attachment for coordination  
+    if (cb_) {
+      int32_t current_count = ++cb_->process_count;
+      LOG(INFO) << "ShmemClientTransport attached, process count now: " << current_count;
+      
+      // Initialize cross-process semaphores if names are available
+      if (cb_->c2s_sem_name[0] != '\0') {
+        auto status = c2s_cross_sem_.InitFromName(cb_->c2s_sem_name);
+        if (status.ok()) {
+          LOG(INFO) << "Initialized c2s cross-process semaphore: " << cb_->c2s_sem_name;
+        } else {
+          LOG(WARNING) << "Failed to initialize c2s semaphore: " << status;
         }
-      } catch (const std::exception& e) {
-        LOG(ERROR) << "Error during client transport initialization: " << e.what();
       }
+      if (cb_->s2c_sem_name[0] != '\0') {
+        auto status = s2c_cross_sem_.InitFromName(cb_->s2c_sem_name);
+        if (status.ok()) {
+          LOG(INFO) << "Initialized s2c cross-process semaphore: " << cb_->s2c_sem_name;
+        } else {
+          LOG(WARNING) << "Failed to initialize s2c semaphore: " << status;
+        }
+      }
+      
+      // Create semaphore adapter for queue operations
+      sem_adapter_ = std::make_unique<grpc_shmem::TransportSemaphoreAdapter>(
+          &c2s_cross_sem_, &s2c_cross_sem_);
     }
   }
 
@@ -115,7 +127,7 @@ class ShmemClientTransport final : public ClientTransport {
     // Step 2: Set stop flag and wake threads
     stop_.store(true, std::memory_order_relaxed);
     if (cb_ != nullptr && grpc_shmem::SafePointerAccess::IsValid(cb_)) {
-      cb_->cleanup_initiated = true;
+      // REVERTED: Remove cleanup_initiated flag for baseline testing
     }
     
     tracer.Checkpoint("Waiting for threads to exit");
@@ -140,7 +152,15 @@ class ShmemClientTransport final : public ClientTransport {
       if (cb_ != nullptr && grpc_shmem::SafePointerAccess::IsValid(cb_)) {
         try {
           // Wake any waiting reader so it can observe stop_ and exit
-          sem_mgr_.WakeAll();
+        if (cb_) {
+          // Wake both directions using cross-process semaphores
+          if (cb_->c2s_sem_name[0] != '\0') {
+            c2s_cross_sem_.post();
+          }
+          if (cb_->s2c_sem_name[0] != '\0') {
+            s2c_cross_sem_.post();
+          }
+        }
           tracer.Checkpoint("Semaphores woken successfully");
         } catch (const std::exception& e) {
           LOG(ERROR) << "Error waking semaphores: " << e.what();
@@ -169,14 +189,15 @@ class ShmemClientTransport final : public ClientTransport {
     try {
       tracer.Checkpoint("Cleaning semaphore manager");
       // Cleanup semaphore manager
-      sem_mgr_.Cleanup();
+      // REVERTED: Remove semaphore manager cleanup for baseline testing
       
       tracer.Checkpoint("Handling process count coordination");
       // Handle process count and cleanup coordination
       if (cb_ != nullptr && grpc_shmem::SafePointerAccess::IsValid(cb_)) {
         tracer.Checkpoint("Decrementing process count");
-        int32_t remaining = cb_->process_count--;
-        LOG(INFO) << "ShmemClientTransport detaching, remaining processes: " << (remaining - 1);
+        int32_t remaining = --cb_->process_count;
+        LOG(INFO) << "ShmemServerTransport detaching, remaining processes: " << remaining;
+        LOG(INFO) << "ShmemClientTransport detaching, remaining processes: " << remaining;
         
         // Clean up cross-process segment if this is a cross-process client
         if (server_ == nullptr) {
@@ -241,7 +262,12 @@ class ShmemClientTransport final : public ClientTransport {
   std::thread reader_;
   std::atomic<uint32_t> next_stream_id_{1};
   int spin_iters_ = kDefaultSpinIters;
-  grpc_shmem::SemaphoreManager sem_mgr_;  // Cross-process semaphore manager
+  // Cross-process semaphores for both directions
+  grpc_shmem::CrossProcessSemaphore c2s_cross_sem_;
+  grpc_shmem::CrossProcessSemaphore s2c_cross_sem_;
+  
+  // Semaphore adapter for queue operations
+  std::unique_ptr<grpc_shmem::TransportSemaphoreAdapter> sem_adapter_;
 
   Mutex state_mu_;
   ConnectivityStateTracker state_tracker_
@@ -314,19 +340,59 @@ class ShmemServerTransport final : public ServerTransport {
       spin_iters_ = raw_spin_iters;
     }
     dispatch_only_ = args.GetBool(kArgShmemDispatchOnly).value_or(true);
-    cb_ = segment_ ? segment_->control() : nullptr;
+    printf("DEBUG: ShmemServerTransport dispatch_only_ = %s\n", dispatch_only_ ? "true" : "false");
+    fflush(stdout);
+    
+    // DIAGNOSTIC: Check segment before getting control block
+    LOG(INFO) << "ShmemServerTransport constructor - segment_: " << segment_.get();
+    if (segment_) {
+      LOG(INFO) << "Segment exists, getting control block...";
+      cb_ = segment_->control();
+      LOG(INFO) << "Got control block: " << cb_;
+      
+      if (cb_) {
+        LOG(INFO) << "ControlBlock magic: " << std::hex << cb_->magic_number;
+        LOG(INFO) << "ControlBlock c2s_queues: " << cb_->GetC2SQueues();
+        LOG(INFO) << "ControlBlock s2c_queues: " << cb_->GetS2CQueues();
+        
+        if (!cb_->GetC2SQueues() || !cb_->GetS2CQueues()) {
+          LOG(ERROR) << "FATAL: Queues not initialized in segment!";
+          LOG(ERROR) << "ShmemSegment::InitQueues() likely failed or was not called";
+        }
+      }
+    } else {
+      LOG(ERROR) << "FATAL: segment_ is null - segment creation failed!";
+      cb_ = nullptr;
+    }
     
     // Initialize semaphore manager for cross-process communication
     if (cb_ != nullptr) {
       // Safely increment process count
       try {
         int32_t current_count = ++cb_->process_count;
-        LOG(INFO) << "ShmemServerTransport attached, process count now: " << (current_count + 1);
+        LOG(INFO) << "ShmemServerTransport attached, process count now: " << current_count;
         
-        auto status = sem_mgr_.InitFromControlBlock(cb_);
-        if (!status.ok()) {
-          LOG(WARNING) << "Failed to initialize semaphore manager: " << status;
+        // Initialize cross-process semaphores if names are available
+        if (cb_->c2s_sem_name[0] != '\0') {
+          auto status = c2s_cross_sem_.InitFromName(cb_->c2s_sem_name);
+          if (status.ok()) {
+            LOG(INFO) << "Initialized c2s cross-process semaphore: " << cb_->c2s_sem_name;
+          } else {
+            LOG(WARNING) << "Failed to initialize c2s semaphore: " << status;
+          }
         }
+        if (cb_->s2c_sem_name[0] != '\0') {
+          auto status = s2c_cross_sem_.InitFromName(cb_->s2c_sem_name);
+          if (status.ok()) {
+            LOG(INFO) << "Initialized s2c cross-process semaphore: " << cb_->s2c_sem_name;
+          } else {
+            LOG(WARNING) << "Failed to initialize s2c semaphore: " << status;
+          }
+        }
+        
+        // Create semaphore adapter for queue operations
+        sem_adapter_ = std::make_unique<grpc_shmem::TransportSemaphoreAdapter>(
+            &c2s_cross_sem_, &s2c_cross_sem_);
       } catch (const std::exception& e) {
         LOG(ERROR) << "Error during server transport initialization: " << e.what();
       }
@@ -342,6 +408,25 @@ class ShmemServerTransport final : public ServerTransport {
         rq->memory_quota()->CreateMemoryAllocator("shmem-server-alloc");
     call_arena_allocator_ =
         MakeRefCounted<CallArenaAllocator>(std::move(alloc), 1024);
+    
+    // VALIDATION: Check ControlBlock before starting reader thread
+    LOG(INFO) << "About to start reader thread. Validating ControlBlock...";
+    if (!cb_) {
+      LOG(ERROR) << "FATAL: cb_ is null at EnsureReaderStarted!";
+      return;
+    }
+    
+    LOG(INFO) << "ControlBlock at: " << cb_;
+    LOG(INFO) << "c2s_queues: " << cb_->GetC2SQueues();
+    LOG(INFO) << "s2c_queues: " << cb_->GetS2CQueues();
+    
+    if (!cb_->GetC2SQueues() || !cb_->GetS2CQueues()) {
+      LOG(ERROR) << "FATAL: Queue pointers not initialized before starting reader!";
+      LOG(ERROR) << "This indicates ShmemSegment::InitQueues() failed or was never called";
+      return;
+    }
+    
+    LOG(INFO) << "ControlBlock validation passed, starting reader thread";
     EnsureReaderStarted();
   }
 
@@ -399,7 +484,7 @@ class ShmemServerTransport final : public ServerTransport {
     
     stop_.store(true, std::memory_order_relaxed);
     if (cb_ != nullptr) {
-      cb_->cleanup_initiated = true;
+      // REVERTED: Remove cleanup_initiated flag for baseline testing
     }
     
     // Step 3: Wait for threads to exit
@@ -417,7 +502,15 @@ class ShmemServerTransport final : public ServerTransport {
     if (reader_started_.load(std::memory_order_acquire)) {
       if (cb_ != nullptr) {
         // Wake any waiting reader thread so it can observe stop_ and exit
-        sem_mgr_.WakeAll();
+        if (cb_) {
+          // Wake both directions using cross-process semaphores
+          if (cb_->c2s_sem_name[0] != '\0') {
+            c2s_cross_sem_.post();
+          }
+          if (cb_->s2c_sem_name[0] != '\0') {
+            s2c_cross_sem_.post();
+          }
+        }
       }
       
       if (reader_.joinable()) {
@@ -431,12 +524,13 @@ class ShmemServerTransport final : public ServerTransport {
   void CleanupResources() {
     try {
       // Cleanup semaphore manager
-      sem_mgr_.Cleanup();
+      // REVERTED: Remove semaphore manager cleanup for baseline testing
       
       // Handle process count and cleanup coordination
       if (cb_ != nullptr) {
-        int32_t remaining = cb_->process_count--;
-        LOG(INFO) << "ShmemServerTransport detaching, remaining processes: " << (remaining - 1);
+        int32_t remaining = --cb_->process_count;
+        LOG(INFO) << "ShmemServerTransport detaching, remaining processes: " << remaining;
+        LOG(INFO) << "ShmemServerTransport detaching, remaining processes: " << remaining;
         
         // Server is responsible for cleaning up shared resources if last process
         if (remaining == 1) {
@@ -451,16 +545,7 @@ class ShmemServerTransport final : public ServerTransport {
   
   void CleanupSharedResources() {
     try {
-      if (cb_ != nullptr && cb_->c2s_sem_name[0] != '\0') {
-        std::string name = std::string(cb_->c2s_sem_name);
-        if (name[0] == '/') name = name.substr(1); // Remove leading '/'
-        grpc_shmem::CrossProcessSemaphore::UnlinkNamed(name);
-      }
-      if (cb_ != nullptr && cb_->s2c_sem_name[0] != '\0') {
-        std::string name = std::string(cb_->s2c_sem_name);
-        if (name[0] == '/') name = name.substr(1); // Remove leading '/'  
-        grpc_shmem::CrossProcessSemaphore::UnlinkNamed(name);
-      }
+      // REVERTED: Remove semaphore name cleanup for baseline testing
       LOG(INFO) << "Server cleaned up shared semaphores";
     } catch (const std::exception& e) {
       LOG(ERROR) << "Error cleaning up shared resources: " << e.what();
@@ -528,16 +613,100 @@ class ShmemServerTransport final : public ServerTransport {
   ~ShmemServerTransport() override = default;
 
   void EnsureReaderStarted() {
-    if (cb_ == nullptr) return;
+    printf("DEBUG: EnsureReaderStarted called, cb_=%p, dispatch_only_=%s\n", 
+           cb_, dispatch_only_ ? "true" : "false");
+    fflush(stdout);
+    if (cb_ == nullptr) {
+      printf("DEBUG: cb_ is null, returning\n");
+      fflush(stdout);
+      return;
+    }
     if (!dispatch_only_ &&
         !reader_started_.exchange(true, std::memory_order_acq_rel)) {
+      printf("DEBUG: Starting ServerLoop thread...\n");
+      fflush(stdout);
       stop_.store(false, std::memory_order_relaxed);
       reader_ = std::thread([this] { this->ServerLoop(); });
+      printf("DEBUG: ServerLoop thread started\n");
+      fflush(stdout);
+    } else {
+      printf("DEBUG: Not starting reader - dispatch_only_=%s, reader_started_=%s\n", 
+             dispatch_only_ ? "true" : "false", 
+             reader_started_.load() ? "true" : "false");
+      fflush(stdout);
     }
   }
 
   void ServerLoop() {
+    printf("DEBUG: ServerLoop thread started, entering main loop\n");
+    fflush(stdout);
     ExecCtx exec_ctx;
+    printf("DEBUG: ExecCtx created, validating control block\n");
+    fflush(stdout);
+    
+    // STEP 1: VALIDATE CONTROLBLOCK BEFORE USE
+    printf("DEBUG: ServerLoop starting, cb_=%p\n", cb_);
+    fflush(stdout);
+    
+    if (!cb_) {
+      printf("DEBUG: FATAL - cb_ is null!\n");
+      fflush(stdout);
+      return;
+    }
+    printf("DEBUG: cb_ is valid, checking basic fields\n");
+    fflush(stdout);
+    
+    // Check if we can read basic fields
+    try {
+      printf("DEBUG: Reading magic number...\n");
+      fflush(stdout);
+      auto magic = cb_->magic_number;
+      printf("DEBUG: Reading version...\n");
+      fflush(stdout);
+      auto version = cb_->transport_version;
+      printf("DEBUG: ControlBlock magic: 0x%lx, version: %u\n", magic, version);
+      fflush(stdout);
+    } catch (...) {
+      printf("DEBUG: FATAL - Cannot read ControlBlock basic fields!\n");
+      fflush(stdout);
+      return;
+    }
+    
+    // CHECK THE ACTUAL PROBLEM - c2s_queues pointer
+    LOG(INFO) << "c2s_queues pointer: " << cb_->GetC2SQueues();
+    LOG(INFO) << "s2c_queues pointer: " << cb_->GetS2CQueues();
+    
+    if (!cb_->GetC2SQueues()) {
+      LOG(ERROR) << "FATAL: c2s_queues is null! Queue initialization failed.";
+      return;
+    }
+    
+    if (!cb_->GetS2CQueues()) {
+      LOG(ERROR) << "FATAL: s2c_queues is null! Queue initialization failed.";
+      return;
+    }
+    
+    // Test if we can access first queue element safely
+    try {
+      // Try to read from the command queue structure  
+      volatile auto* queue_ptr = cb_->GetC2SQueues();
+      LOG(INFO) << "c2s_queues access test - pointer: " << queue_ptr;
+      
+      // Check if this looks like a valid memory address
+      uintptr_t addr = reinterpret_cast<uintptr_t>(queue_ptr);
+      if (addr < 0x1000 || addr > 0x7fffffffffff) {
+        LOG(ERROR) << "FATAL: c2s_queues pointer looks invalid: " << std::hex << addr;
+        return;
+      }
+      
+      LOG(INFO) << "Queue pointer validation passed";
+    } catch (...) {
+      LOG(ERROR) << "FATAL: c2s_queues points to invalid memory!";
+      return;
+    }
+    
+    LOG(INFO) << "ControlBlock validation passed, proceeding with ServerLoop";
+    
     struct StreamState {
       bool synthetic = true;       // synthetic fast-path or dispatched
       bool sent_initial = false;   // S2C initial metadata sent
@@ -648,12 +817,11 @@ class ShmemServerTransport final : public ServerTransport {
     };
     absl::flat_hash_map<uint32_t, StreamState> streams;
     for (;;) {
-      if (stop_.load(std::memory_order_relaxed) || 
-          (cb_ != nullptr && cb_->cleanup_initiated)) break;
+      if (stop_.load(std::memory_order_relaxed)) break;  // REVERTED: Remove cleanup_initiated check
       grpc_shmem::Command cmd;
       bool has_command = grpc_shmem::PopCommandHybrid(
-          cb_->c2s_queues, cb_, &sem_mgr_, grpc_shmem::Direction::kC2S, spin_iters_,
-          &cmd);
+          cb_->GetC2SQueues(), cb_, grpc_shmem::Direction::kC2S, spin_iters_,
+          &cmd, sem_adapter_.get());
 
       if (!has_command) {
         // No command available - check stop flag again before continuing
@@ -671,7 +839,7 @@ class ShmemServerTransport final : public ServerTransport {
               std::vector<grpc_shmem::KVPair> kvs_in;
               if (cmd.data_size > 0) {
                 const unsigned char* p =
-                    cb_->c2s_queues->data_rb.buffer + cmd.data_offset;
+                    cb_->GetC2SQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
                 kvs_in = grpc_shmem::DeserializeMetadataKVs(p, cmd.data_size);
               }
               for (const auto& kv : kvs_in) {
@@ -699,9 +867,9 @@ class ShmemServerTransport final : public ServerTransport {
                     {"content-type", "application/grpc"}, {"x-shmem", "1"}};
                 auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
                 uint64_t off = 0;
-                grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
+                grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
                                               buf.size(), &off);
-                std::memcpy(cb_->s2c_queues->data_rb.buffer + off,
+                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off,
                             buf.data(), buf.size());
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -709,19 +877,19 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = 0;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
-                                        grpc_shmem::Direction::kS2C, out);
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                        grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
               }
               st.sent_initial = true;
             }
             // Release consumed bytes from c2s
-            cb_->c2s_queues->data_rb.tail.fetch_add(cmd.data_size,
+            cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size,
                                                     std::memory_order_release);
             break;
           }
           case grpc_shmem::FrameType::C2S_MESSAGE: {
             const unsigned char* p =
-                cb_->c2s_queues->data_rb.buffer + cmd.data_offset;
+                cb_->GetC2SQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
             // Synthetic cancel-by-payload (only for synthetic streams)
             if (st.synthetic && !st.sent_trailing && st.path == "/cancel" &&
                 cmd.data_size == 6 && memcmp(p, "cancel", 6) == 0) {
@@ -736,9 +904,9 @@ class ShmemServerTransport final : public ServerTransport {
                     {"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)}};
                 auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
                 uint64_t off = 0;
-                grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
+                grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
                                               buf.size(), &off);
-                std::memcpy(cb_->s2c_queues->data_rb.buffer + off,
+                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off,
                             buf.data(), buf.size());
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -746,13 +914,13 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = GRPC_STATUS_CANCELLED;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
-                                        grpc_shmem::Direction::kS2C, out);
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                        grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
               }
               // Release input bytes
-              cb_->c2s_queues->data_rb.tail.fetch_add(
+              cb_->GetC2SQueues()->data_rb.tail.fetch_add(
                   cmd.data_size, std::memory_order_release);
               break;
             }
@@ -761,9 +929,9 @@ class ShmemServerTransport final : public ServerTransport {
               uint64_t off = 0;
               
               // Try allocation once with optimized ReserveContiguous
-              if (grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
+              if (grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
                                                cmd.data_size, &off)) {
-                std::memcpy(cb_->s2c_queues->data_rb.buffer + off, p, cmd.data_size);
+                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off, p, cmd.data_size);
                 
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -771,22 +939,22 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = cmd.data_size;
                 out.grpc_status_code = 0;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
-                                        grpc_shmem::Direction::kS2C, out);
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                        grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
               } else {
                 // Fallback: use wrapping allocation for very large messages
-                if (grpc_shmem::ReserveWrapping(&cb_->s2c_queues->data_rb,
+                if (grpc_shmem::ReserveWrapping(&cb_->GetS2CQueues()->data_rb,
                                                cmd.data_size, &off)) {
                   // Handle potential wrap-around copy
-                  const uint64_t capacity = cb_->s2c_queues->data_rb.capacity;
+                  const uint64_t capacity = cb_->GetS2CQueues()->data_rb.capacity;
                   if (off + cmd.data_size <= capacity) {
-                    std::memcpy(cb_->s2c_queues->data_rb.buffer + off, p, cmd.data_size);
+                    std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off, p, cmd.data_size);
                   } else {
                     // Split copy across ring boundary
                     const uint32_t first_part = capacity - off;
                     const uint32_t second_part = cmd.data_size - first_part;
-                    std::memcpy(cb_->s2c_queues->data_rb.buffer + off, p, first_part);
-                    std::memcpy(cb_->s2c_queues->data_rb.buffer, p + first_part, second_part);
+                    std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off, p, first_part);
+                    std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_), p + first_part, second_part);
                   }
                   
                   grpc_shmem::Command out{};
@@ -795,19 +963,19 @@ class ShmemServerTransport final : public ServerTransport {
                   out.data_offset = off;
                   out.data_size = cmd.data_size;
                   out.grpc_status_code = 0;
-                  grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
-                                          grpc_shmem::Direction::kS2C, out);
+                  grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                          grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
                 }
                 // If both allocations fail, drop the message (better than hanging)
               }
               
-              cb_->c2s_queues->data_rb.tail.fetch_add(
+              cb_->GetC2SQueues()->data_rb.tail.fetch_add(
                   cmd.data_size, std::memory_order_release);
             } else {
               // *** FIX: messages for dispatched streams are forwarded by
               // ForwardCall; ignore any ring messages (should not be sent by
               // client) and just release.
-              cb_->c2s_queues->data_rb.tail.fetch_add(
+              cb_->GetC2SQueues()->data_rb.tail.fetch_add(
                   cmd.data_size, std::memory_order_release);
             }
             break;
@@ -825,9 +993,9 @@ class ShmemServerTransport final : public ServerTransport {
                   kvs.push_back({"grpc-message", "unimplemented"});
                 auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
                 uint64_t off = 0;
-                grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
+                grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
                                               buf.size(), &off);
-                std::memcpy(cb_->s2c_queues->data_rb.buffer + off,
+                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off,
                             buf.data(), buf.size());
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -835,13 +1003,13 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = code;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
-                                        grpc_shmem::Direction::kS2C, out);
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                        grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
               }
               if (cmd.data_size != 0)
-                cb_->c2s_queues->data_rb.tail.fetch_add(
+                cb_->GetC2SQueues()->data_rb.tail.fetch_add(
                     cmd.data_size, std::memory_order_release);
             } else {
               // *** FIX: for dispatched streams, ForwardCall will call
@@ -849,7 +1017,7 @@ class ShmemServerTransport final : public ServerTransport {
               // call announcement on client trailing nor need to interpret it
               // specially.
               if (cmd.data_size != 0) {
-                cb_->c2s_queues->data_rb.tail.fetch_add(
+                cb_->GetC2SQueues()->data_rb.tail.fetch_add(
                     cmd.data_size, std::memory_order_release);
               }
             }
@@ -863,9 +1031,9 @@ class ShmemServerTransport final : public ServerTransport {
                     {"grpc-status", std::to_string(GRPC_STATUS_CANCELLED)}};
                 auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
                 uint64_t off = 0;
-                grpc_shmem::ReserveContiguous(&cb_->s2c_queues->data_rb,
+                grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
                                               buf.size(), &off);
-                std::memcpy(cb_->s2c_queues->data_rb.buffer + off,
+                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off,
                             buf.data(), buf.size());
                 grpc_shmem::Command out{};
                 out.stream_id = cmd.stream_id;
@@ -873,8 +1041,8 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = GRPC_STATUS_CANCELLED;
-                grpc_shmem::PushCommand(cb_->s2c_queues, cb_, &sem_mgr_,
-                                        grpc_shmem::Direction::kS2C, out);
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                        grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
                 st.sent_trailing = true;
                 st.completed = true;  // Mark stream as completed for cleanup
               }
@@ -936,7 +1104,13 @@ class ShmemServerTransport final : public ServerTransport {
 
   std::unique_ptr<grpc_shmem::ShmemSegment> segment_;
   grpc_shmem::ControlBlock* cb_ = nullptr;
-  grpc_shmem::SemaphoreManager sem_mgr_;  // Cross-process semaphore manager
+  // Cross-process semaphores for both directions
+  grpc_shmem::CrossProcessSemaphore c2s_cross_sem_;
+  grpc_shmem::CrossProcessSemaphore s2c_cross_sem_;
+  
+  // Semaphore adapter for queue operations
+  std::unique_ptr<grpc_shmem::TransportSemaphoreAdapter> sem_adapter_;
+  
   std::atomic<bool> shutdown_initiated_{false};
   std::atomic<bool> cleanup_complete_{false};
   RefCountedPtr<UnstartedCallDestination> dest_;
@@ -1049,12 +1223,11 @@ void ShmemClientTransport::EnsureReaderStarted() {
       // Initialize client config lazily from server's config
       if (server_ != nullptr) spin_iters_ = server_->spin_iters();
       for (;;) {
-        if (stop_.load(std::memory_order_relaxed) || 
-          (cb_ != nullptr && cb_->cleanup_initiated)) break;
+        if (stop_.load(std::memory_order_relaxed)) break;  // REVERTED: Remove cleanup_initiated check
         grpc_shmem::Command cmd;
-        if (!grpc_shmem::PopCommandHybrid(cb_->s2c_queues, cb_, &sem_mgr_,
+        if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_,
                                           grpc_shmem::Direction::kS2C,
-                                          spin_iters_, &cmd)) {
+                                          spin_iters_, &cmd, sem_adapter_.get())) {
           continue;
         }
         std::unique_ptr<CallHandler> handler;
@@ -1067,7 +1240,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
         if (!handler) continue;
         switch (cmd.type) {
           case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
-            auto data = cb_->s2c_queues->data_rb.buffer + cmd.data_offset;
+            auto data = cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
             auto kvs = grpc_shmem::DeserializeMetadataKVs(data, cmd.data_size);
             handler->SpawnInfallible(
                 "push-initial", [kvs = std::move(kvs), h = *handler]() mutable {
@@ -1090,14 +1263,14 @@ void ShmemClientTransport::EnsureReaderStarted() {
                   h.SpawnPushServerInitialMetadata(std::move(md));
                   return Empty{};
                 });
-            cb_->s2c_queues->data_rb.tail.fetch_add(cmd.data_size,
+            cb_->GetS2CQueues()->data_rb.tail.fetch_add(cmd.data_size,
                                                     std::memory_order_release);
             break;
           }
           case grpc_shmem::FrameType::S2C_MESSAGE: {
             // Zero-copy slice; tail advanced by slice destructor.
             grpc_slice s = grpc_shmem::MakeSliceFromRing(
-                &cb_->s2c_queues->data_rb, cmd.data_offset, cmd.data_size);
+                &cb_->GetS2CQueues()->data_rb, cb_, cmd.data_offset, cmd.data_size);
             handler->SpawnInfallible("push-msg", [h = *handler, s]() mutable {
               SliceBuffer sb;
               // Wrap the ring-backed grpc_slice directly into a
@@ -1112,7 +1285,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
             break;
           }
           case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
-            auto data = cb_->s2c_queues->data_rb.buffer + cmd.data_offset;
+            auto data = cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
             auto kvs = grpc_shmem::DeserializeMetadataKVs(data, cmd.data_size);
             handler->SpawnInfallible(
                 "push-trailing", [kvs = std::move(kvs), h = *handler,
@@ -1142,7 +1315,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
 
                   return Empty{};
                 });
-            cb_->s2c_queues->data_rb.tail.fetch_add(cmd.data_size,
+            cb_->GetS2CQueues()->data_rb.tail.fetch_add(cmd.data_size,
                                                     std::memory_order_release);
             break;
           }
@@ -1174,15 +1347,12 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                }
 
                const bool is_cancel_path = (path == "/cancel");
+               const bool is_cross_process = (server_ == nullptr);
 
                // Default to **dispatched** (in-proc) for all real RPCs.
-               // Only use the synthetic ring path for the special "/cancel" hook.
-               if (!is_cancel_path) {
+               // Use synthetic ring path for cross-process mode or "/cancel" hook.
+               if (!is_cancel_path && !is_cross_process) {
                  // *** In-proc bootstrap (dispatched) ***
-                 if (server_ == nullptr) {
-                   // Cross-process mode: can't use direct dispatch
-                   return absl::InternalError("Cross-process dispatch not supported");
-                 }
                  auto initiator =
                      server_->AnnounceAndGetInitiator(stream_id, std::move(md));
                  ForwardCall(child_call_handler, std::move(initiator),
@@ -1194,14 +1364,11 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                              });
                  return absl::OkStatus();
                } else {
-                 // *** Synthetic ring path (cancel test hook only) ***
+                 // *** Synthetic ring path (cross-process communication and cancel test hook) ***
                  if (server_ != nullptr && server_->dispatch_only()) {
                    // In dispatch-only mode the ring reader is disabled:
                    // never route synthetic traffic in that mode.
                    // Fall back to dispatched to ensure the test proceeds.
-                   if (server_ == nullptr) {
-                     return absl::InternalError("Cross-process fallback not supported");
-                   }
                    auto initiator =
                        server_->AnnounceAndGetInitiator(stream_id, std::move(md));
                    ForwardCall(child_call_handler, std::move(initiator),
@@ -1241,17 +1408,25 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
 
                  auto vec = grpc_shmem::SerializeMetadataKVs(kvs);
                  uint64_t off = 0;
-                 grpc_shmem::ReserveContiguous(&cb->c2s_queues->data_rb,
+                 grpc_shmem::ReserveContiguous(&cb->GetC2SQueues()->data_rb,
                                                vec.size(), &off);
-                 std::memcpy(cb->c2s_queues->data_rb.buffer + off,
+                 printf("DEBUG: About to memcpy metadata to ring buffer, off=%zu, size=%zu\n", off, vec.size());
+                 fflush(stdout);
+                 std::memcpy(cb->GetC2SQueues()->data_rb.GetBuffer(cb) + off,
                              vec.data(), vec.size());
+                 printf("DEBUG: memcpy completed, creating command\n");
+                 fflush(stdout);
                  grpc_shmem::Command cmd{};
                  cmd.stream_id = stream_id;
                  cmd.type = grpc_shmem::FrameType::C2S_INITIAL_METADATA;
                  cmd.data_offset = off;
                  cmd.data_size = static_cast<uint32_t>(vec.size());
-                 grpc_shmem::PushCommand(cb->c2s_queues, cb, &sem_mgr_,
-                                         grpc_shmem::Direction::kC2S, cmd);
+                 printf("DEBUG: About to push command to C2S queue\n");
+                 fflush(stdout);
+                 grpc_shmem::PushCommand(cb->GetC2SQueues(), cb,
+                                         grpc_shmem::Direction::kC2S, cmd, sem_adapter_.get());
+                 printf("DEBUG: Command pushed successfully\n");
+                 fflush(stdout);
 
                  return absl::OkStatus();
                }
@@ -1312,6 +1487,9 @@ MakeShmemTransportPair(const ChannelArgs& server_channel_args,
 
 OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     const std::string& server_name, const ChannelArgs& server_channel_args) {
+  printf("DEBUG: MakeNamedShmemServerTransport called with server_name: %s\n", server_name.c_str());
+  fflush(stdout);
+  
   // Force ring mode for cross-process server
   ChannelArgs ring_mode_args = server_channel_args
       .Set("grpc.shmem.dispatch_only", false);
@@ -1323,21 +1501,44 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
   cfg.server_name = server_name;  // For named semaphores
   cfg.data_ring_capacity = 64 * 1024 * 1024;
   cfg.size = 192 * 1024 * 1024;
+  printf("DEBUG: Segment config: name=%s, size=%zu, data_ring_capacity=%zu\n", 
+         cfg.name.c_str(), cfg.size, cfg.data_ring_capacity);
+  fflush(stdout);
+  
+  printf("DEBUG: Removing existing segment if exists...\n");
+  fflush(stdout);
   grpc_shmem::ShmemSegment::RemoveIfExists(cfg.name);
+  
+  printf("DEBUG: Creating new segment...\n");
+  fflush(stdout);
   auto s = grpc_shmem::ShmemSegment::Create(cfg);
+  
+  printf("DEBUG: Created segment, checking control block...\n");
+  fflush(stdout);
   if (s.control() == nullptr) {
     LOG(ERROR) << "Failed to create named shmem segment: " << cfg.name;
     return nullptr;
   }
+  
+  LOG(INFO) << "Control block created successfully at: " << s.control();
+  LOG(INFO) << "Control block c2s_queues: " << s.control()->GetC2SQueues();
+  LOG(INFO) << "Control block s2c_queues: " << s.control()->GetS2CQueues();
+  
   segment = std::make_unique<grpc_shmem::ShmemSegment>(std::move(s));
+  LOG(INFO) << "Wrapped in unique_ptr, creating server transport...";
 
   auto server_transport = MakeOrphanable<ShmemServerTransport>(
       ring_mode_args, std::move(segment));
+  
+  LOG(INFO) << "Server transport created: " << server_transport.get();
   return std::move(server_transport);
 }
 
 OrphanablePtr<Transport> ConnectToShmemServerTransport(
     const std::string& server_name, const ChannelArgs& client_channel_args) {
+  printf("DEBUG: ConnectToShmemServerTransport called with server_name: %s\n", server_name.c_str());
+  fflush(stdout);
+  
   const bool dispatch_only =
       client_channel_args.GetBool("grpc.shmem.dispatch_only").value_or(false);
 
@@ -1347,17 +1548,33 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   }
 
   std::string segment_name = absl::StrCat("grpc_shmem_", server_name);
+  printf("DEBUG: Opening segment: %s\n", segment_name.c_str());
+  fflush(stdout);
+  
   auto segment = grpc_shmem::ShmemSegment::Open(segment_name);
+  
+  printf("DEBUG: Segment opened, control block: %p\n", segment.control());
+  fflush(stdout);
   if (segment.control() == nullptr) {
     LOG(ERROR) << "Failed to connect to shmem server: " << server_name;
     return nullptr;
   }
 
   grpc_shmem::ControlBlock* cb = segment.control();
+  printf("DEBUG: Control block at: %p\n", cb);
+  printf("DEBUG: c2s_queues: %p, s2c_queues: %p\n", cb->GetC2SQueues(), cb->GetS2CQueues());
+  fflush(stdout);
+  
   auto segment_ptr = std::make_unique<grpc_shmem::ShmemSegment>(std::move(segment));
+  
+  printf("DEBUG: About to store segment and create client transport\n");
+  fflush(stdout);
   
   // Store segment for cleanup
   StoreCrossProcessSegment(cb, std::move(segment_ptr));
+  
+  printf("DEBUG: Creating client transport with cb: %p\n", cb);
+  fflush(stdout);
   
   return MakeOrphanable<ShmemClientTransport>(nullptr, cb, client_channel_args);
 }

@@ -78,41 +78,55 @@ struct ControlBlock {
   std::atomic<uint32_t> server_state;
   std::atomic<uint32_t> client_state;
 
-  // --- Process Coordination ---
-  // std::atomic<int32_t> process_count{0};       // Number of attached processes
-  // std::atomic<bool> cleanup_initiated{false};  // Global shutdown signal
-  int32_t process_count;       // Number of attached processes  
-  bool cleanup_initiated;      // Global shutdown signal
-  
-  // --- Cross-Process Semaphore Names ---
-  // Store semaphore names instead of process-specific handles
-  // char c2s_sem_name[32];  // Name for client-to-server semaphore
-  // char s2c_sem_name[32];  // Name for server-to-client semaphore
-  
+  // --- Lightweight Synchronization Semaphores ---
+  // Used to wake a sleeping reader thread when the command queue transitions
+  // from empty to non-empty.
+  // Cross-process compatible: Both semaphores managed by name outside shared memory
+  char c2s_sem_placeholder[64];  // Reserved space (semaphores managed by name)
+  char s2c_sem_placeholder[64];  // Reserved space (semaphores managed by name)
   // Set by the consumer just before sleeping; producers check this to avoid
   // spurious posts. 0 = not waiting, 1 = waiting.
   std::atomic<uint32_t> c2s_waiters{0};
   std::atomic<uint32_t> s2c_waiters{0};
 
-  // --- Pointers to the new queue structures ---
-  ShmemQueues* c2s_queues;
-  ShmemQueues* s2c_queues;
+  // --- Process coordination for cross-process cleanup ---
+  std::atomic<int32_t> process_count{0};  // Number of attached processes
 
-  // Constructor to initialize fields
+  // --- Cross-process semaphore names (stored in shared memory) ---
+  char c2s_sem_name[64];  // Client-to-server semaphore name
+  char s2c_sem_name[64];  // Server-to-client semaphore name
+
+  // --- Offsets to the queue structures (relative to segment base) ---  
+  uint64_t c2s_queues_offset;  // Offset from segment base to c2s queues
+  uint64_t s2c_queues_offset;  // Offset from segment base to s2c queues
+
+  // Constructor to initialize fields and semaphores
   ControlBlock()
       : magic_number(0x47525043534D454Dull /* "GRPCSMEM" */),
         transport_version(1),
         server_state(0),
         client_state(0),
-        process_count(0),
-        cleanup_initiated(false),
         c2s_waiters(0),
         s2c_waiters(0),
-        c2s_queues(nullptr),
-        s2c_queues(nullptr) {
-    // Initialize semaphore name fields to empty
-    // c2s_sem_name[0] = '\0';
-    // s2c_sem_name[0] = '\0';
+        process_count(0),
+        c2s_queues_offset(0),
+        s2c_queues_offset(0) {
+    // Initialize semaphore name arrays to empty
+    c2s_sem_name[0] = '\0';
+    s2c_sem_name[0] = '\0';
+  }
+  
+  // Helper methods to get actual queue pointers from offsets (cross-process safe)
+  ShmemQueues* GetC2SQueues() {
+    if (c2s_queues_offset == 0) return nullptr;
+    char* base = reinterpret_cast<char*>(this);
+    return reinterpret_cast<ShmemQueues*>(base + c2s_queues_offset);
+  }
+  
+  ShmemQueues* GetS2CQueues() {
+    if (s2c_queues_offset == 0) return nullptr;
+    char* base = reinterpret_cast<char*>(this);
+    return reinterpret_cast<ShmemQueues*>(base + s2c_queues_offset);
   }
 };
 
@@ -148,7 +162,15 @@ struct DataRingBuffer {
   // head is advanced by the producer, tail by the consumer.
   std::atomic<uint64_t> head{0};
   std::atomic<uint64_t> tail{0};
-  unsigned char* buffer = nullptr;
+  // Store buffer as offset from segment base for cross-process compatibility
+  uint64_t buffer_offset = 0;
+  
+  // Helper method to get actual buffer pointer (cross-process safe)
+  unsigned char* GetBuffer(void* segment_base) {
+    if (buffer_offset == 0) return nullptr;
+    return reinterpret_cast<unsigned char*>(
+        static_cast<char*>(segment_base) + buffer_offset);
+  }
 };
 
 // Define the command queue type using our custom lock-free SPSC queue. 
@@ -164,103 +186,34 @@ struct ShmemQueues {
   DataRingBuffer data_rb;
 };
 
-// Helper class to manage cross-process semaphore operations for transports
-class SemaphoreManager {
+// Lightweight adapter to provide semaphore manager interface using transport's own semaphores
+class TransportSemaphoreAdapter {
  public:
-  SemaphoreManager() = default;
-  ~SemaphoreManager() { Cleanup(); }
-
-  // Initialize semaphores from control block names
-  absl::Status InitFromControlBlock(ControlBlock* cb) {
-    if (cb == nullptr) {
-      return absl::InvalidArgumentError("Null control block");
-    }
-    
-    // TEMPORARILY DISABLED - semaphore name fields removed
-    LOG(INFO) << "SemaphoreManager::InitFromControlBlock called (disabled for testing)";
-    
-    /*
-    LOG(INFO) << "SemaphoreManager::InitFromControlBlock: c2s_name='" << cb->c2s_sem_name 
-              << "', s2c_name='" << cb->s2c_sem_name << "'";
-    
-    if (cb->c2s_sem_name[0] != '\0') {
-      auto status = c2s_sem_.InitFromName(cb->c2s_sem_name);
-      if (!status.ok()) {
-        LOG(ERROR) << "Failed to init c2s semaphore: " << status;
-        return status;
-      }
-      LOG(INFO) << "Successfully initialized c2s semaphore: " << cb->c2s_sem_name;
-    }
-    
-    if (cb->s2c_sem_name[0] != '\0') {
-      auto status = s2c_sem_.InitFromName(cb->s2c_sem_name);
-      if (!status.ok()) {
-        LOG(ERROR) << "Failed to init s2c semaphore: " << status;
-        return status;
-      }
-      LOG(INFO) << "Successfully initialized s2c semaphore: " << cb->s2c_sem_name;
-    }
-    */
-    
-    return absl::OkStatus();
-  }
-
+  TransportSemaphoreAdapter(CrossProcessSemaphore* c2s_sem, CrossProcessSemaphore* s2c_sem)
+      : c2s_sem_(c2s_sem), s2c_sem_(s2c_sem) {}
+  
   // Post to semaphore based on direction
   void Post(ControlBlock* cb, bool c2s_direction) {
-    if (c2s_direction) {
-      if (cb->c2s_waiters.load(std::memory_order_relaxed)) {
-        c2s_sem_.post();
-      }
-    } else {
-      if (cb->s2c_waiters.load(std::memory_order_relaxed)) {
-        s2c_sem_.post();
+    std::atomic<uint32_t>* waiters = c2s_direction ? &cb->c2s_waiters : &cb->s2c_waiters;
+    if (waiters->load(std::memory_order_relaxed)) {
+      CrossProcessSemaphore* sem = c2s_direction ? c2s_sem_ : s2c_sem_;
+      if (sem) {
+        sem->post();
       }
     }
   }
 
   // Wait on semaphore based on direction
   void Wait(bool c2s_direction) {
-    if (c2s_direction) {
-      c2s_sem_.wait();
-    } else {
-      s2c_sem_.wait();
-    }
-  }
-
-  // Wake all waiters for shutdown
-  void WakeAll() {
-    c2s_sem_.post();
-    s2c_sem_.post();
-  }
-
-  // Timeout-enabled wait for graceful shutdown
-  bool WaitWithTimeout(bool c2s_direction, std::chrono::milliseconds timeout) {
-    // For now, use regular wait - can be enhanced with sem_timedwait later
-    if (c2s_direction) {
-      c2s_sem_.wait();
-    } else {
-      s2c_sem_.wait();
-    }
-    return true;
-  }
-
-  // Explicit cleanup method
-  void Cleanup() {
-    ShmemShutdownTracer tracer("SemaphoreManager::Cleanup");
-    
-    try {
-      tracer.Checkpoint("Starting semaphore cleanup");
-      // Close handles - the CrossProcessSemaphore destructor handles this
-      // but we make it explicit for better error handling
-      tracer.Checkpoint("Semaphore cleanup completed successfully");
-    } catch (const std::exception& e) {
-      LOG(ERROR) << "SemaphoreManager cleanup error: " << e.what();
+    CrossProcessSemaphore* sem = c2s_direction ? c2s_sem_ : s2c_sem_;
+    if (sem) {
+      sem->wait();
     }
   }
 
  private:
-  CrossProcessSemaphore c2s_sem_;
-  CrossProcessSemaphore s2c_sem_;
+  CrossProcessSemaphore* c2s_sem_;
+  CrossProcessSemaphore* s2c_sem_;
 };
 
 }  // namespace grpc_shmem
