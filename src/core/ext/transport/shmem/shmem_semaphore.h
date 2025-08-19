@@ -19,9 +19,9 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <errno.h>
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
-#include "src/core/lib/gprpp/log.h"
 
 namespace grpc_shmem {
 
@@ -42,8 +42,9 @@ class EventFdSemaphore {
     fd_ = ::eventfd(initial, flags);
     if (fd_ == -1) {
       int saved_errno = errno;
-      GRPC_LOG_ERROR("EventFdSemaphore::Init() eventfd failed: initial=%u, flags=0x%x, errno=%d (%s)", 
-                     initial, flags, saved_errno, strerror(saved_errno));
+      LOG(ERROR) << "EventFdSemaphore::Init() eventfd failed: initial=" << initial 
+                 << ", flags=0x" << std::hex << flags << std::dec 
+                 << ", errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
       return absl::UnknownError(absl::StrCat("eventfd() failed: ", strerror(saved_errno)));
     }
     return absl::OkStatus();
@@ -54,8 +55,8 @@ class EventFdSemaphore {
       int close_result = ::close(fd_);
       if (close_result != 0) {
         int saved_errno = errno;
-        GRPC_LOG_ERROR("EventFdSemaphore::Close() failed: fd=%d, errno=%d (%s)", 
-                       fd_, saved_errno, strerror(saved_errno));
+        LOG(ERROR) << "EventFdSemaphore::Close() failed: fd=" << fd_ 
+                   << ", errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
         // Continue with cleanup despite close failure
       }
       fd_ = -1;
@@ -68,8 +69,9 @@ class EventFdSemaphore {
     ssize_t result = ::write(fd_, &one, sizeof(one));
     if (result != sizeof(one)) {
       int saved_errno = errno;
-      GRPC_LOG_ERROR("EventFdSemaphore::post() write failed: fd=%d, result=%zd, errno=%d (%s)", 
-                     fd_, result, saved_errno, strerror(saved_errno));
+      LOG(ERROR) << "EventFdSemaphore::post() write failed: fd=" << fd_ 
+                 << ", result=" << result << ", errno=" << saved_errno 
+                 << " (" << strerror(saved_errno) << ")";
       // In production, this is a fatal error - semaphore synchronization is broken
       // For now, log and continue, but calling code should handle this scenario
     }
@@ -83,12 +85,13 @@ class EventFdSemaphore {
       int saved_errno = errno;
       if (saved_errno == EINTR) {
         // Interrupted by signal, retry
-        GRPC_LOG_INFO("EventFdSemaphore::wait() interrupted by signal, retrying");
+        LOG(INFO) << "EventFdSemaphore::wait() interrupted by signal, retrying";
         wait(); // Recursive retry - in production, consider iterative approach
         return;
       }
-      GRPC_LOG_ERROR("EventFdSemaphore::wait() read failed: fd=%d, result=%zd, errno=%d (%s)", 
-                     fd_, result, saved_errno, strerror(saved_errno));
+      LOG(ERROR) << "EventFdSemaphore::wait() read failed: fd=" << fd_ 
+                 << ", result=" << result << ", errno=" << saved_errno 
+                 << " (" << strerror(saved_errno) << ")";
       // This is a fatal error - synchronization is broken
       // For now, log and return, but calling code should handle this scenario
     }

@@ -73,8 +73,50 @@ Shared Memory Segment:
 
 ## Configuration Options
 
-* `grpc.shmem.spin_iters`: Number of busy-wait iterations before sleeping (default: 0)
-* `grpc.shmem.dispatch_only`: Enable dispatch-only mode for event-driven workloads (default: true)
+The shmem transport supports the following channel arguments for performance tuning:
+
+### `grpc.shmem.spin_iters` (integer)
+Controls the number of busy-wait iterations before falling back to blocking synchronization.
+
+* **Type**: `int`
+* **Default**: `0` (no spinning, optimized for event-driven workloads)
+* **Valid Range**: `0` to `10000`
+* **Validation**: Values outside the valid range are clamped with warnings logged
+* **Purpose**: Higher values reduce latency for high-frequency messaging at the cost of CPU usage
+
+**Usage Guidelines:**
+- `0`: Best for event-driven applications, servers with many idle connections
+- `1-50`: Good balance for moderate load applications  
+- `100-1000`: Low-latency applications willing to trade CPU for reduced latency
+- `1000-10000`: High-frequency trading or other latency-critical applications
+
+**Example:**
+```cpp
+grpc::ChannelArguments args;
+args.SetInt("grpc.shmem.spin_iters", 100);  // Low-latency mode
+```
+
+### `grpc.shmem.dispatch_only` (boolean)  
+Controls whether the transport should only operate in dispatch-only mode.
+
+* **Type**: `bool`
+* **Default**: `true`
+* **Purpose**: When enabled, ensures compatibility with gRPC's event-driven architecture
+* **Note**: This is primarily an internal configuration option. Most users should leave this at the default value.
+
+**Example:**
+```cpp
+grpc::ChannelArguments args;
+args.SetInt("grpc.shmem.dispatch_only", 1);  // Enable (default)
+```
+
+### Error Handling and Validation
+
+All channel arguments are validated during transport initialization:
+- Invalid values generate warning logs with details about the validation failure
+- Out-of-range values are automatically clamped to safe bounds  
+- Default values are used when invalid arguments are provided
+- Validation errors do not prevent transport initialization
 
 ## Protocol Specification
 

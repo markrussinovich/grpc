@@ -19,9 +19,9 @@
 #include <sys/syscall.h>
 #endif
 #include <errno.h>
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "src/core/ext/transport/shmem/shmem_semaphore.h"
-#include "src/core/lib/gprpp/log.h"
 
 namespace grpc_shmem {
 
@@ -83,8 +83,9 @@ void ShmemSegment::Unmap() {
     int munmap_result = ::munmap(base_, size_);
     if (munmap_result != 0) {
       int saved_errno = errno;
-      GRPC_LOG_ERROR("ShmemSegment::Unmap() munmap failed: base=%p, size=%zu, errno=%d (%s)", 
-                     base_, size_, saved_errno, strerror(saved_errno));
+      LOG(ERROR) << "ShmemSegment::Unmap() munmap failed: base=" << base_ 
+                 << ", size=" << size_ << ", errno=" << saved_errno 
+                 << " (" << strerror(saved_errno) << ")";
       // Continue cleanup despite munmap failure
     }
     base_ = nullptr; size_ = 0;
@@ -93,8 +94,8 @@ void ShmemSegment::Unmap() {
     int close_result = ::close(fd_); 
     if (close_result != 0) {
       int saved_errno = errno;
-      GRPC_LOG_ERROR("ShmemSegment::Unmap() close failed: fd=%d, errno=%d (%s)", 
-                     fd_, saved_errno, strerror(saved_errno));
+      LOG(ERROR) << "ShmemSegment::Unmap() close failed: fd=" << fd_ 
+                 << ", errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
       // Continue cleanup despite close failure
     }
     fd_ = -1; 

@@ -45,6 +45,7 @@
 #include "src/core/lib/transport/connectivity_state.h"
 #include "src/core/lib/transport/transport.h"
 #include "src/core/channelz/channelz.h"
+#include "absl/log/log.h"
 
 namespace grpc_core {
 namespace {
@@ -145,7 +146,19 @@ class ShmemServerTransport final : public ServerTransport {
       state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(),
                               "init");
     }
-    spin_iters_ = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
+    // Validate and sanitize channel arguments
+    int raw_spin_iters = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
+    if (raw_spin_iters < 0) {
+      LOG(WARNING) << "Invalid " << kArgShmemSpinIters << " value " << raw_spin_iters 
+                   << ", using default " << kDefaultSpinIters;
+      spin_iters_ = kDefaultSpinIters;
+    } else if (raw_spin_iters > 10000) {
+      LOG(WARNING) << "Excessive " << kArgShmemSpinIters << " value " << raw_spin_iters 
+                   << " clamped to 10000";
+      spin_iters_ = 10000;
+    } else {
+      spin_iters_ = raw_spin_iters;
+    }
     dispatch_only_ = args.GetBool(kArgShmemDispatchOnly).value_or(true);
     
     // Initialize call arena allocator from resource quota (or create one).
@@ -169,7 +182,19 @@ class ShmemServerTransport final : public ServerTransport {
       state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(),
                               "init");
     }
-    spin_iters_ = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
+    // Validate and sanitize channel arguments
+    int raw_spin_iters = args.GetInt(kArgShmemSpinIters).value_or(kDefaultSpinIters);
+    if (raw_spin_iters < 0) {
+      LOG(WARNING) << "Invalid " << kArgShmemSpinIters << " value " << raw_spin_iters 
+                   << ", using default " << kDefaultSpinIters;
+      spin_iters_ = kDefaultSpinIters;
+    } else if (raw_spin_iters > 10000) {
+      LOG(WARNING) << "Excessive " << kArgShmemSpinIters << " value " << raw_spin_iters 
+                   << " clamped to 10000";
+      spin_iters_ = 10000;
+    } else {
+      spin_iters_ = raw_spin_iters;
+    }
     dispatch_only_ = args.GetBool(kArgShmemDispatchOnly).value_or(true);
     cb_ = segment_ ? segment_->control() : nullptr;
     
