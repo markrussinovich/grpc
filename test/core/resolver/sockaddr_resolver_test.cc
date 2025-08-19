@@ -119,10 +119,25 @@ TEST(SockaddrResolverTest, MainTest) {
       grpc_core::CoreConfiguration::Get()
           .resolver_registry()
           .LookupResolverFactory("unix-abstract");
-
+  
   test_succeeds(uds, "unix:///tmp/sockaddr_resolver_test");
   test_succeeds(uds_abstract, "unix-abstract:sockaddr_resolver_test");
 #endif  // GRPC_HAVE_UNIX_SOCKET
+
+  // Test shmem:// URI scheme
+  grpc_core::ResolverFactory* shmem = grpc_core::CoreConfiguration::Get()
+                                          .resolver_registry()
+                                          .LookupResolverFactory("shmem");
+  if (shmem != nullptr) {
+    test_succeeds(shmem, "shmem://test-server");
+    test_succeeds(shmem, "shmem://my-service-name");
+    
+    // Test invalid shmem URIs
+    test_fails(shmem, "shmem://");  // Empty server name
+    test_fails(shmem, "shmem:");    // No authority
+  } else {
+    VLOG(2) << "Shmem resolver not available, skipping tests";
+  }
 }
 
 int main(int argc, char** argv) {

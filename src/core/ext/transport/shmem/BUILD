@@ -15,8 +15,8 @@ grpc_cc_library(
         "shmem_queue.cc",
         "shmem_segment.cc",
         "shmem_channel.cc",
-        "shmem_legacy_transport.cc",
         "shmem_memory.cc",
+        "shmem_resolver.cc",
     ] + select({
         "//conditions:default": ["shmem_transport_stub.cc"],
         ":linux": [],
@@ -28,9 +28,9 @@ grpc_cc_library(
         "shmem_segment.h",
         "shmem_protocol.h",
         "shmem_memory.h",
-        "shmem_legacy_transport.h",
         "shmem_semaphore.h",
         "shmem_lockfree_queue.h",
+        "shmem_resolver.h",
     ],
     defines = select({
         "//conditions:default": [],
@@ -44,6 +44,7 @@ grpc_cc_library(
         "//src/core:channel_args",
         "//src/core:memory_quota",
         "//src/core:direct_channel",
+        "//src/core:grpc_transport_inproc",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

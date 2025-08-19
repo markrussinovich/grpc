@@ -7660,6 +7660,38 @@ grpc_cc_library(
 )
 
 grpc_cc_library(
+    name = "grpc_resolver_shmem",
+    srcs = [
+        "//src/core/ext/transport/shmem:shmem_resolver.cc",
+    ],
+    hdrs = [
+        "//src/core/ext/transport/shmem:shmem_resolver.h",
+    ],
+    alwayslink = True,
+    external_deps = [
+        "absl/log",
+        "absl/status:statusor",
+        "absl/strings",
+    ],
+    deps = [
+        "channel_args",
+        "//:config",
+        "//:endpoint_addresses",
+        "//:gpr",
+        "//:grpc_resolver",
+        "//:orphanable",
+        "//:uri",
+    ],
+)
+
+grpc_cc_library(
+    name = "grpc_transport_shmem",
+    deps = [
+        "//src/core/ext/transport/shmem:shmem_transport",
+    ],
+)
+
+grpc_cc_library(
     name = "grpc_resolver_xds_attributes",
     hdrs = [
         "resolver/xds/xds_resolver_attributes.h",

@@ -56,6 +56,7 @@ extern void FaultInjectionFilterRegister(CoreConfiguration::Builder* builder);
 extern void RegisterDnsResolver(CoreConfiguration::Builder* builder);
 extern void RegisterBackendMetricFilter(CoreConfiguration::Builder* builder);
 extern void RegisterSockaddrResolver(CoreConfiguration::Builder* builder);
+extern void RegisterShmemResolver(CoreConfiguration::Builder* builder);
 extern void RegisterFakeResolver(CoreConfiguration::Builder* builder);
 extern void RegisterPriorityLbPolicy(CoreConfiguration::Builder* builder);
 extern void RegisterOutlierDetectionLbPolicy(
@@ -125,6 +126,7 @@ void BuildCoreConfiguration(CoreConfiguration::Builder* builder) {
   FaultInjectionFilterRegister(builder);
   RegisterDnsResolver(builder);
   RegisterSockaddrResolver(builder);
+  RegisterShmemResolver(builder);
   RegisterFakeResolver(builder);
   RegisterHttpProxyMapper(builder);
   RegisterLoadBalancedCallDestination(builder);

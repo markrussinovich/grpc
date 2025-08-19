@@ -18,10 +18,12 @@
 #include <grpc/grpc.h>
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/lib/surface/channel.h"
-#include "src/core/server/server.h"
 #include "src/core/util/ref_counted_ptr.h"
 
 namespace grpc_core {
+
+// Forward declaration
+class Server;
 
 // Create a legacy (filter-stack) shmem channel for hosting legacy filters.
 // This is used as a fallback when v3 channel creation fails due to legacy-only filters.
