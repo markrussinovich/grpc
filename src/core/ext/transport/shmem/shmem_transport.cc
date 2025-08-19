@@ -861,9 +861,13 @@ class ShmemServerTransport final : public ServerTransport {
       }
 
       if (has_command) {
+        printf("DEBUG: Processing command in switch statement\n");
+        fflush(stdout);
         auto& st = streams[cmd.stream_id];
         switch (cmd.type) {
           case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
+            printf("DEBUG: Handling C2S_INITIAL_METADATA for stream %u\n", cmd.stream_id);
+            fflush(stdout);
             if (!st.sent_initial) {
               // Deserialize client initial metadata
               std::vector<grpc_shmem::KVPair> kvs_in;
@@ -875,10 +879,20 @@ class ShmemServerTransport final : public ServerTransport {
               for (const auto& kv : kvs_in) {
                 if (kv.key == ":path") st.path = kv.value;
               }
-              // Default to **dispatched** (in-proc) for all real RPCs.
-              // Only use the synthetic ring path for the special "/cancel" hook.
+              printf("DEBUG: Extracted path: '%s'\n", st.path.c_str());
+              fflush(stdout);
+              // CROSS-PROCESS FIX: Use synthetic path for cross-process communication
+              // In cross-process mode, we need immediate responses like synthetic path
+              // dispatch_only_ = false indicates ring mode (cross-process)
               const bool is_cancel_path = (st.path == "/cancel");
-              if (!is_cancel_path) {
+              const bool is_cross_process = !dispatch_only_;
+              const bool use_synthetic = is_cancel_path || is_cross_process;
+              printf("DEBUG: is_cancel_path = %s, is_cross_process = %s, using %s path\n", 
+                     is_cancel_path ? "true" : "false",
+                     is_cross_process ? "true" : "false",
+                     use_synthetic ? "synthetic" : "dispatched");
+              fflush(stdout);
+              if (!use_synthetic) {
                 st.synthetic = false;
                 // Stage 1: Buffer initial metadata for dispatched unary calls
                 st.dispatched_unary =
@@ -890,9 +904,15 @@ class ShmemServerTransport final : public ServerTransport {
                 // *** ForwardCall will deliver messages and finish-sends; we do
                 // NOT need to wait for a message or synthesize client trailing
                 // here.
+                printf("DEBUG: About to call announce_dispatched_call for stream %u\n", cmd.stream_id);
+                fflush(stdout);
                 announce_dispatched_call(cmd.stream_id, st);
+                printf("DEBUG: announce_dispatched_call completed for stream %u\n", cmd.stream_id);
+                fflush(stdout);
               } else {
                 // Synthetic path (retain Phase 1 behavior)
+                printf("DEBUG: Taking synthetic path - sending immediate S2C_INITIAL_METADATA\n");
+                fflush(stdout);
                 std::vector<grpc_shmem::KVPair> kvs = {
                     {"content-type", "application/grpc"}, {"x-shmem", "1"}};
                 auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
@@ -907,8 +927,12 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 out.grpc_status_code = 0;
+                printf("DEBUG: About to push S2C_INITIAL_METADATA response\n");
+                fflush(stdout);
                 grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
                                         grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
+                printf("DEBUG: S2C_INITIAL_METADATA response pushed successfully\n");
+                fflush(stdout);
               }
               st.sent_initial = true;
             }
@@ -1243,23 +1267,58 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
 }
 
 void ShmemClientTransport::EnsureReaderStarted() {
-  if (cb_ == nullptr) return;
-  if (server_ != nullptr && server_->dispatch_only())
+  printf("DEBUG: Client EnsureReaderStarted called\n");
+  fflush(stdout);
+  if (cb_ == nullptr) {
+    printf("DEBUG: Client cb_ is null, returning\n");
+    fflush(stdout);
+    return;
+  }
+  printf("DEBUG: Client server_=%p, dispatch_only=%s\n", 
+         server_.get(), (server_ != nullptr ? (server_->dispatch_only() ? "true" : "false") : "N/A"));
+  fflush(stdout);
+  if (server_ != nullptr && server_->dispatch_only()) {
+    printf("DEBUG: Client skipping reader - in-proc dispatch mode\n");
+    fflush(stdout);
     return;  // no S2C reader in in-proc mode
+  }
+  printf("DEBUG: Client starting reader thread...\n");
+  fflush(stdout);
   if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
     stop_.store(false, std::memory_order_relaxed);
     reader_ = std::thread([this] {
+      printf("DEBUG: Client reader thread started\n");
+      fflush(stdout);
       ExecCtx exec_ctx;
       // Initialize client config lazily from server's config
       if (server_ != nullptr) spin_iters_ = server_->spin_iters();
+      int client_loop_count = 0;
+      printf("DEBUG: Client reader entering main loop\n");
+      fflush(stdout);
       for (;;) {
         if (stop_.load(std::memory_order_relaxed)) break;  // REVERTED: Remove cleanup_initiated check
+        client_loop_count++;
+        
+        // Log first few iterations
+        if (client_loop_count <= 5 || (client_loop_count % 100 == 0)) {
+          printf("DEBUG: Client reader checking S2C queue (iteration %d)\n", client_loop_count);
+          fflush(stdout);
+        }
+        
         grpc_shmem::Command cmd;
         if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_,
                                           grpc_shmem::Direction::kS2C,
                                           spin_iters_, &cmd, sem_adapter_.get())) {
+          if (client_loop_count <= 5) {
+            printf("DEBUG: Client reader - no S2C command available (iteration %d)\n", client_loop_count);
+            fflush(stdout);
+          }
           continue;
         }
+        
+        printf("DEBUG: Client reader GOT S2C RESPONSE! Type: %d, Stream ID: %u (iteration %d)\n", 
+               static_cast<int>(cmd.type), cmd.stream_id, client_loop_count);
+        fflush(stdout);
         std::unique_ptr<CallHandler> handler;
         {
           MutexLock lock(&mu_);
