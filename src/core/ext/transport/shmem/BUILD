@@ -16,6 +16,7 @@ grpc_cc_library(
         "shmem_segment.cc",
         "shmem_channel.cc",
         "shmem_legacy_transport.cc",
+        "shmem_memory.cc",
     ] + select({
         "//conditions:default": ["shmem_transport_stub.cc"],
         ":linux": [],
@@ -31,14 +32,18 @@ grpc_cc_library(
         "shmem_semaphore.h",
         "shmem_lockfree_queue.h",
     ],
-    copts = select({
+    defines = select({
         "//conditions:default": [],
-        ":linux": ["-DGRPC_SHMEM_LINUX"],
+        ":linux": ["GRPC_SHMEM_LINUX"],
     }),
     deps = [
         "//:gpr",
-        "//src/core:grpc_base",
-        "//src/core:grpc_transport",
+        "//:grpc_base",
+        "//src/core:slice",
+        "//src/core:context",
+        "//src/core:channel_args",
+        "//src/core:memory_quota",
+        "//src/core:direct_channel",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
