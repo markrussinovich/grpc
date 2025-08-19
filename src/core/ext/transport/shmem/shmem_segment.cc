@@ -18,8 +18,10 @@
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
+#include <errno.h>
 #include "absl/status/status.h"
 #include "src/core/ext/transport/shmem/shmem_semaphore.h"
+#include "src/core/lib/gprpp/log.h"
 
 namespace grpc_shmem {
 
@@ -78,10 +80,25 @@ void* ShmemSegment::Map(int fd, size_t size) {
 
 void ShmemSegment::Unmap() {
   if (base_ != nullptr) {
-    (void)::munmap(base_, size_);
+    int munmap_result = ::munmap(base_, size_);
+    if (munmap_result != 0) {
+      int saved_errno = errno;
+      GRPC_LOG_ERROR("ShmemSegment::Unmap() munmap failed: base=%p, size=%zu, errno=%d (%s)", 
+                     base_, size_, saved_errno, strerror(saved_errno));
+      // Continue cleanup despite munmap failure
+    }
     base_ = nullptr; size_ = 0;
   }
-  if (fd_ != -1) { ::close(fd_); fd_ = -1; }
+  if (fd_ != -1) { 
+    int close_result = ::close(fd_); 
+    if (close_result != 0) {
+      int saved_errno = errno;
+      GRPC_LOG_ERROR("ShmemSegment::Unmap() close failed: fd=%d, errno=%d (%s)", 
+                     fd_, saved_errno, strerror(saved_errno));
+      // Continue cleanup despite close failure
+    }
+    fd_ = -1; 
+  }
 }
 
 // -------- public API --------
