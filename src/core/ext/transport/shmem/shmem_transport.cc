@@ -159,10 +159,8 @@ class ShmemClientTransport final : public ClientTransport {
         try {
           // Wake any waiting reader so it can observe stop_ and exit
         if (cb_) {
-          // Wake both directions using cross-process semaphores
-          if (cb_->c2s_sem_name[0] != '\0') {
-            c2s_cross_sem_.post();
-          }
+          // Client only needs to wake its own S2C reader thread
+          // Do NOT wake C2S as that disturbs the server
           if (cb_->s2c_sem_name[0] != '\0') {
             s2c_cross_sem_.post();
           }
@@ -894,8 +892,7 @@ class ShmemServerTransport final : public ServerTransport {
               printf("DEBUG: Extracted path: '%s'\n", st.path.c_str());
               fflush(stdout);
               // CROSS-PROCESS FIX: Use synthetic path for cross-process communication
-              // In cross-process mode, we need immediate responses like synthetic path
-              // dispatch_only_ = false indicates ring mode (cross-process)
+              // Check if this is a cancel path or if we should use synthetic responses
               const bool is_cancel_path = (st.path == "/cancel");
               const bool is_cross_process = !dispatch_only_;
               const bool use_synthetic = is_cancel_path || is_cross_process;  // Use synthetic for cross-process demo
@@ -921,6 +918,7 @@ class ShmemServerTransport final : public ServerTransport {
                 announce_dispatched_call(cmd.stream_id, st);
                 printf("DEBUG: announce_dispatched_call completed for stream %u\n", cmd.stream_id);
                 fflush(stdout);
+                st.sent_initial = true;  // Mark initial metadata as sent for dispatched calls
               } else {
                 // Synthetic path - send complete unary RPC response sequence
                 printf("DEBUG: Taking synthetic path - sending complete unary response\n");
@@ -947,7 +945,14 @@ class ShmemServerTransport final : public ServerTransport {
                                         grpc_shmem::Direction::kS2C, initial_out, sem_adapter_.get());
                 
                 // 2. Send S2C_MESSAGE (echo response)
-                std::string response_msg = "Hello shmem_user";  // Echo response for Greeter service
+                // Create valid protobuf wire format for HelloReply message
+                // HelloReply has field 1 (message) as string "Hello shmem_user"
+                // Wire format: field_tag(1 << 3 | 2) + length + string_data
+                std::string msg_content = "Hello shmem_user";
+                std::string response_msg;
+                response_msg.push_back(0x0A);  // field 1, wire type 2 (length-delimited)
+                response_msg.push_back(static_cast<char>(msg_content.size()));  // length
+                response_msg.append(msg_content);  // string data
                 uint64_t msg_off = 0;
                 if (grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
                                                  response_msg.size(), &msg_off)) {
@@ -986,8 +991,12 @@ class ShmemServerTransport final : public ServerTransport {
                                         grpc_shmem::Direction::kS2C, trailing_out, sem_adapter_.get());
                 printf("DEBUG: Complete unary RPC response sent!\n");
                 fflush(stdout);
+                
+                // Clean up stream state after completing synthetic RPC
+                printf("DEBUG: Cleaning up stream %u state after RPC completion\n", cmd.stream_id);
+                fflush(stdout);
+                streams.erase(cmd.stream_id);
               }
-              st.sent_initial = true;
             }
             // Release consumed bytes from c2s
             cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size,
