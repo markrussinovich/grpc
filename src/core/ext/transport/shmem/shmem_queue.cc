@@ -165,15 +165,12 @@ static inline void Post(ControlBlock* cb, Direction dir, grpc_shmem::TransportSe
 
 static inline void Wait(ControlBlock* cb, Direction dir, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
   const char* dir_name = (dir == Direction::kC2S) ? "C2S" : "S2C";
-  printf("DEBUG: Wait %s - sem_adapter: %p\n", dir_name, sem_adapter);
-  fflush(stdout);
+  VLOG(3) << "Wait " << dir_name << " - sem_adapter: " << sem_adapter;
   if (sem_adapter) {
-    printf("DEBUG: Wait %s - calling sem_adapter->Wait\n", dir_name);
-    fflush(stdout);
+    VLOG(3) << "Wait " << dir_name << " - calling sem_adapter->Wait";
     // Use cross-process semaphores via semaphore adapter
     sem_adapter->Wait(dir == Direction::kC2S);
-    printf("DEBUG: Wait %s - sem_adapter->Wait returned (woke up!)\n", dir_name);
-    fflush(stdout);
+    VLOG(3) << "Wait " << dir_name << " - sem_adapter->Wait returned (woke up!)";
   } else {
     // Fallback: Skip waiting if no semaphore adapter available
     printf("DEBUG: Wait %s - no semaphore adapter available!\n", dir_name);
@@ -214,8 +211,7 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   pop_call_count++;
   
   if (pop_call_count <= 10 || pop_call_count % 50 == 0) {
-    printf("DEBUG: PopCommandHybrid %s - call #%d\n", dir_name, pop_call_count);
-    fflush(stdout);
+    VLOG(3) << "PopCommandHybrid " << dir_name << " - call #" << pop_call_count;
   }
   
   Command tmp;
@@ -226,8 +222,7 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
     if (q->command_q.pop(tmp)) {
       *out = tmp;
       if (pop_call_count <= 10) {
-        printf("DEBUG: PopCommandHybrid %s - found command in spin loop\n", dir_name);
-        fflush(stdout);
+        VLOG(3) << "PopCommandHybrid " << dir_name << " - found command in spin loop";
       }
       return true;
     }
@@ -241,8 +236,7 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   // lost wakeups
   std::atomic<uint32_t>* waiters = (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
   if (pop_call_count <= 10) {
-    printf("DEBUG: PopCommandHybrid %s - setting waiter flag\n", dir_name);
-    fflush(stdout);
+    VLOG(3) << "PopCommandHybrid " << dir_name << " - setting waiter flag";
   }
   waiters->store(1, std::memory_order_release);
   

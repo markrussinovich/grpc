@@ -133,7 +133,7 @@ void ShmemSegment::InitQueues(void* base, size_t size, ControlBlock* cb,
     LOG(INFO) << "Phase 2B: Set semaphore names: c2s='" << cb->c2s_sem_name 
               << "', s2c='" << cb->s2c_sem_name << "'";
     
-    // Phase 2C: Create the c2s cross-process semaphore (s2c stays as EventFdSemaphore)
+    // Phase 2C: Create both c2s and s2c cross-process semaphores
     CrossProcessSemaphore::UnlinkNamed(server_name + "_c2s");
     CrossProcessSemaphore temp_c2s;
     auto c2s_status = temp_c2s.CreateNamed(server_name + "_c2s", 0);
@@ -141,6 +141,15 @@ void ShmemSegment::InitQueues(void* base, size_t size, ControlBlock* cb,
       LOG(WARNING) << "Phase 2C: Failed to create c2s cross-process semaphore: " << c2s_status;
     } else {
       LOG(INFO) << "Phase 2C: Created c2s cross-process semaphore successfully";
+    }
+    
+    CrossProcessSemaphore::UnlinkNamed(server_name + "_s2c");
+    CrossProcessSemaphore temp_s2c;
+    auto s2c_status = temp_s2c.CreateNamed(server_name + "_s2c", 0);
+    if (!s2c_status.ok()) {
+      LOG(WARNING) << "Phase 2C: Failed to create s2c cross-process semaphore: " << s2c_status;
+    } else {
+      LOG(INFO) << "Phase 2C: Created s2c cross-process semaphore successfully";
     }
   } else {
     // Clear semaphore names for in-process mode

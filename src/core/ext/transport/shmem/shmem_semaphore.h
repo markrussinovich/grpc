@@ -231,22 +231,15 @@ class CrossProcessSemaphore {
   // Wake one waiter
   inline void post() {
     if (posix_sem_ == SEM_FAILED) {
-      printf("DEBUG: CrossProcessSemaphore::post() called on uninitialized semaphore\n");
-      fflush(stdout);
       LOG(ERROR) << "CrossProcessSemaphore::post() called on uninitialized semaphore";
       return;
     }
-    printf("DEBUG: CrossProcessSemaphore::post() calling sem_post on '%s'\n", sem_name_.c_str());
-    fflush(stdout);
+    VLOG(3) << "CrossProcessSemaphore::post() calling sem_post on '" << sem_name_ << "'";
     int result = ::sem_post(posix_sem_);
     if (result == 0) {
-      printf("DEBUG: CrossProcessSemaphore::post() sem_post SUCCESS on '%s'\n", sem_name_.c_str());
-      fflush(stdout);
+      VLOG(3) << "CrossProcessSemaphore::post() sem_post SUCCESS on '" << sem_name_ << "'";
     } else {
       int saved_errno = errno;
-      printf("DEBUG: CrossProcessSemaphore::post() sem_post FAILED on '%s': errno=%d (%s)\n", 
-             sem_name_.c_str(), saved_errno, strerror(saved_errno));
-      fflush(stdout);
       LOG(ERROR) << "CrossProcessSemaphore::post() sem_post failed: name=" << sem_name_
                  << ", errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
     }
@@ -255,33 +248,25 @@ class CrossProcessSemaphore {
   // Block until signaled (proper event-driven approach)
   inline void wait() {
     if (posix_sem_ == SEM_FAILED) {
-      printf("DEBUG: CrossProcessSemaphore::wait() called on uninitialized semaphore\n");
-      fflush(stdout);
       LOG(ERROR) << "CrossProcessSemaphore::wait() called on uninitialized semaphore";
       return;
     }
     
-    printf("DEBUG: CrossProcessSemaphore::wait() calling sem_wait on '%s'\n", sem_name_.c_str());
-    fflush(stdout);
+    VLOG(3) << "CrossProcessSemaphore::wait() calling sem_wait on '" << sem_name_ << "'";
     
     while (true) {
       int result = ::sem_wait(posix_sem_);
       if (result == 0) {
-        printf("DEBUG: CrossProcessSemaphore::wait() sem_wait SUCCESS on '%s'\n", sem_name_.c_str());
-        fflush(stdout);
+        VLOG(3) << "CrossProcessSemaphore::wait() sem_wait SUCCESS on '" << sem_name_ << "'";
         break;  // Success
       }
       
       int saved_errno = errno;
       if (saved_errno == EINTR) {
-        printf("DEBUG: CrossProcessSemaphore::wait() interrupted by signal, retrying on '%s'\n", sem_name_.c_str());
-        fflush(stdout);
+        VLOG(3) << "CrossProcessSemaphore::wait() interrupted by signal, retrying on '" << sem_name_ << "'";
         // Interrupted by signal, retry
         continue;
       }
-      printf("DEBUG: CrossProcessSemaphore::wait() sem_wait FAILED on '%s': errno=%d (%s)\n", 
-             sem_name_.c_str(), saved_errno, strerror(saved_errno));
-      fflush(stdout);
       LOG(ERROR) << "CrossProcessSemaphore::wait() sem_wait failed: name=" << sem_name_
                  << ", errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
       break;
