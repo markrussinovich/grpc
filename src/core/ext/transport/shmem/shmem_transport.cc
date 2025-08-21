@@ -804,7 +804,21 @@ class ShmemServerTransport final : public ServerTransport {
         d = dest_;
       }
       if (d != nullptr) {
-        d->StartCall(std::move(call.handler));
+        printf("DEBUG: Calling d->StartCall for stream %u with async integration\n", stream_id);
+        fflush(stdout);
+        
+        // Async delivery to avoid deadlock
+        auto call_ref = std::move(call.handler);
+        call.initiator.SpawnGuarded(
+            "shmem-server-call", [d, call_ref = std::move(call_ref)]() mutable -> absl::Status {
+              d->StartCall(std::move(call_ref));
+              return absl::OkStatus();
+            });
+        printf("DEBUG: Async StartCall scheduled for stream %u\n", stream_id);
+        fflush(stdout);
+      } else {
+        printf("DEBUG: dest_ is null for stream %u - no call destination available\n", stream_id);
+        fflush(stdout);
       }
 
       // SIMPLIFIED: ForwardCall will handle all S2C communication automatically
@@ -867,15 +881,12 @@ class ShmemServerTransport final : public ServerTransport {
                 if (kv.key == ":path") st.path = kv.value;
               }
               VLOG(2) << "Extracted path: '" << st.path << "'";
-              // CROSS-PROCESS FIX: Use synthetic path for cross-process communication
-              // Check if this is a cancel path or if we should use synthetic responses
+              // Cross-process-only shmem transport: use dispatched path for all operations
               const bool is_cancel_path = (st.path == "/cancel");
-              const bool is_cross_process = !dispatch_only_;
-              const bool use_synthetic = is_cancel_path || is_cross_process;  // Use synthetic for cross-process demo
-              printf("DEBUG: is_cancel_path = %s, is_cross_process = %s, using %s path\n", 
-                     is_cancel_path ? "true" : "false",
-                     is_cross_process ? "true" : "false",
-                     use_synthetic ? "synthetic" : "dispatched");
+              // Always use dispatched path for cross-process communication
+              const bool use_synthetic = false;
+              printf("DEBUG: path = %s, is_cancel_path = %s, use_synthetic = %s\n", 
+                     st.path.c_str(), is_cancel_path ? "true" : "false", use_synthetic ? "true" : "false");
               fflush(stdout);
               if (!use_synthetic) {
                 st.synthetic = false;
@@ -894,11 +905,101 @@ class ShmemServerTransport final : public ServerTransport {
                 announce_dispatched_call(cmd.stream_id, st);
                 printf("DEBUG: announce_dispatched_call completed for stream %u\n", cmd.stream_id);
                 fflush(stdout);
+                
+                // For streaming, we should NOT break here - continue processing more commands
+                printf("DEBUG: Streaming path activated for stream %u, continuing to process commands\n", cmd.stream_id);
+                fflush(stdout);
                 st.sent_initial = true;  // Mark initial metadata as sent for dispatched calls
               } else {
-                // Synthetic path - send complete unary RPC response sequence
-                printf("DEBUG: Taking synthetic path - sending complete unary response\n");
+                // Synthetic path with async integration - deliver request to server
+                printf("DEBUG: Taking synthetic path with async integration - delivering request to server\n");
                 fflush(stdout);
+                
+                // Use the server transport's call destination to deliver the request
+                printf("DEBUG: Getting call destination\n");
+                fflush(stdout);
+                RefCountedPtr<UnstartedCallDestination> dest;
+                {
+                  printf("DEBUG: Acquiring dest_mu_ lock\n");
+                  fflush(stdout);
+                  MutexLock lock(&dest_mu_);
+                  printf("DEBUG: Lock acquired, getting dest_\n");
+                  fflush(stdout);
+                  dest = dest_;
+                  printf("DEBUG: dest_ retrieved, dest is %s\n", dest != nullptr ? "not null" : "null");
+                  fflush(stdout);
+                }
+                
+                if (dest != nullptr) {
+                  printf("DEBUG: Delivering request to gRPC server through call destination\n");
+                  fflush(stdout);
+                  
+                  // Build ClientMetadata from the incoming shmem request  
+                  printf("DEBUG: Creating arena and metadata\n");
+                  fflush(stdout);
+                  auto arena = call_arena_allocator_->MakeArena();
+                  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+                  arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+                  auto md = arena->MakePooledForOverwrite<ClientMetadata>();
+                  printf("DEBUG: Arena and metadata created successfully\n");
+                  fflush(stdout);
+                  
+                  // Set metadata from the shmem request
+                  printf("DEBUG: Setting metadata from shmem request\n");
+                  fflush(stdout);
+                  for (const auto& kv : kvs_in) {
+                    if (kv.key == ":path") {
+                      md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
+                    } else if (kv.key == ":method") {
+                      md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
+                    } else if (kv.key == ":scheme") {
+                      if (kv.value == "https")
+                        md->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttps);
+                      else
+                        md->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttp);
+                    } else if (kv.key == "te") {
+                      md->Set(TeMetadata(), TeMetadata::kTrailers);
+                    } else if (kv.key == "content-type") {
+                      md->Set(ContentTypeMetadata(),
+                              ContentTypeMetadata::kApplicationGrpc);
+                    } else if (kv.key == "grpc-accept-encoding") {
+                      md->Set(GrpcAcceptEncodingMetadata(),
+                              CompressionAlgorithmSet{GRPC_COMPRESS_NONE});
+                    }
+                  }
+                  printf("DEBUG: Metadata set successfully, creating call handler\n");
+                  fflush(stdout);
+                  
+                  // Use MakeCallPair and async spawn like chaotic_good transport
+                  printf("DEBUG: Creating call pair for cross-process delivery\n");
+                  fflush(stdout);
+                  auto call = MakeCallPair(std::move(md), arena);
+                  printf("DEBUG: Call pair created successfully\n");
+                  fflush(stdout);
+                  
+                  // Spawn async delivery to avoid deadlock (like chaotic_good does)
+                  printf("DEBUG: Spawning async server call delivery\n");
+                  fflush(stdout);
+                  call.initiator.SpawnGuarded(
+                      "shmem-server-call", [dest, call_handler = std::move(call.handler)]() mutable -> absl::Status {
+                        printf("DEBUG: Async delivery - calling dest->StartCall()\n");
+                        fflush(stdout);
+                        dest->StartCall(std::move(call_handler));
+                        printf("DEBUG: Async delivery - dest->StartCall() completed\n");
+                        fflush(stdout);
+                        return absl::OkStatus();
+                      });
+                  printf("DEBUG: Async spawn completed, call delivered\n");
+                  fflush(stdout);
+                  
+                  // Skip synthetic response since we delivered to server
+                  printf("DEBUG: Request delivered to server, skipping synthetic response\n");
+                  continue;
+                } else {
+                  printf("DEBUG: No call destination available, using synthetic response\n");
+                }
+                
+                printf("DEBUG: Sending synthetic response (temporary)\n");
                 
                 // 1. Send S2C_INITIAL_METADATA
                 std::vector<grpc_shmem::KVPair> initial_kvs = {
@@ -1480,11 +1581,9 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                }
 
                const bool is_cancel_path = (path == "/cancel");
-               const bool is_cross_process = (server_ == nullptr);
 
-               // Default to **dispatched** (in-proc) for all real RPCs.
-               // Use synthetic ring path for cross-process mode or "/cancel" hook.
-               if (!is_cancel_path && !is_cross_process) {
+               // Cross-process-only shmem transport: use synthetic path with async integration
+               if (false) {  // Never use dispatched path in cross-process mode
                  // *** In-proc bootstrap (dispatched) ***
                  auto initiator =
                      server_->AnnounceAndGetInitiator(stream_id, std::move(md));

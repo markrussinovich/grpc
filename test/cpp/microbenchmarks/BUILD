@@ -444,3 +444,13 @@ grpc_cc_benchmark(
         "//test/core/test_util:grpc_test_util",
     ],
 )
+cc_binary(
+    name = "test_shmem_async",
+    srcs = ["test_shmem_async.cc"],
+    deps = [
+        "//src/proto/grpc/testing:echo_cc_grpc",
+        "//:grpc++",
+        "//:grpc",
+        "//:grpc_transport_shmem",
+    ],
+)
