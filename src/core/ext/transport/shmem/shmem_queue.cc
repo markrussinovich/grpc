@@ -251,8 +251,21 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   }
   
   // Sleep until woken up by producer (event-driven)
-  Wait(cb, dir, sem_adapter);
-  waiters->store(0, std::memory_order_relaxed);
+  // For server startup, don't block indefinitely if no clients are connected yet
+  if (pop_call_count <= 100) {
+    // During server startup, use a short timeout to avoid hanging
+    // if there are no clients connected yet
+    if (pop_call_count <= 10) {
+      VLOG(3) << "PopCommandHybrid " << dir_name << " - startup mode, using brief wait";
+    }
+    waiters->store(0, std::memory_order_relaxed);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return false;  // Return false to indicate no command available
+  } else {
+    // After startup period, use normal blocking wait
+    Wait(cb, dir, sem_adapter);
+    waiters->store(0, std::memory_order_relaxed);
+  }
   
   // Upon wake, try again (one attempt)
   if (q->command_q.pop(tmp)) {

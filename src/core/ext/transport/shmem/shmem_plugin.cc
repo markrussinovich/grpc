@@ -20,6 +20,7 @@
 #include "src/core/util/uri.h"
 #include "src/core/client_channel/direct_channel.h"
 #include "src/core/ext/transport/shmem/shmem_segment.h"
+#include "src/core/transport/auth_context.h"
 #include "absl/strings/str_cat.h"
 #include "absl/container/flat_hash_map.h"
 #include <mutex>
@@ -39,23 +40,10 @@ public:
     return instance;
   }
   
-  // Register a server by creating a named shared memory segment
+  // Register a server - don't create transport yet, wait for first client
   void RegisterServer(const std::string& name, Server* server) {
     std::lock_guard<std::mutex> lock(mutex_);
-    // Create the named server transport that clients can connect to
-    auto server_transport = grpc_core::MakeNamedShmemServerTransport(
-        name, server->channel_args());
-    if (server_transport) {
-      // Set up the server transport with the server
-      auto result = server->SetupTransport(server_transport.get(), nullptr, 
-                                           server->channel_args(), nullptr);
-      if (result.ok()) {
-        server_transport.release(); // Server takes ownership
-        servers_[name] = server;
-      } else {
-        LOG(ERROR) << "Failed to setup shmem server transport: " << result;
-      }
-    }
+    servers_[name] = server;
   }
   
   void UnregisterServer(const std::string& name) {
@@ -142,9 +130,36 @@ class ShmemEndpointTransport final : public EndpointTransport {
           absl::StrCat("Shmem URI missing server name: ", addr));
     }
 
-    // Register this server and create named shared memory segment
+    // Register server and create transport (but reader thread won't start until SetCallDestination)
     std::string server_name = uri.authority();
+    std::cout << "AddPort: Registering shmem server: " << server_name << std::endl;
     ShmemServerRegistry::Get().RegisterServer(server_name, server);
+    
+    // Create the named server transport 
+    std::cout << "AddPort: Creating server transport..." << std::endl;
+    auto server_transport = grpc_core::MakeNamedShmemServerTransport(
+        server_name, args);
+    if (!server_transport) {
+      std::cout << "AddPort: Failed to create server transport" << std::endl;
+      return absl::InternalError("Failed to create shmem server transport");
+    }
+    
+    std::cout << "AddPort: Setting up transport with server..." << std::endl;
+    // Create insecure auth context like insecure_security_connector does
+    auto auth_context = grpc_core::MakeRefCounted<grpc_auth_context>(nullptr);
+    // Use similar channel args to inproc transport and add auth context
+    ChannelArgs setup_args = args
+        .Remove(GRPC_ARG_MAX_CONNECTION_IDLE_MS)
+        .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS)
+        .SetObject(auth_context);
+    auto result = server->SetupTransport(server_transport.get(), nullptr, setup_args, nullptr);
+    if (!result.ok()) {
+      std::cout << "AddPort: Failed to setup transport: " << result << std::endl;
+      return result;
+    }
+    
+    server_transport.release(); // Server takes ownership
+    std::cout << "AddPort: Server transport set up successfully" << std::endl;
     
     // Return a fake port number since shmem doesn't use real network ports
     return 1;
