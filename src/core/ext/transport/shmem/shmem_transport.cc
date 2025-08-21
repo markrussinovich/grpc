@@ -881,30 +881,15 @@ class ShmemServerTransport final : public ServerTransport {
                 if (kv.key == ":path") st.path = kv.value;
               }
               VLOG(2) << "Extracted path: '" << st.path << "'";
-              // Cross-process-only shmem transport: use dispatched path for all operations
-              const bool is_cancel_path = (st.path == "/cancel");
-              // Always use dispatched path for cross-process communication
-              const bool use_synthetic = false;
-              printf("DEBUG: path = %s, is_cancel_path = %s, use_synthetic = %s\n", 
-                     st.path.c_str(), is_cancel_path ? "true" : "false", use_synthetic ? "true" : "false");
+              // SIMPLIFIED: Just handle I/O transfer between client and server
+              // Remove all custom request processing - let gRPC server infrastructure handle it
+              printf("DEBUG: ServerLoop received C2S_INITIAL_METADATA for stream %u, path = %s\n", 
+                     cmd.stream_id, st.path.c_str());
               fflush(stdout);
-              if (!use_synthetic) {
-                st.synthetic = false;
-                // Stage 1: Buffer initial metadata for dispatched unary calls
-                st.dispatched_unary =
-                    std::make_unique<StreamState::DispatchedUnaryState>();
-                st.dispatched_unary->initial_kvs = kvs_in;
-                st.dispatched_unary->have_initial = true;
-
-                // *** FIX PART 1: announce call immediately on initial metadata
-                // *** ForwardCall will deliver messages and finish-sends; we do
-                // NOT need to wait for a message or synthesize client trailing
-                // here.
-                printf("DEBUG: About to call announce_dispatched_call for stream %u\n", cmd.stream_id);
-                fflush(stdout);
-                announce_dispatched_call(cmd.stream_id, st);
-                printf("DEBUG: announce_dispatched_call completed for stream %u\n", cmd.stream_id);
-                fflush(stdout);
+              
+              // TODO: Replace with minimal I/O forwarding logic
+              // For now, just break to see if we can avoid the hang
+              break;
                 
                 // For streaming, we should NOT break here - continue processing more commands
                 printf("DEBUG: Streaming path activated for stream %u, continuing to process commands\n", cmd.stream_id);
