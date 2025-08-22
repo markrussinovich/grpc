@@ -39,6 +39,7 @@
 #include "src/core/lib/iomgr/error.h"
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/resource_quota/resource_quota.h"
+#include "src/core/lib/surface/channel.h"
 #include "src/core/lib/surface/channel_create.h"
 #include "src/core/lib/surface/lame_client.h"
 #include "src/core/lib/transport/transport.h"
@@ -94,8 +95,8 @@ static RefCountedPtr<Channel> MakeLameChannelFromStatus(const absl::Status& st,
 // Exact analog of MakeInprocChannel(...) but for shmem. [1]
 RefCountedPtr<Channel> MakeShmemChannel(
     Server* server, ChannelArgs client_channel_args) {
-  // 1) Build the transport pair using both server and client ChannelArgs.
-  auto transports = MakeShmemTransportPair(server->channel_args(), client_channel_args);
+  // 1) Build the transport pair using the server's ChannelArgs.
+  auto transports = MakeShmemTransportPair(server->channel_args());
   auto client_transport = std::move(transports.first);
   auto server_transport = std::move(transports.second);
 

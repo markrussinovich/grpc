@@ -30,7 +30,7 @@ class ShmemTraits {
     auto channel_args = CoreConfiguration::Get()
                             .channel_args_preconditioning()
                             .PreconditionChannelArgs(nullptr);
-    auto t = MakeShmemTransportPair(channel_args, channel_args);
+    auto t = MakeShmemTransportPair(channel_args);
     return {OrphanablePtr<ClientTransport>(
                 DownCast<ClientTransport*>(t.first.release())),
             OrphanablePtr<ServerTransport>(

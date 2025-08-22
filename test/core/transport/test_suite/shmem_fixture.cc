@@ -22,9 +22,6 @@ TRANSPORT_FIXTURE(Shmem) {
   auto transports =
       MakeShmemTransportPair(CoreConfiguration::Get()
                                  .channel_args_preconditioning()
-                                 .PreconditionChannelArgs(nullptr),
-                             CoreConfiguration::Get()
-                                 .channel_args_preconditioning()
                                  .PreconditionChannelArgs(nullptr));
   return {std::move(transports.first), std::move(transports.second)};
 }

@@ -28,105 +28,52 @@ namespace grpc_shmem {
 struct Command;
 struct DataRingBuffer;
 struct ShmemQueues;
-class CrossProcessSemaphore;
-
-// Shutdown diagnostics helper
-class ShmemShutdownTracer {
- private:
-  static std::atomic<int> trace_id_;
-  int my_trace_id_;
-  std::string component_;
-  
- public:
-  ShmemShutdownTracer(const std::string& component) 
-      : my_trace_id_(trace_id_.fetch_add(1)), component_(component) {
-    LOG(INFO) << "[TRACE-" << my_trace_id_ << "] Starting shutdown: " << component_;
-  }
-  
-  ~ShmemShutdownTracer() {
-    LOG(INFO) << "[TRACE-" << my_trace_id_ << "] Completed shutdown: " << component_;
-  }
-  
-  void Checkpoint(const std::string& step) {
-    LOG(INFO) << "[TRACE-" << my_trace_id_ << "] Checkpoint: " << step;
-  }
-};
-
-// Safe pointer access validator
-class SafePointerAccess {
- public:
-  template<typename T>
-  static bool IsValid(const T* ptr) {
-    if (!ptr) return false;
-    
-    // Try to read first byte - will segfault if invalid
-    try {
-      volatile char test = *reinterpret_cast<const volatile char*>(ptr);
-      (void)test; // Suppress unused variable warning
-      return true;
-    } catch (...) {
-      return false;
-    }
-  }
-};
+struct ControlBlock;
 
 // The master control block, located at the beginning of the shared memory
 // segment.
 struct ControlBlock {
-  std::atomic<uint64_t> magic_number;
-  std::atomic<uint32_t> transport_version;
-  std::atomic<uint32_t> server_state;
-  std::atomic<uint32_t> client_state;
+  // NEW: make magic/version atomics (safe publishing across processes)
+  std::atomic<uint64_t> magic_number{0};
+  std::atomic<uint32_t> transport_version{0};
+
+  // Optional counters / state
+  std::atomic<int32_t>  process_count{0};
+  std::atomic<uint32_t> server_state{0};
+  std::atomic<uint32_t> client_state{0};
 
   // --- Lightweight Synchronization Semaphores ---
   // Used to wake a sleeping reader thread when the command queue transitions
   // from empty to non-empty.
-  // Cross-process compatible: Both semaphores managed by name outside shared memory
-  char c2s_sem_placeholder[64];  // Reserved space (semaphores managed by name)
-  char s2c_sem_placeholder[64];  // Reserved space (semaphores managed by name)
+  EventFdSemaphore c2s_sem;
+  EventFdSemaphore s2c_sem;
   // Set by the consumer just before sleeping; producers check this to avoid
   // spurious posts. 0 = not waiting, 1 = waiting.
   std::atomic<uint32_t> c2s_waiters{0};
   std::atomic<uint32_t> s2c_waiters{0};
 
-  // --- Process coordination for cross-process cleanup ---
-  std::atomic<int32_t> process_count{0};  // Number of attached processes
+  // NEW: offsets to the two ShmemQueues blocks, relative to this ControlBlock*
+  uint64_t c2s_queues_offset = 0;
+  uint64_t s2c_queues_offset = 0;
 
-  // --- Cross-process semaphore names (stored in shared memory) ---
-  char c2s_sem_name[64];  // Client-to-server semaphore name
-  char s2c_sem_name[64];  // Server-to-client semaphore name
+  // NEW: names for named semaphores (POSIX shm-safe)
+  char c2s_sem_name[64] = {0};
+  char s2c_sem_name[64] = {0};
 
-  // --- Offsets to the queue structures (relative to segment base) ---  
-  uint64_t c2s_queues_offset;  // Offset from segment base to c2s queues
-  uint64_t s2c_queues_offset;  // Offset from segment base to s2c queues
-
-  // Constructor to initialize fields and semaphores
-  ControlBlock()
-      : magic_number(0x47525043534D454Dull /* "GRPCSMEM" */),
-        transport_version(1),
-        server_state(0),
-        client_state(0),
-        c2s_waiters(0),
-        s2c_waiters(0),
-        process_count(0),
-        c2s_queues_offset(0),
-        s2c_queues_offset(0) {
-    // Initialize semaphore name arrays to empty
-    c2s_sem_name[0] = '\0';
-    s2c_sem_name[0] = '\0';
+  // Helpers (these are used throughout your transport)
+  inline ShmemQueues* GetC2SQueues() {
+    return reinterpret_cast<ShmemQueues*>(
+        reinterpret_cast<char*>(this) + c2s_queues_offset);
   }
-  
-  // Helper methods to get actual queue pointers from offsets (cross-process safe)
-  ShmemQueues* GetC2SQueues() {
-    if (c2s_queues_offset == 0) return nullptr;
-    char* base = reinterpret_cast<char*>(this);
-    return reinterpret_cast<ShmemQueues*>(base + c2s_queues_offset);
+  inline ShmemQueues* GetS2CQueues() {
+    return reinterpret_cast<ShmemQueues*>(
+        reinterpret_cast<char*>(this) + s2c_queues_offset);
   }
-  
-  ShmemQueues* GetS2CQueues() {
-    if (s2c_queues_offset == 0) return nullptr;
-    char* base = reinterpret_cast<char*>(this);
-    return reinterpret_cast<ShmemQueues*>(base + s2c_queues_offset);
+  inline const ShmemQueues* GetC2SQueues() const {
+    return const_cast<ControlBlock*>(this)->GetC2SQueues();
+  }
+  inline const ShmemQueues* GetS2CQueues() const {
+    return const_cast<ControlBlock*>(this)->GetS2CQueues();
   }
 };
 
@@ -157,19 +104,18 @@ struct Command {
 };
 
 // A simple ring buffer for variable-length binary data shared between peers.
+// Valid across processes by storing an offset, not a raw pointer.
 struct DataRingBuffer {
   uint64_t capacity = 0;
   // head is advanced by the producer, tail by the consumer.
   std::atomic<uint64_t> head{0};
   std::atomic<uint64_t> tail{0};
-  // Store buffer as offset from segment base for cross-process compatibility
+  // NEW: offset from ControlBlock* base to the data buffer
   uint64_t buffer_offset = 0;
-  
-  // Helper method to get actual buffer pointer (cross-process safe)
-  unsigned char* GetBuffer(void* segment_base) {
-    if (buffer_offset == 0) return nullptr;
+
+  inline unsigned char* GetBuffer(ControlBlock* cb) const {
     return reinterpret_cast<unsigned char*>(
-        static_cast<char*>(segment_base) + buffer_offset);
+        reinterpret_cast<char*>(cb) + buffer_offset);
   }
 };
 
@@ -186,36 +132,6 @@ struct ShmemQueues {
   DataRingBuffer data_rb;
 };
 
-// Lightweight adapter to provide semaphore manager interface using transport's own semaphores
-class TransportSemaphoreAdapter {
- public:
-  TransportSemaphoreAdapter(CrossProcessSemaphore* c2s_sem, CrossProcessSemaphore* s2c_sem)
-      : c2s_sem_(c2s_sem), s2c_sem_(s2c_sem) {}
-  
-  // Post to semaphore based on direction
-  void Post(ControlBlock* cb, bool c2s_direction) {
-    std::atomic<uint32_t>* waiters = c2s_direction ? &cb->c2s_waiters : &cb->s2c_waiters;
-    if (waiters->load(std::memory_order_relaxed)) {
-      CrossProcessSemaphore* sem = c2s_direction ? c2s_sem_ : s2c_sem_;
-      if (sem) {
-        sem->post();
-      }
-    }
-  }
-
-  // Wait on semaphore based on direction
-  void Wait(bool c2s_direction) {
-    CrossProcessSemaphore* sem = c2s_direction ? c2s_sem_ : s2c_sem_;
-    if (sem) {
-      sem->wait();
-    }
-  }
-
- private:
-  CrossProcessSemaphore* c2s_sem_;
-  CrossProcessSemaphore* s2c_sem_;
-};
-
 }  // namespace grpc_shmem
 
 namespace grpc_core {
@@ -223,18 +139,15 @@ namespace grpc_core {
 // Factory entry point used by tests and the surface integration later on.
 // Implemented in shmem_transport.cc.
 std::pair<OrphanablePtr<Transport>, OrphanablePtr<Transport>>
-MakeShmemTransportPair(const ChannelArgs& server_channel_args,
-                       const ChannelArgs& client_channel_args);
+MakeShmemTransportPair(const ChannelArgs& server_channel_args);
 
-// Factory entry point for creating a server transport with a predictable name
-// that clients can connect to cross-process. Returns server transport only.
+// Create a named server transport for cross-process communication
 OrphanablePtr<Transport> MakeNamedShmemServerTransport(
-    const std::string& server_name, const ChannelArgs& server_channel_args);
+    const std::string& server_name, const ChannelArgs& args);
 
-// Factory entry point for connecting to an existing named server transport.
-// Returns client transport only.
+// Connect to an existing named shmem server transport
 OrphanablePtr<Transport> ConnectToShmemServerTransport(
-    const std::string& server_name, const ChannelArgs& client_channel_args);
+    const std::string& server_name, const ChannelArgs& args);
 
 }  // namespace grpc_core
 

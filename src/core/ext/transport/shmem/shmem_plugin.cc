@@ -21,6 +21,7 @@
 #include "src/core/client_channel/direct_channel.h"
 #include "src/core/ext/transport/shmem/shmem_segment.h"
 #include "src/core/transport/auth_context.h"
+#include "src/core/call/security_context.h"
 #include "absl/strings/str_cat.h"
 #include "absl/container/flat_hash_map.h"
 #include <mutex>

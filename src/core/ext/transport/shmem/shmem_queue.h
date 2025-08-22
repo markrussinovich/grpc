@@ -52,7 +52,12 @@ inline void Release(DataRingBuffer* rb, uint32_t size) {
 }
 
 // Forward declaration for semaphore adapter
-class TransportSemaphoreAdapter;
+class TransportSemaphoreAdapter {
+ public:
+  virtual ~TransportSemaphoreAdapter() = default;
+  virtual void Post(ControlBlock* cb, bool is_c2s) = 0;
+  virtual void Wait(bool is_c2s) = 0;
+};
 
 // Push a command and optionally wake the sleeping peer if the queue was empty
 // before the push. Returns true if the command was pushed.

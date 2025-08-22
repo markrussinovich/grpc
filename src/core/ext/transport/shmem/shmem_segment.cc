@@ -206,9 +206,13 @@ ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
   }
   
   // Place control block at the start and initialize it properly
-  auto* cb = new(base) ControlBlock();  // Placement new to call constructor
+  auto* cb = new(base) ControlBlock();  // Placement new to initialize fields
   
-  // Set additional fields not initialized by constructor
+  // Set magic/version during creation using atomic stores
+  cb->magic_number.store(0x47525043534D454Dull, std::memory_order_release); // "GRPCSMEM"
+  cb->transport_version.store(1, std::memory_order_release);
+  
+  // Set additional fields
   cb->server_state.store(1);  // listening
   cb->client_state.store(0);
   
