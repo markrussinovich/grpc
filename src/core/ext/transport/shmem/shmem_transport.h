@@ -141,6 +141,11 @@ namespace grpc_core {
 std::pair<OrphanablePtr<Transport>, OrphanablePtr<Transport>>
 MakeShmemTransportPair(const ChannelArgs& server_channel_args);
 
+// Two-argument overload for distinct server and client channel args
+std::pair<OrphanablePtr<Transport>, OrphanablePtr<Transport>>
+MakeShmemTransportPair(const ChannelArgs& server_channel_args,
+                       const ChannelArgs& client_channel_args);
+
 // Create a named server transport for cross-process communication
 OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     const std::string& server_name, const ChannelArgs& args);

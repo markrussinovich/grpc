@@ -1,0 +1,39 @@
+Starting server...
+Creating service...
+Enabling health check...
+Initializing reflection...
+Creating ServerBuilder...
+Adding listening port: shmem://grpc_shmem_example
+Registering service...
+Building and starting server...
+AddPort: Registering shmem server: grpc_shmem_example
+AddPort: Creating server transport...
+DEBUG: Created segment, checking control block...
+AddPort: Setting up transport with server...
+DEBUG: SetCallDestination called for shmem server - starting reader thread
+AddPort: Server transport set up successfully
+Server listening on shmem://grpc_shmem_example ... DEBUG: ServerLoop: Iteration 50, checking for commands
+DEBUG: ServerLoop: Iteration 100, checking for commands
+DEBUG: ServerLoop: GOT COMMAND! Type: 1, Stream ID: 1 (iteration 101)
+F0823 16:28:53.696645 1669081 context.h:116] Check failed: p != nullptr ((null) vs. (null)) 
+*** Check failure stack trace: ***
+    @     0x5d6191b516b7  absl::lts_20250512::log_internal::LogMessage::PrepareToDie()
+    @     0x5d6191b5109f  absl::lts_20250512::log_internal::LogMessage::SendToLog()
+    @     0x5d6191b5103e  absl::lts_20250512::log_internal::LogMessage::Flush()
+    @     0x5d61906720b9  absl::lts_20250512::log_internal::Voidify::operator&&<>()
+    @     0x5d619138b5f6  grpc_core::ServerAuthFilter::Call::Call()
+    @     0x5d61906fdc1d  grpc_core::filters_detail::CallConstructor<>::Construct()
+    @     0x5d61906fdbf1  grpc_core::filters_detail::StackData::AddFilterConstructor<>()::{lambda()#1}::operator()()
+    @     0x5d61906fdbbd  grpc_core::filters_detail::StackData::AddFilterConstructor<>()::{lambda()#1}::__invoke()
+    @     0x5d6191687cb7  grpc_core::CallFilters::Start()
+    @     0x5d61913fb8b8  grpc_core::UnstartedCallHandler::StartCall()
+    @     0x5d6191656f46  grpc_core::(anonymous namespace)::CallStarter::StartCall()
+    @     0x5d61907c04c9  grpc_core::(anonymous namespace)::ShmemServerTransport::ServerLoop()
+    @     0x5d61907bcec8  grpc_core::(anonymous namespace)::ShmemServerTransport::EnsureReaderStarted()::{lambda()#4}::operator()()
+    @     0x5d61907bce9d  std::__invoke_impl<>()
+    @     0x5d61907bce2d  std::__invoke<>()
+    @     0x5d61907bce05  std::thread::_Invoker<>::_M_invoke<>()
+    @     0x5d61907bcdd5  std::thread::_Invoker<>::operator()()
+    @     0x5d61907bccf9  std::thread::_State_impl<>::_M_run()
+    @     0x7dedcacdc253  (unknown)
+timeout: the monitored command dumped core

@@ -1,0 +1,11 @@
+DEBUG: Segment opened, control block: 0x77347c000000
+DEBUG: About to store segment and create client transport
+Sending 'shmem_user' to shmem://grpc_shmem_example ... DEBUG: ShmemClientTransport S2C reader thread STARTED
+DEBUG: PushCommand C2S - queue empty: true
+DEBUG: PushCommand C2S - push result: success
+DEBUG: PushCommand C2S - queue was empty, posting semaphore (event-driven)
+DEBUG: Post C2S - sem_adapter: 0x5f79e5bf4bb0
+DEBUG: Post C2S - calling sem_adapter->Post
+DEBUG: Post C2S - sem_adapter->Post completed
+DEBUG: PushCommand C2S - queue empty: false
+DEBUG: PushCommand C2S - push result: success

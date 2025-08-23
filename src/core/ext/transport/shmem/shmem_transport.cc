@@ -87,6 +87,12 @@ namespace grpc_shmem {
 namespace grpc_core {
 namespace {
 
+// Data structure for announcing streams to core via accept callback
+struct ShmemServerData {
+  uint32_t stream_id;
+  std::vector<grpc_shmem::KVPair> initial_md;
+};
+
 // Concrete implementation of TransportSemaphoreAdapter
 class ConcreteSemaphoreAdapter : public grpc_shmem::TransportSemaphoreAdapter {
  public:
@@ -700,6 +706,9 @@ class ShmemServerTransport final : public ServerTransport {
   CallInitiator AnnounceAndGetInitiator(uint32_t /*stream_id*/,
                                         ClientMetadataHandle md);
 
+  // FinishAccept - called by core to complete the stream accept lifecycle
+  void FinishAccept(const void* server_data);
+
  private:
   ~ShmemServerTransport() override = default;
 
@@ -950,9 +959,7 @@ class ShmemServerTransport final : public ServerTransport {
               }
               VLOG(2) << "Extracted path: '" << st.path << "'";
               
-              // Always use ring-based approach: Create server call via UnstartedCallDestination::StartCall
-              
-              // Get the call destination
+              // Direct StartCall approach (temporary for testing)
               RefCountedPtr<UnstartedCallDestination> dest;
               {
                 MutexLock lock(&dest_mu_);
@@ -960,23 +967,14 @@ class ShmemServerTransport final : public ServerTransport {
               }
               
               if (dest != nullptr) {
-                // Create server call through StartCall - this is the proper way
                 auto arena = call_arena_allocator_->MakeArena();
                 auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
                 arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
                 auto md = arena->MakePooledForOverwrite<ClientMetadata>();
 
-                // IMPORTANT: Provide a per-call server security context (like TCP does)
-                // ServerAuthFilter requires this to be present.
-                grpc_server_security_context* server_ctx = 
-                    grpc_server_security_context_create(arena.get());
-                server_ctx->auth_context = MakeShmemAuthContext();
-                arena->SetContext<grpc_core::SecurityContext>(server_ctx);
-
-                // Optional but nice: set a peer string so filters/logging have something sane.
+                // Set peer string and metadata from shmem request
                 md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
                 
-                // Set metadata from the shmem request
                 for (const auto& kv : kvs_in) {
                   if (kv.key == ":path") {
                     md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
@@ -1006,26 +1004,23 @@ class ShmemServerTransport final : public ServerTransport {
                 auto call = MakeCallPair(std::move(md), std::move(arena));
                 st.initiator.emplace(call.initiator);
                 
-                // Start the server call and response bridge
+                // Start the server call - auth context should come from server channel args now
                 dest->StartCall(std::move(call.handler));
                 
-                // Start the response bridge to forward server responses back to client
+                // Start the response bridge
                 call.initiator.SpawnGuarded("shmem-response-bridge", 
                   [this, stream_id = cmd.stream_id, call_initiator = call.initiator]() mutable {
                     return ShmemCallOutboundLoop(stream_id, std::move(call_initiator));
                   });
               } else {
-                // No destination available - this shouldn't happen in cross-process mode
                 VLOG(1) << "No call destination available for stream " << cmd.stream_id;
               }
               
               st.sent_initial = true;
-              
-              st.sent_initial = true;
+              if (cmd.data_size != 0) {
+                cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+              }
             }
-            // Release consumed bytes from c2s
-            cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size,
-                                                    std::memory_order_release);
             break;
           }
           case grpc_shmem::FrameType::C2S_MESSAGE: {
@@ -1234,12 +1229,6 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
   arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
   
-  // ServerAuthFilter requires a server security context; set the correct type.
-  grpc_server_security_context* server_ctx = 
-      grpc_server_security_context_create(arena.get());
-  server_ctx->auth_context = MakeShmemAuthContext();
-  arena->SetContext<grpc_core::SecurityContext>(server_ctx);
-  
   // Set peer string in metadata
   md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
   auto call = MakeCallPair(std::move(md), std::move(arena));
@@ -1260,6 +1249,58 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
     calls_started_.fetch_add(1, std::memory_order_relaxed);
   }
   return std::move(call.initiator);
+}
+
+void ShmemServerTransport::FinishAccept(const void* server_data) {
+  auto* sd = static_cast<const ShmemServerData*>(server_data);
+  ExecCtx exec_ctx;
+
+  auto arena = call_arena_allocator_->MakeArena();
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+
+  // Convert sd->initial_md -> ClientMetadata (same code you already had)
+  auto md = arena->MakePooledForOverwrite<ClientMetadata>();
+  for (const auto& kv : sd->initial_md) {
+    if (kv.key == ":path") md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
+    else if (kv.key == ":method") md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
+    else if (kv.key == ":scheme")
+      md->Set(HttpSchemeMetadata(), kv.value == "https" ? HttpSchemeMetadata::kHttps
+                                                        : HttpSchemeMetadata::kHttp);
+    else if (kv.key == "te") md->Set(TeMetadata(), TeMetadata::kTrailers);
+    else if (kv.key == "content-type")
+      md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+    else if (kv.key == "grpc-accept-encoding")
+      md->Set(GrpcAcceptEncodingMetadata(), CompressionAlgorithmSet{GRPC_COMPRESS_NONE});
+    else if (kv.key == "user-agent")
+      md->Set(UserAgentMetadata(), Slice::FromCopiedString(kv.value));
+    else if (kv.key == ":authority")
+      md->Set(HttpAuthorityMetadata(), Slice::FromCopiedString(kv.value));
+    else
+      md->Append(kv.key, Slice::FromCopiedString(kv.value), [](absl::string_view, const Slice&) {});
+  }
+  md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
+
+  auto call = MakeCallPair(std::move(md), std::move(arena));
+
+  RefCountedPtr<UnstartedCallDestination> d;
+  { MutexLock l(&dest_mu_); d = dest_; }
+  if (d == nullptr) { delete sd; return; }
+
+  // THIS is where core/filters are ready; StartCall now is safe.
+  d->StartCall(std::move(call.handler));
+
+  {
+    MutexLock lk(&stream_initiators_mu_);
+    stream_initiators_.emplace(sd->stream_id, call.initiator);
+  }
+  // Start your S2C bridge (unchanged)
+  call.initiator.SpawnGuarded("shmem-response-bridge",
+      [this, sid = sd->stream_id, ci = call.initiator]() mutable {
+        return ShmemCallOutboundLoop(sid, std::move(ci));
+      });
+
+  delete sd;
 }
 
 void ShmemClientTransport::EnsureReaderStarted() {
@@ -1529,10 +1570,8 @@ MakeShmemTransportPairImpl(const ChannelArgs& server_channel_args,
     cb = segment->control();
   }
 
-  // Add auth context to server channel args for ServerAuthFilter
-  auto server_args_with_auth = server_channel_args.SetObject(MakeShmemAuthContext());
   auto server_transport = MakeOrphanable<ShmemServerTransport>(
-      server_args_with_auth, std::move(segment));
+      server_channel_args, std::move(segment));
   auto client_transport = MakeOrphanable<ShmemClientTransport>(
       server_transport->RefAsSubclass<ShmemServerTransport>(), cb, client_channel_args);
   return {std::move(client_transport), std::move(server_transport)};
@@ -1542,10 +1581,9 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     const std::string& server_name, const ChannelArgs& server_channel_args) {
   VLOG(2) << "MakeNamedShmemServerTransport called with server_name: " << server_name;
   
-  // Force ring mode for cross-process server and add auth context for ServerAuthFilter
+  // Force ring mode for cross-process server
   ChannelArgs ring_mode_args = server_channel_args
-      .Set("grpc.shmem.dispatch_only", false)
-      .SetObject(MakeShmemAuthContext());
+      .Set("grpc.shmem.dispatch_only", false);
 
   std::unique_ptr<grpc_shmem::ShmemSegment> segment;
   

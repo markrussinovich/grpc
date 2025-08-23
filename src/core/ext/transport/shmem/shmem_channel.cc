@@ -27,6 +27,7 @@
 //     src/core/ext/transport/inproc/inproc_transport.cc lines ~L19-L20
 
 #include <grpc/grpc.h>
+#include <grpc/grpc_security.h>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -45,9 +46,29 @@
 #include "src/core/lib/transport/transport.h"
 #include "src/core/server/server.h"
 #include "src/core/util/ref_counted_ptr.h"
+#include "src/core/call/security_context.h"
 
 namespace grpc_core {
 namespace {
+
+// Helper to create auth context for shmem transport
+static RefCountedPtr<grpc_auth_context> MakeShmemAuthContext() {
+  // Create an empty (insecure) auth context with nullptr chained context
+  RefCountedPtr<grpc_auth_context> ctx = MakeRefCounted<grpc_auth_context>(nullptr);
+
+  // Required: tell the stack what this transport is
+  grpc_auth_context_add_cstring_property(
+      ctx.get(),
+      GRPC_TRANSPORT_SECURITY_TYPE_PROPERTY_NAME,  // usually "transport_security_type"
+      "shmem");
+
+  // Optional: make this property the "identity" (harmless & keeps some code paths simpler)
+  grpc_auth_context_set_peer_identity_property_name(
+      ctx.get(),
+      GRPC_TRANSPORT_SECURITY_TYPE_PROPERTY_NAME);
+
+  return ctx;
+}
 
 // Map absl::Status -> grpc_status_code, honoring kRpcStatus if present.
 static grpc_status_code MapToGrpcStatus(const absl::Status& st) {
@@ -95,8 +116,10 @@ static RefCountedPtr<Channel> MakeLameChannelFromStatus(const absl::Status& st,
 // Exact analog of MakeInprocChannel(...) but for shmem. [1]
 RefCountedPtr<Channel> MakeShmemChannel(
     Server* server, ChannelArgs client_channel_args) {
-  // 1) Build the transport pair using the server's ChannelArgs.
-  auto transports = MakeShmemTransportPair(server->channel_args());
+  // 1) Build the transport pair using distinct server and client ChannelArgs.
+  // Add auth context to server args since shmem doesn't do handshakes like TCP
+  auto server_args_with_auth = server->channel_args().SetObject(MakeShmemAuthContext());
+  auto transports = MakeShmemTransportPair(server_args_with_auth, client_channel_args);
   auto client_transport = std::move(transports.first);
   auto server_transport = std::move(transports.second);
 
