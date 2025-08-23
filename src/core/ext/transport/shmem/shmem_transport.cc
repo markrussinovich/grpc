@@ -52,9 +52,38 @@
 #include "src/core/channelz/channelz.h"
 #include "src/core/util/debug_location.h"
 #include "src/core/transport/auth_context.h"
+#include "src/core/call/security_context.h"
+#include "src/core/util/ref_counted_ptr.h"
+#include "include/grpc/grpc_security.h"
 #include "absl/log/log.h"
 
 // Legacy stream-op scaffolding removed: this transport uses promise-based APIs exclusively.
+
+// Helper to build a valid shmem auth context
+static grpc_core::RefCountedPtr<grpc_auth_context> MakeShmemAuthContext() {
+  // Create an empty (insecure) auth context with nullptr chained context
+  grpc_core::RefCountedPtr<grpc_auth_context> ctx = grpc_core::MakeRefCounted<grpc_auth_context>(nullptr);
+
+  // Required: tell the stack what this transport is
+  grpc_auth_context_add_cstring_property(
+      ctx.get(),
+      GRPC_TRANSPORT_SECURITY_TYPE_PROPERTY_NAME,  // usually "transport_security_type"
+      "shmem");
+
+  // Optional: make this property the "identity" (harmless & keeps some code paths simpler)
+  grpc_auth_context_set_peer_identity_property_name(
+      ctx.get(),
+      GRPC_TRANSPORT_SECURITY_TYPE_PROPERTY_NAME);
+
+  return ctx;
+}
+
+// Helper to create shmem server security context
+static std::unique_ptr<grpc_server_security_context> MakeShmemSecurityContext() {
+  auto sc = std::make_unique<grpc_server_security_context>();
+  sc->auth_context = MakeShmemAuthContext();
+  return sc;
+}
 
 namespace grpc_shmem {
 // Shutdown tracer removed for compilation
@@ -1200,8 +1229,10 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
   arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
   
-  // Set server security context using insecure auth context
-  auto auth = MakeRefCounted<grpc_auth_context>(nullptr);
+  // Set server security context using valid shmem auth context
+  auto security_ctx = MakeShmemSecurityContext();
+  arena->SetContext<grpc_core::SecurityContext>(security_ctx.release());
+  
   // Set peer string in metadata
   md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
   auto call = MakeCallPair(std::move(md), std::move(arena));
@@ -1491,8 +1522,10 @@ MakeShmemTransportPairImpl(const ChannelArgs& server_channel_args,
     cb = segment->control();
   }
 
+  // Add auth context to server channel args for ServerAuthFilter
+  auto server_args_with_auth = server_channel_args.SetObject(MakeShmemAuthContext());
   auto server_transport = MakeOrphanable<ShmemServerTransport>(
-      server_channel_args, std::move(segment));
+      server_args_with_auth, std::move(segment));
   auto client_transport = MakeOrphanable<ShmemClientTransport>(
       server_transport->RefAsSubclass<ShmemServerTransport>(), cb, client_channel_args);
   return {std::move(client_transport), std::move(server_transport)};
@@ -1502,9 +1535,10 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     const std::string& server_name, const ChannelArgs& server_channel_args) {
   VLOG(2) << "MakeNamedShmemServerTransport called with server_name: " << server_name;
   
-  // Force ring mode for cross-process server
+  // Force ring mode for cross-process server and add auth context for ServerAuthFilter
   ChannelArgs ring_mode_args = server_channel_args
-      .Set("grpc.shmem.dispatch_only", false);
+      .Set("grpc.shmem.dispatch_only", false)
+      .SetObject(MakeShmemAuthContext());
 
   std::unique_ptr<grpc_shmem::ShmemSegment> segment;
   
