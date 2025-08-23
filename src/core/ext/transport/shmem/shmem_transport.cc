@@ -78,12 +78,7 @@ static grpc_core::RefCountedPtr<grpc_auth_context> MakeShmemAuthContext() {
   return ctx;
 }
 
-// Helper to create shmem server security context
-static std::unique_ptr<grpc_server_security_context> MakeShmemSecurityContext() {
-  auto sc = std::make_unique<grpc_server_security_context>();
-  sc->auth_context = MakeShmemAuthContext();
-  return sc;
-}
+// Note: MakeShmemSecurityContext removed - using grpc_server_security_context_create directly
 
 namespace grpc_shmem {
 // Shutdown tracer removed for compilation
@@ -970,6 +965,16 @@ class ShmemServerTransport final : public ServerTransport {
                 auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
                 arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
                 auto md = arena->MakePooledForOverwrite<ClientMetadata>();
+
+                // IMPORTANT: Provide a per-call server security context (like TCP does)
+                // ServerAuthFilter requires this to be present.
+                grpc_server_security_context* server_ctx = 
+                    grpc_server_security_context_create(arena.get());
+                server_ctx->auth_context = MakeShmemAuthContext();
+                arena->SetContext<grpc_core::SecurityContext>(server_ctx);
+
+                // Optional but nice: set a peer string so filters/logging have something sane.
+                md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
                 
                 // Set metadata from the shmem request
                 for (const auto& kv : kvs_in) {
@@ -1229,9 +1234,11 @@ CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
   arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
   
-  // Set server security context using valid shmem auth context
-  auto security_ctx = MakeShmemSecurityContext();
-  arena->SetContext<grpc_core::SecurityContext>(security_ctx.release());
+  // ServerAuthFilter requires a server security context; set the correct type.
+  grpc_server_security_context* server_ctx = 
+      grpc_server_security_context_create(arena.get());
+  server_ctx->auth_context = MakeShmemAuthContext();
+  arena->SetContext<grpc_core::SecurityContext>(server_ctx);
   
   // Set peer string in metadata
   md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
