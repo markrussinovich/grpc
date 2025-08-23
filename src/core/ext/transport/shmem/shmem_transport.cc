@@ -338,7 +338,6 @@ class ShmemClientTransport final : public ClientTransport {
   std::atomic<bool> shutdown_initiated_{false};
   std::atomic<bool> cleanup_complete_{false};
   std::thread reader_;
-  std::atomic<uint32_t> next_stream_id_{1};
   int spin_iters_ = kDefaultSpinIters;
   // Cross-process semaphores for both directions
   grpc_shmem::CrossProcessSemaphore c2s_cross_sem_;
@@ -945,8 +944,8 @@ class ShmemServerTransport final : public ServerTransport {
           &cmd, sem_adapter_.get());
       
       if (has_command) {
-        printf("DEBUG: ServerLoop: GOT COMMAND! Type: %d, Stream ID: %u (iteration %d)\n", 
-               static_cast<int>(cmd.type), cmd.stream_id, loop_count);
+        printf("DEBUG: ServerLoop: GOT COMMAND! Type: %d, Stream ID: %u (iteration %d) - SERVER: %p\n", 
+               static_cast<int>(cmd.type), cmd.stream_id, loop_count, this);
         fflush(stdout);
       } else {
         // Only log on first few iterations and then every 100 iterations
@@ -1458,7 +1457,10 @@ void ShmemClientTransport::EnsureReaderStarted() {
 
 void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
   EnsureReaderStarted();  // Start S2C reader for all RPCs
-  auto stream_id = next_stream_id_.fetch_add(1, std::memory_order_relaxed);
+  // Use global stream ID counter from control block to avoid conflicts between clients
+  auto stream_id = cb_->next_stream_id.fetch_add(1, std::memory_order_relaxed);
+  printf("DEBUG: ShmemClientTransport::StartCall - Allocated global stream ID: %u for this client transport: %p (avoiding conflicts)\n", stream_id, this);
+  fflush(stdout);
   
   // Always insert handler for S2C reader delivery
   {

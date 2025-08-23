@@ -41,6 +41,9 @@ struct ControlBlock {
   std::atomic<int32_t>  process_count{0};
   std::atomic<uint32_t> server_state{0};
   std::atomic<uint32_t> client_state{0};
+  
+  // Global stream ID counter to prevent conflicts between multiple clients
+  std::atomic<uint32_t> next_stream_id{1};
 
   // --- Lightweight Synchronization Semaphores ---
   // Used to wake a sleeping reader thread when the command queue transitions
