@@ -136,23 +136,49 @@ class ShmemEndpointTransport final : public EndpointTransport {
     std::cout << "AddPort: Registering shmem server: " << server_name << std::endl;
     ShmemServerRegistry::Get().RegisterServer(server_name, server);
     
-    // Create the named server transport 
+    // Create properly configured auth context for both transport and server setup  
+    printf("DEBUG: Plugin - Creating properly configured auth context\n");
+    fflush(stdout);
+    
+    // Create auth context like MakeShmemAuthContext() does
+    auto auth_context = grpc_core::MakeRefCounted<grpc_auth_context>(nullptr);
+    grpc_auth_context_add_cstring_property(
+        auth_context.get(),
+        GRPC_TRANSPORT_SECURITY_TYPE_PROPERTY_NAME,
+        "shmem");
+    grpc_auth_context_set_peer_identity_property_name(
+        auth_context.get(),
+        GRPC_TRANSPORT_SECURITY_TYPE_PROPERTY_NAME);
+        
+    printf("DEBUG: Plugin - Created configured auth context: %p\n", auth_context.get());
+    fflush(stdout);
+    
+    // Add auth context to args for transport creation
+    ChannelArgs transport_args = args.SetObject(auth_context);
+    
+    // Create the named server transport with auth context
     std::cout << "AddPort: Creating server transport..." << std::endl;
     auto server_transport = grpc_core::MakeNamedShmemServerTransport(
-        server_name, args);
+        server_name, transport_args);
     if (!server_transport) {
       std::cout << "AddPort: Failed to create server transport" << std::endl;
       return absl::InternalError("Failed to create shmem server transport");
     }
     
     std::cout << "AddPort: Setting up transport with server..." << std::endl;
-    // Create insecure auth context like insecure_security_connector does
-    auto auth_context = grpc_core::MakeRefCounted<grpc_auth_context>(nullptr);
-    // Use similar channel args to inproc transport and add auth context
+    
+    printf("DEBUG: Plugin - Using same auth context for SetupTransport: %p\n", auth_context.get());
+    fflush(stdout);
+    
+    // Use similar channel args to inproc transport with the same auth context
     ChannelArgs setup_args = args
         .Remove(GRPC_ARG_MAX_CONNECTION_IDLE_MS)
         .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS)
         .SetObject(auth_context);
+        
+    printf("DEBUG: Plugin - About to call SetupTransport with auth context: %p\n", auth_context.get());
+    fflush(stdout);
+    
     auto result = server->SetupTransport(server_transport.get(), nullptr, setup_args, nullptr);
     if (!result.ok()) {
       std::cout << "AddPort: Failed to setup transport: " << result << std::endl;

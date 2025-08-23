@@ -360,7 +360,15 @@ class ShmemClientTransport final : public ClientTransport {
 
 class ShmemServerTransport final : public ServerTransport {
  public:
-  explicit ShmemServerTransport(const ChannelArgs& args) {
+  explicit ShmemServerTransport(const ChannelArgs& args) : channel_args_(args) {
+    printf("DEBUG: ShmemServerTransport constructor (1-arg) - Starting\n");
+    fflush(stdout);
+    
+    // Check if auth context is in the args
+    auto auth_ctx = args.GetObjectRef<grpc_auth_context>();
+    printf("DEBUG: ShmemServerTransport constructor (1-arg) - Auth context in args: %p\n", auth_ctx.get());
+    fflush(stdout);
+    
     // Connectivity setup (start in CONNECTING like inproc).
     state_.store(ConnectionState::kInitial, std::memory_order_relaxed);
     {
@@ -396,7 +404,15 @@ class ShmemServerTransport final : public ServerTransport {
   }
   ShmemServerTransport(const ChannelArgs& args,
                        std::unique_ptr<grpc_shmem::ShmemSegment> seg)
-      : segment_(std::move(seg)) {
+      : channel_args_(args), segment_(std::move(seg)) {
+    printf("DEBUG: ShmemServerTransport constructor (2-arg) - Starting\n");
+    fflush(stdout);
+    
+    // Check if auth context is in the args
+    auto auth_ctx = args.GetObjectRef<grpc_auth_context>();
+    printf("DEBUG: ShmemServerTransport constructor - Auth context in args: %p\n", auth_ctx.get());
+    fflush(stdout);
+    
     // Connectivity setup (start in CONNECTING like inproc).
     state_.store(ConnectionState::kInitial, std::memory_order_relaxed);
     {
@@ -967,10 +983,23 @@ class ShmemServerTransport final : public ServerTransport {
               }
               
               if (dest != nullptr) {
+                printf("DEBUG: ServerLoop - About to create call, dest: %p\n", dest.get());
+                fflush(stdout);
+                
                 auto arena = call_arena_allocator_->MakeArena();
+                printf("DEBUG: ServerLoop - Created arena: %p\n", arena.get());
+                fflush(stdout);
+                
                 auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
                 arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+                
+                // Debug: Check if stored channel args have auth context
+                auto auth_ctx = channel_args_.GetObjectRef<grpc_auth_context>();
+                printf("DEBUG: ServerLoop - Auth context from stored channel args: %p\n", auth_ctx.get());
+                fflush(stdout);
                 auto md = arena->MakePooledForOverwrite<ClientMetadata>();
+                printf("DEBUG: ServerLoop - Created metadata: %p\n", md.get());
+                fflush(stdout);
 
                 // Set peer string and metadata from shmem request
                 md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
@@ -1001,11 +1030,20 @@ class ShmemServerTransport final : public ServerTransport {
                   }
                 }
                 
+                printf("DEBUG: ServerLoop - About to call MakeCallPair\n");
+                fflush(stdout);
                 auto call = MakeCallPair(std::move(md), std::move(arena));
+                printf("DEBUG: ServerLoop - MakeCallPair completed, call.handler: %p\n", &call.handler);
+                fflush(stdout);
+                
                 st.initiator.emplace(call.initiator);
                 
                 // Start the server call - auth context should come from server channel args now
+                printf("DEBUG: ServerLoop - About to call dest->StartCall()\n");
+                fflush(stdout);
                 dest->StartCall(std::move(call.handler));
+                printf("DEBUG: ServerLoop - dest->StartCall() completed successfully\n");
+                fflush(stdout);
                 
                 // Start the response bridge
                 call.initiator.SpawnGuarded("shmem-response-bridge", 
@@ -1164,6 +1202,8 @@ class ShmemServerTransport final : public ServerTransport {
   std::thread reader_;
   std::atomic<bool> stop_{false};
   std::atomic<bool> reader_started_{false};
+  // Store channel args to provide auth context to filter creation
+  ChannelArgs channel_args_;
   int spin_iters_ = kDefaultSpinIters;
   // Always use ring-based communication
   RefCountedPtr<CallArenaAllocator> call_arena_allocator_;
@@ -1581,9 +1621,26 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     const std::string& server_name, const ChannelArgs& server_channel_args) {
   VLOG(2) << "MakeNamedShmemServerTransport called with server_name: " << server_name;
   
-  // Force ring mode for cross-process server
+  printf("DEBUG: MakeNamedShmemServerTransport - Starting for server: %s\n", server_name.c_str());
+  fflush(stdout);
+  
+  // Reuse existing auth context if available, otherwise create one
+  auto auth_ctx = server_channel_args.GetObjectRef<grpc_auth_context>();
+  if (auth_ctx == nullptr) {
+    printf("DEBUG: MakeNamedShmemServerTransport - No auth context provided, creating new one\n");
+    fflush(stdout);
+    auth_ctx = MakeShmemAuthContext();
+    printf("DEBUG: MakeNamedShmemServerTransport - Created auth context: %p\n", auth_ctx.get());
+    fflush(stdout);
+  } else {
+    printf("DEBUG: MakeNamedShmemServerTransport - Reusing provided auth context: %p\n", auth_ctx.get());
+    fflush(stdout);
+  }
+  
+  // Force ring mode for cross-process server and include auth context
   ChannelArgs ring_mode_args = server_channel_args
-      .Set("grpc.shmem.dispatch_only", false);
+      .Set("grpc.shmem.dispatch_only", false)
+      .SetObject(auth_ctx);
 
   std::unique_ptr<grpc_shmem::ShmemSegment> segment;
   

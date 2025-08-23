@@ -173,6 +173,7 @@ class ServerAuthFilter final : public ImplementChannelFilter<ServerAuthFilter> {
    public:
     explicit Call(ServerAuthFilter* filter);
     auto OnClientInitialMetadata(ClientMetadata& md, ServerAuthFilter* filter) {
+      EnsureSecurityContext();  // Ensure security context is created when arena is available
       return AssertResultType<absl::Status>(If(
           filter->server_credentials_ == nullptr ||
               filter->server_credentials_->auth_metadata_processor().process ==
@@ -186,6 +187,11 @@ class ServerAuthFilter final : public ImplementChannelFilter<ServerAuthFilter> {
     static inline const NoInterceptor OnServerToClientMessage;
     static inline const NoInterceptor OnServerTrailingMetadata;
     static inline const NoInterceptor OnFinalize;
+
+   private:
+    void EnsureSecurityContext();
+    ServerAuthFilter* filter_;
+    bool security_context_created_;
   };
 
  private:

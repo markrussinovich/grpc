@@ -118,19 +118,34 @@ RefCountedPtr<Channel> MakeShmemChannel(
     Server* server, ChannelArgs client_channel_args) {
   // 1) Build the transport pair using distinct server and client ChannelArgs.
   // Add auth context to server args since shmem doesn't do handshakes like TCP
-  auto server_args_with_auth = server->channel_args().SetObject(MakeShmemAuthContext());
+  printf("DEBUG: MakeShmemChannel - Starting\n");
+  fflush(stdout);
+  
+  auto auth_ctx = MakeShmemAuthContext();
+  printf("DEBUG: MakeShmemChannel - Created auth context: %p\n", auth_ctx.get());
+  fflush(stdout);
+  
+  auto server_args_with_auth = server->channel_args().SetObject(auth_ctx);
+  printf("DEBUG: MakeShmemChannel - Added auth context to server args\n");
+  fflush(stdout);
+  
   auto transports = MakeShmemTransportPair(server_args_with_auth, client_channel_args);
   auto client_transport = std::move(transports.first);
   auto server_transport = std::move(transports.second);
 
   // 2) Hand the server half to the server.
+  auto setup_args = server_args_with_auth
+      .Remove(GRPC_ARG_MAX_CONNECTION_IDLE_MS)
+      .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS);
+  printf("DEBUG: MakeShmemChannel - About to call SetupTransport\n");
+  auto setup_auth_ctx = setup_args.GetObjectRef<grpc_auth_context>();
+  printf("DEBUG: MakeShmemChannel - Auth context in setup args: %p\n", setup_auth_ctx.get());
+  fflush(stdout);
+  
   auto error = server->SetupTransport(
       server_transport.get(),
       /*accept_stream_fn=*/nullptr,
-      // Inproc code removes these two args; we do the same for symmetry. [1]
-      server->channel_args()
-          .Remove(GRPC_ARG_MAX_CONNECTION_IDLE_MS)
-          .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS),
+      setup_args,
       /*socket_node=*/nullptr);
   
   if (!error.ok()) {

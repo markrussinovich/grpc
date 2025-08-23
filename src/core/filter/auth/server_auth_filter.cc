@@ -181,28 +181,92 @@ void ServerAuthFilter::RunApplicationCode::OnMdProcessingDone(
   waker.Wakeup();
 }
 
-ServerAuthFilter::Call::Call(ServerAuthFilter* filter) {
-  // Create server security context.  Set its auth context from channel
-  // data and save it in the call context.
-  grpc_server_security_context* server_ctx =
-      grpc_server_security_context_create(GetContext<Arena>());
-  server_ctx->auth_context =
-      filter->auth_context_->Ref(DEBUG_LOCATION, "server_auth_filter");
+ServerAuthFilter::Call::Call(ServerAuthFilter* filter) 
+    : filter_(filter), security_context_created_(false) {
+  printf("DEBUG: ServerAuthFilter::Call constructor - Starting with deferred security context, filter: %p\n", filter);
+  fflush(stdout);
+  
+  if (filter == nullptr) {
+    printf("DEBUG: ServerAuthFilter::Call constructor - ERROR: filter is null!\n");
+    fflush(stdout);
+    return;
+  }
+  
+  printf("DEBUG: ServerAuthFilter::Call constructor - filter->auth_context_: %p\n", filter->auth_context_.get());
+  fflush(stdout);
+  
+  if (filter->auth_context_ == nullptr) {
+    printf("DEBUG: ServerAuthFilter::Call constructor - ERROR: filter->auth_context_ is null!\n");
+    fflush(stdout);
+    return;
+  }
+  
+  printf("DEBUG: ServerAuthFilter::Call constructor - Deferred security context creation, will create when arena is available\n");
+  fflush(stdout);
+}
+
+void ServerAuthFilter::Call::EnsureSecurityContext() {
+  if (security_context_created_) {
+    return;  // Already created
+  }
+  
+  printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - Creating security context now\n");
+  fflush(stdout);
+  
+  if (filter_ == nullptr || filter_->auth_context_ == nullptr) {
+    printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - ERROR: filter or auth_context is null\n");
+    fflush(stdout);
+    return;
+  }
+  
+  // Now we should have arena context available during promise execution
+  auto* arena = GetContext<Arena>();
+  printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - Got arena: %p\n", arena);
+  fflush(stdout);
+  
+  if (arena == nullptr) {
+    printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - ERROR: Arena is still null!\n");
+    fflush(stdout);
+    return;
+  }
+  
+  // Create server security context with the arena
+  grpc_server_security_context* server_ctx = grpc_server_security_context_create(arena);
+  server_ctx->auth_context = filter_->auth_context_->Ref(DEBUG_LOCATION, "server_auth_filter");
   SetContext<SecurityContext>(server_ctx);
+  
+  security_context_created_ = true;
+  printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - Security context created successfully\n");
+  fflush(stdout);
 }
 
 ServerAuthFilter::ServerAuthFilter(
     RefCountedPtr<grpc_server_credentials> server_credentials,
     RefCountedPtr<grpc_auth_context> auth_context)
-    : server_credentials_(server_credentials), auth_context_(auth_context) {}
+    : server_credentials_(server_credentials), auth_context_(auth_context) {
+  printf("DEBUG: ServerAuthFilter constructor - this: %p, auth_context: %p\n", this, auth_context_.get());
+  fflush(stdout);
+}
 
 absl::StatusOr<std::unique_ptr<ServerAuthFilter>> ServerAuthFilter::Create(
     const ChannelArgs& args, ChannelFilter::Args) {
+  printf("DEBUG: ServerAuthFilter::Create - Starting filter creation\n");
+  fflush(stdout);
+  
   auto auth_context = args.GetObjectRef<grpc_auth_context>();
+  printf("DEBUG: ServerAuthFilter::Create - Got auth_context: %p\n", auth_context.get());
+  fflush(stdout);
+  
   CHECK(auth_context != nullptr);
   auto creds = args.GetObjectRef<grpc_server_credentials>();
-  return std::make_unique<ServerAuthFilter>(std::move(creds),
-                                            std::move(auth_context));
+  printf("DEBUG: ServerAuthFilter::Create - Creating filter with auth_context: %p\n", auth_context.get());
+  fflush(stdout);
+  
+  auto filter = std::make_unique<ServerAuthFilter>(std::move(creds), std::move(auth_context));
+  printf("DEBUG: ServerAuthFilter::Create - Created filter: %p\n", filter.get());
+  fflush(stdout);
+  
+  return filter;
 }
 
 }  // namespace grpc_core

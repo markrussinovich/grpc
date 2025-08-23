@@ -1,0 +1,47 @@
+Starting server...
+Creating service...
+Enabling health check...
+Initializing reflection...
+Creating ServerBuilder...
+Adding listening port: shmem://grpc_shmem_example
+Registering service...
+Building and starting server...
+AddPort: Registering shmem server: grpc_shmem_example
+AddPort: Creating server transport...
+DEBUG: Created segment, checking control block...
+DEBUG: ShmemServerTransport constructor - Starting
+DEBUG: ShmemServerTransport constructor - Auth context in args: (nil)
+AddPort: Setting up transport with server...
+DEBUG: SetCallDestination called for shmem server - starting reader thread
+AddPort: Server transport set up successfully
+Server listening on shmem://grpc_shmem_example ... DEBUG: ServerLoop: Iteration 50, checking for commands
+DEBUG: ServerLoop: Iteration 100, checking for commands
+DEBUG: ServerLoop: GOT COMMAND! Type: 1, Stream ID: 1 (iteration 101)
+DEBUG: ServerLoop - About to create call, dest: 0x5f4cbba6c0a0
+DEBUG: ServerLoop - Created arena: 0x7f5c78001080
+DEBUG: ServerLoop - Created metadata: 0x7f5c780016b0
+DEBUG: ServerLoop - About to call MakeCallPair
+DEBUG: ServerLoop - MakeCallPair completed, call.handler: 0x7f5c917f9010
+DEBUG: ServerLoop - About to call dest->StartCall()
+F0823 16:38:47.540810 1694085 context.h:116] Check failed: p != nullptr ((null) vs. (null)) 
+*** Check failure stack trace: ***
+    @     0x5f4c843b3a07  absl::lts_20250512::log_internal::LogMessage::PrepareToDie()
+    @     0x5f4c843b33ef  absl::lts_20250512::log_internal::LogMessage::SendToLog()
+    @     0x5f4c843b338e  absl::lts_20250512::log_internal::LogMessage::Flush()
+    @     0x5f4c82ed40b9  absl::lts_20250512::log_internal::Voidify::operator&&<>()
+    @     0x5f4c83bedc76  grpc_core::ServerAuthFilter::Call::Call()
+    @     0x5f4c82f5fc1d  grpc_core::filters_detail::CallConstructor<>::Construct()
+    @     0x5f4c82f5fbf1  grpc_core::filters_detail::StackData::AddFilterConstructor<>()::{lambda()#1}::operator()()
+    @     0x5f4c82f5fbbd  grpc_core::filters_detail::StackData::AddFilterConstructor<>()::{lambda()#1}::__invoke()
+    @     0x5f4c83eea007  grpc_core::CallFilters::Start()
+    @     0x5f4c83c5dc28  grpc_core::UnstartedCallHandler::StartCall()
+    @     0x5f4c83eb92b6  grpc_core::(anonymous namespace)::CallStarter::StartCall()
+    @     0x5f4c83022b52  grpc_core::(anonymous namespace)::ShmemServerTransport::ServerLoop()
+    @     0x5f4c8301f428  grpc_core::(anonymous namespace)::ShmemServerTransport::EnsureReaderStarted()::{lambda()#4}::operator()()
+    @     0x5f4c8301f3fd  std::__invoke_impl<>()
+    @     0x5f4c8301f38d  std::__invoke<>()
+    @     0x5f4c8301f365  std::thread::_Invoker<>::_M_invoke<>()
+    @     0x5f4c8301f335  std::thread::_Invoker<>::operator()()
+    @     0x5f4c8301f259  std::thread::_State_impl<>::_M_run()
+    @     0x7f5ccb8dc253  (unknown)
+timeout: the monitored command dumped core
