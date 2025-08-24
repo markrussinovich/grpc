@@ -158,3 +158,33 @@ cc_binary(
         "@com_google_absl//absl/log:initialize",
     ],
 )
+
+cc_binary(
+    name = "greeter_shmem_async_server",
+    srcs = ["greeter_shmem_async_server.cc"],
+    defines = ["BAZEL_BUILD"],
+    deps = [
+        "//:grpc++",
+        "//examples/protos:helloworld_cc_grpc",
+        "//:grpc_transport_shmem",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_binary(
+    name = "greeter_shmem_async_client",
+    srcs = ["greeter_shmem_async_client.cc"],
+    defines = ["BAZEL_BUILD"],
+    deps = [
+        "//:grpc++",
+        "//examples/protos:helloworld_cc_grpc",
+        "//:grpc_transport_shmem",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/log:initialize",
+    ],
+)
