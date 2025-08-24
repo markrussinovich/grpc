@@ -183,26 +183,21 @@ void ServerAuthFilter::RunApplicationCode::OnMdProcessingDone(
 
 ServerAuthFilter::Call::Call(ServerAuthFilter* filter) 
     : filter_(filter), security_context_created_(false) {
-  printf("DEBUG: ServerAuthFilter::Call constructor - Starting with deferred security context, filter: %p\n", filter);
-  fflush(stdout);
+  VLOG(2) << "ServerAuthFilter::Call constructor - Starting with deferred security context, filter: " << filter;
   
   if (filter == nullptr) {
-    printf("DEBUG: ServerAuthFilter::Call constructor - ERROR: filter is null!\n");
-    fflush(stdout);
+    LOG(ERROR) << "ServerAuthFilter::Call constructor - ERROR: filter is null!";
     return;
   }
   
-  printf("DEBUG: ServerAuthFilter::Call constructor - filter->auth_context_: %p\n", filter->auth_context_.get());
-  fflush(stdout);
+  VLOG(3) << "ServerAuthFilter::Call constructor - filter->auth_context_: " << filter->auth_context_.get();
   
   if (filter->auth_context_ == nullptr) {
-    printf("DEBUG: ServerAuthFilter::Call constructor - ERROR: filter->auth_context_ is null!\n");
-    fflush(stdout);
+    LOG(ERROR) << "ServerAuthFilter::Call constructor - ERROR: filter->auth_context_ is null!";
     return;
   }
   
-  printf("DEBUG: ServerAuthFilter::Call constructor - Deferred security context creation, will create when arena is available\n");
-  fflush(stdout);
+  VLOG(2) << "ServerAuthFilter::Call constructor - Deferred security context creation, will create when arena is available";
 }
 
 void ServerAuthFilter::Call::EnsureSecurityContext() {
@@ -210,23 +205,19 @@ void ServerAuthFilter::Call::EnsureSecurityContext() {
     return;  // Already created
   }
   
-  printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - Creating security context now\n");
-  fflush(stdout);
+  VLOG(2) << "ServerAuthFilter::Call::EnsureSecurityContext - Creating security context now";
   
   if (filter_ == nullptr || filter_->auth_context_ == nullptr) {
-    printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - ERROR: filter or auth_context is null\n");
-    fflush(stdout);
+    LOG(ERROR) << "ServerAuthFilter::Call::EnsureSecurityContext - ERROR: filter or auth_context is null";
     return;
   }
   
   // Now we should have arena context available during promise execution
   auto* arena = GetContext<Arena>();
-  printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - Got arena: %p\n", arena);
-  fflush(stdout);
+  VLOG(3) << "ServerAuthFilter::Call::EnsureSecurityContext - Got arena: " << arena;
   
   if (arena == nullptr) {
-    printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - ERROR: Arena is still null!\n");
-    fflush(stdout);
+    LOG(ERROR) << "ServerAuthFilter::Call::EnsureSecurityContext - ERROR: Arena is still null!";
     return;
   }
   
@@ -236,35 +227,29 @@ void ServerAuthFilter::Call::EnsureSecurityContext() {
   SetContext<SecurityContext>(server_ctx);
   
   security_context_created_ = true;
-  printf("DEBUG: ServerAuthFilter::Call::EnsureSecurityContext - Security context created successfully\n");
-  fflush(stdout);
+  VLOG(2) << "ServerAuthFilter::Call::EnsureSecurityContext - Security context created successfully";
 }
 
 ServerAuthFilter::ServerAuthFilter(
     RefCountedPtr<grpc_server_credentials> server_credentials,
     RefCountedPtr<grpc_auth_context> auth_context)
     : server_credentials_(server_credentials), auth_context_(auth_context) {
-  printf("DEBUG: ServerAuthFilter constructor - this: %p, auth_context: %p\n", this, auth_context_.get());
-  fflush(stdout);
+  VLOG(2) << "ServerAuthFilter constructor - this: " << this << ", auth_context: " << auth_context_.get();
 }
 
 absl::StatusOr<std::unique_ptr<ServerAuthFilter>> ServerAuthFilter::Create(
     const ChannelArgs& args, ChannelFilter::Args) {
-  printf("DEBUG: ServerAuthFilter::Create - Starting filter creation\n");
-  fflush(stdout);
+  VLOG(2) << "ServerAuthFilter::Create - Starting filter creation";
   
   auto auth_context = args.GetObjectRef<grpc_auth_context>();
-  printf("DEBUG: ServerAuthFilter::Create - Got auth_context: %p\n", auth_context.get());
-  fflush(stdout);
+  VLOG(3) << "ServerAuthFilter::Create - Got auth_context: " << auth_context.get();
   
   CHECK(auth_context != nullptr);
   auto creds = args.GetObjectRef<grpc_server_credentials>();
-  printf("DEBUG: ServerAuthFilter::Create - Creating filter with auth_context: %p\n", auth_context.get());
-  fflush(stdout);
+  VLOG(2) << "ServerAuthFilter::Create - Creating filter with auth_context: " << auth_context.get();
   
   auto filter = std::make_unique<ServerAuthFilter>(std::move(creds), std::move(auth_context));
-  printf("DEBUG: ServerAuthFilter::Create - Created filter: %p\n", filter.get());
-  fflush(stdout);
+  VLOG(2) << "ServerAuthFilter::Create - Created filter: " << filter.get();
   
   return filter;
 }

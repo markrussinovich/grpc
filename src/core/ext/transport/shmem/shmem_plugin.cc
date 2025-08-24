@@ -133,12 +133,11 @@ class ShmemEndpointTransport final : public EndpointTransport {
 
     // Register server and create transport (but reader thread won't start until SetCallDestination)
     std::string server_name = uri.authority();
-    std::cout << "AddPort: Registering shmem server: " << server_name << std::endl;
+    VLOG(2) << "AddPort: Registering shmem server: " << server_name;
     ShmemServerRegistry::Get().RegisterServer(server_name, server);
     
     // Create properly configured auth context for both transport and server setup  
-    printf("DEBUG: Plugin - Creating properly configured auth context\n");
-    fflush(stdout);
+    VLOG(2) << "Plugin - Creating properly configured auth context";
     
     // Create auth context like MakeShmemAuthContext() does
     auto auth_context = grpc_core::MakeRefCounted<grpc_auth_context>(nullptr);
@@ -150,25 +149,23 @@ class ShmemEndpointTransport final : public EndpointTransport {
         auth_context.get(),
         GRPC_TRANSPORT_SECURITY_TYPE_PROPERTY_NAME);
         
-    printf("DEBUG: Plugin - Created configured auth context: %p\n", auth_context.get());
-    fflush(stdout);
+    VLOG(2) << "Plugin - Created configured auth context: " << auth_context.get();
     
     // Add auth context to args for transport creation
     ChannelArgs transport_args = args.SetObject(auth_context);
     
     // Create the named server transport with auth context
-    std::cout << "AddPort: Creating server transport..." << std::endl;
+    VLOG(2) << "AddPort: Creating server transport...";
     auto server_transport = grpc_core::MakeNamedShmemServerTransport(
         server_name, transport_args);
     if (!server_transport) {
-      std::cout << "AddPort: Failed to create server transport" << std::endl;
+      LOG(ERROR) << "AddPort: Failed to create server transport";
       return absl::InternalError("Failed to create shmem server transport");
     }
     
-    std::cout << "AddPort: Setting up transport with server..." << std::endl;
+    VLOG(2) << "AddPort: Setting up transport with server...";
     
-    printf("DEBUG: Plugin - Using same auth context for SetupTransport: %p\n", auth_context.get());
-    fflush(stdout);
+    VLOG(2) << "Plugin - Using same auth context for SetupTransport: " << auth_context.get();
     
     // Use similar channel args to inproc transport with the same auth context
     ChannelArgs setup_args = args
@@ -176,17 +173,16 @@ class ShmemEndpointTransport final : public EndpointTransport {
         .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS)
         .SetObject(auth_context);
         
-    printf("DEBUG: Plugin - About to call SetupTransport with auth context: %p\n", auth_context.get());
-    fflush(stdout);
+    VLOG(2) << "Plugin - About to call SetupTransport with auth context: " << auth_context.get();
     
     auto result = server->SetupTransport(server_transport.get(), nullptr, setup_args, nullptr);
     if (!result.ok()) {
-      std::cout << "AddPort: Failed to setup transport: " << result << std::endl;
+      LOG(ERROR) << "AddPort: Failed to setup transport: " << result;
       return result;
     }
     
     server_transport.release(); // Server takes ownership
-    std::cout << "AddPort: Server transport set up successfully" << std::endl;
+    VLOG(2) << "AddPort: Server transport set up successfully";
     
     // Return a fake port number since shmem doesn't use real network ports
     return 1;

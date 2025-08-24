@@ -146,20 +146,15 @@ bool ReserveWrapping(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset) {
 
 static inline void Post(ControlBlock* cb, Direction dir, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
   const char* dir_name = (dir == Direction::kC2S) ? "C2S" : "S2C";
-  printf("DEBUG: Post %s - sem_adapter: %p\n", dir_name, sem_adapter);
-  fflush(stdout);
+  VLOG(3) << "Post " << dir_name << " - sem_adapter: " << sem_adapter;
   if (sem_adapter) {
-    printf("DEBUG: Post %s - calling sem_adapter->Post\n", dir_name);
-    fflush(stdout);
+    VLOG(3) << "Post " << dir_name << " - calling sem_adapter->Post";
     // Use cross-process semaphores via semaphore adapter
     sem_adapter->Post(cb, dir == Direction::kC2S);
-    printf("DEBUG: Post %s - sem_adapter->Post completed\n", dir_name);
-    fflush(stdout);
+    VLOG(3) << "Post " << dir_name << " - sem_adapter->Post completed";
   } else {
     // Fallback: Skip posting if no semaphore adapter available
-    printf("DEBUG: Post %s - no semaphore adapter available!\n", dir_name);
-    fflush(stdout);
-    LOG(WARNING) << "Post() called without semaphore adapter - skipping";
+    LOG(WARNING) << "Post " << dir_name << " - no semaphore adapter available";
   }
 }
 
@@ -173,23 +168,19 @@ static inline void Wait(ControlBlock* cb, Direction dir, grpc_shmem::TransportSe
     VLOG(3) << "Wait " << dir_name << " - sem_adapter->Wait returned (woke up!)";
   } else {
     // Fallback: Skip waiting if no semaphore adapter available
-    printf("DEBUG: Wait %s - no semaphore adapter available!\n", dir_name);
-    fflush(stdout);
-    LOG(WARNING) << "Wait() called without semaphore adapter - skipping";
+    LOG(WARNING) << "Wait " << dir_name << " - no semaphore adapter available";
   }
 }
 
 bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
                  const Command& cmd, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
   const char* dir_name = (dir == Direction::kC2S) ? "C2S" : "S2C";
-  printf("DEBUG: PushCommand %s - queue empty: %s\n", dir_name, q->command_q.empty() ? "true" : "false");
-  fflush(stdout);
+  VLOG(3) << "PushCommand " << dir_name << " - queue empty: " << (q->command_q.empty() ? "true" : "false");
   
   // Check if queue was empty before pushing - if so, we need to signal
   const bool was_empty = q->command_q.empty();
   const bool ok = q->command_q.push(cmd);
-  printf("DEBUG: PushCommand %s - push result: %s\n", dir_name, ok ? "success" : "failed");
-  fflush(stdout);
+  VLOG(3) << "PushCommand " << dir_name << " - push result: " << (ok ? "success" : "failed");
   
   if (ok && was_empty) {
     // Memory barrier to ensure command is visible before posting
@@ -197,8 +188,7 @@ bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
     
     // Always post when queue transitions from empty to non-empty
     // This ensures reliable event-driven wakeup regardless of timing races
-    printf("DEBUG: PushCommand %s - queue was empty, posting semaphore (event-driven)\n", dir_name);
-    fflush(stdout);
+    VLOG(3) << "PushCommand " << dir_name << " - queue was empty, posting semaphore (event-driven)";
     Post(cb, dir, sem_adapter);
   }
   return ok;

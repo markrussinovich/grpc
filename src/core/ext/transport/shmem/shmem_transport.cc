@@ -193,105 +193,67 @@ class ShmemClientTransport final : public ClientTransport {
   
  private:
   void InitiateShutdown() {
-    // Debug tracing removed
     ExecCtx exec_ctx;
     
-    // Debug checkpoint: Checking if already initiated
     // Step 1: Signal shutdown to all threads
     if (shutdown_initiated_.exchange(true, std::memory_order_acq_rel)) {
-      // Debug checkpoint: Already initiated, returning
       return; // Already initiated
     }
     
-    // Debug checkpoint: Setting shutdown flags
     // Step 2: Set stop flag and wake threads
     stop_.store(true, std::memory_order_relaxed);
-    if (cb_ != nullptr && true) {
-      // REVERTED: Remove cleanup_initiated flag for baseline testing
-    }
     
-    // Debug checkpoint: Waiting for threads to exit
     // Step 3: Wake any waiting reader threads
     WaitForThreadsToExit();
     
-    // Debug checkpoint: Cleaning up resources
     // Step 4: Cleanup resources in proper order
     CleanupResources();
     
-    // Debug checkpoint: Setting cleanup complete flag
     cleanup_complete_.store(true, std::memory_order_release);
   }
   
   void WaitForThreadsToExit() {
-    // Debug tracing removed
-    
-    // Debug checkpoint: Checking if reader was started
     // Only wake semaphores if a ring reader thread was started
     if (reader_started_.load(std::memory_order_acquire)) {
-      // Debug checkpoint: Reader was started, waking semaphores
-      if (cb_ != nullptr && true) {
+      if (cb_ != nullptr) {
         try {
           // Wake any waiting reader so it can observe stop_ and exit
-        if (cb_) {
-          // Client only needs to wake its own S2C reader thread
-          // Do NOT wake C2S as that disturbs the server
-          if (cb_->s2c_sem_name[0] != '\0') {
-            s2c_cross_sem_.post();
+          if (cb_) {
+            // Client only needs to wake its own S2C reader thread
+            // Do NOT wake C2S as that disturbs the server
+            if (cb_->s2c_sem_name[0] != '\0') {
+              s2c_cross_sem_.post();
+            }
           }
-        }
-          // Debug checkpoint: Semaphores woken successfully
         } catch (const std::exception& e) {
           LOG(ERROR) << "Error waking semaphores: " << e.what();
         }
       }
       
-      // Debug checkpoint: Joining reader thread
       if (reader_.joinable()) {
         try {
           reader_.join();
-          // Debug checkpoint: Reader thread joined successfully
         } catch (const std::exception& e) {
           LOG(ERROR) << "Error joining reader thread: " << e.what();
         }
-      } else {
-        // Debug checkpoint: Reader thread not joinable
       }
-    } else {
-      // Debug checkpoint: Reader was never started, skipping thread cleanup
     }
   }
   
   void CleanupResources() {
-    // Debug tracing removed
-    
     try {
-      // Debug checkpoint: Cleaning semaphore manager
-      // Cleanup semaphore manager
-      // REVERTED: Remove semaphore manager cleanup for baseline testing
-      
-      // Debug checkpoint: Handling process count coordination
       // Handle process count and cleanup coordination
-      if (cb_ != nullptr && true) {
-        // Debug checkpoint: Decrementing process count
+      if (cb_ != nullptr) {
         int32_t remaining = --cb_->process_count;
-        LOG(INFO) << "ShmemServerTransport detaching, remaining processes: " << remaining;
         LOG(INFO) << "ShmemClientTransport detaching, remaining processes: " << remaining;
         
         // Clean up cross-process segment if this is a cross-process client
         if (server_ == nullptr) {
-          // Debug checkpoint: Cross-process client, checking if last process
           // Last process cleans up shared resources
           if (remaining == 1) {
-            // Debug checkpoint: Last process - cleaning up shared resources
             RemoveCrossProcessSegment(cb_);
-          } else {
-            // Debug checkpoint: Not last process, skipping shared resource cleanup
           }
-        } else {
-          // Debug checkpoint: In-process client, skipping shared resource cleanup
         }
-      } else {
-        // Debug checkpoint: Control block invalid, skipping process coordination
       }
     } catch (const std::exception& e) {
       LOG(ERROR) << "ShmemClientTransport cleanup error: " << e.what();
@@ -360,13 +322,11 @@ class ShmemClientTransport final : public ClientTransport {
 class ShmemServerTransport final : public ServerTransport {
  public:
   explicit ShmemServerTransport(const ChannelArgs& args) : channel_args_(args) {
-    printf("DEBUG: ShmemServerTransport constructor (1-arg) - Starting\n");
-    fflush(stdout);
+    VLOG(2) << "ShmemServerTransport constructor (1-arg) starting";
     
     // Check if auth context is in the args
     auto auth_ctx = args.GetObjectRef<grpc_auth_context>();
-    printf("DEBUG: ShmemServerTransport constructor (1-arg) - Auth context in args: %p\n", auth_ctx.get());
-    fflush(stdout);
+    VLOG(2) << "Auth context in args: " << auth_ctx.get();
     
     // Connectivity setup (start in CONNECTING like inproc).
     state_.store(ConnectionState::kInitial, std::memory_order_relaxed);
@@ -404,13 +364,11 @@ class ShmemServerTransport final : public ServerTransport {
   ShmemServerTransport(const ChannelArgs& args,
                        std::unique_ptr<grpc_shmem::ShmemSegment> seg)
       : channel_args_(args), segment_(std::move(seg)) {
-    printf("DEBUG: ShmemServerTransport constructor (2-arg) - Starting\n");
-    fflush(stdout);
+    VLOG(2) << "ShmemServerTransport constructor (2-arg) starting";
     
     // Check if auth context is in the args
     auto auth_ctx = args.GetObjectRef<grpc_auth_context>();
-    printf("DEBUG: ShmemServerTransport constructor - Auth context in args: %p\n", auth_ctx.get());
-    fflush(stdout);
+    VLOG(2) << "Auth context in args: " << auth_ctx.get();
     
     // Connectivity setup (start in CONNECTING like inproc).
     state_.store(ConnectionState::kInitial, std::memory_order_relaxed);
@@ -434,7 +392,7 @@ class ShmemServerTransport final : public ServerTransport {
     }
     // Always use ServerLoop for ring-based I/O
     
-    // DIAGNOSTIC: Check segment before getting control block
+    // Check segment before getting control block
     LOG(INFO) << "ShmemServerTransport constructor - segment_: " << segment_.get();
     if (segment_) {
       LOG(INFO) << "Segment exists, getting control block...";
@@ -503,7 +461,7 @@ class ShmemServerTransport final : public ServerTransport {
     call_arena_allocator_ =
         MakeRefCounted<CallArenaAllocator>(std::move(alloc), 1024);
     
-    // VALIDATION: Check ControlBlock before starting reader thread
+    // Check ControlBlock before starting reader thread
     LOG(INFO) << "About to start reader thread. Validating ControlBlock...";
     if (!cb_) {
       LOG(ERROR) << "FATAL: cb_ is null at EnsureReaderStarted!";
@@ -521,7 +479,7 @@ class ShmemServerTransport final : public ServerTransport {
     }
     
     LOG(INFO) << "ControlBlock validation passed, deferring reader thread start";
-    // DEFER: Don't start reader thread during construction to avoid startup hang
+    // Don't start reader thread during construction to avoid startup hang
     // EnsureReaderStarted();
   }
 
@@ -545,8 +503,6 @@ class ShmemServerTransport final : public ServerTransport {
   // have already installed its own callback via PerformOp during
   // Server::SetupTransport. We simply start consuming C2S traffic and call
   // that callback when new streams arrive, mirroring TCP behavior.
-  printf("DEBUG: SetCallDestination called for shmem server - starting reader thread\n");
-  fflush(stdout);
   LOG(INFO) << "SetCallDestination called - starting reader thread";
 
     EnsureReaderStarted();
@@ -587,7 +543,7 @@ class ShmemServerTransport final : public ServerTransport {
     
     stop_.store(true, std::memory_order_relaxed);
     if (cb_ != nullptr) {
-      // REVERTED: Remove cleanup_initiated flag for baseline testing
+      // Additional cleanup flags could be set here if needed
     }
     
     // Step 3: Wait for threads to exit
@@ -627,7 +583,7 @@ class ShmemServerTransport final : public ServerTransport {
   void CleanupResources() {
     try {
       // Cleanup semaphore manager
-      // REVERTED: Remove semaphore manager cleanup for baseline testing
+      // Cleanup semaphore manager if needed
       
       // Handle process count and cleanup coordination
       if (cb_ != nullptr) {
@@ -648,7 +604,7 @@ class ShmemServerTransport final : public ServerTransport {
   
   void CleanupSharedResources() {
     try {
-      // REVERTED: Remove semaphore name cleanup for baseline testing
+      // Clean up semaphore names if needed
       LOG(INFO) << "Server cleaned up shared semaphores";
     } catch (const std::exception& e) {
       LOG(ERROR) << "Error cleaning up shared resources: " << e.what();
@@ -748,19 +704,14 @@ class ShmemServerTransport final : public ServerTransport {
   // Response monitoring loop - forward real server responses onto S2C ring.
   // Implement CallOutboundLoop equivalent for shmem cross-process communication
   auto ShmemCallOutboundLoop(uint32_t stream_id, CallInitiator call_initiator) {
-    printf("DEBUG: ShmemCallOutboundLoop STARTED for stream %u\n", stream_id);
-    fflush(stdout);
-    
-    printf("DEBUG: About to call PullServerInitialMetadata for stream %u\n", stream_id);
-    fflush(stdout);
+    VLOG(2) << "ShmemCallOutboundLoop started for stream " << stream_id;
     
     return Seq(
         TrySeq(
           call_initiator.PullServerInitialMetadata(),
           [this, stream_id](std::optional<ServerMetadataHandle> md) {
             if (md.has_value()) {
-              printf("DEBUG: ShmemCallOutboundLoop: sending S2C_INITIAL_METADATA for stream %u\n", stream_id);
-              fflush(stdout);
+              VLOG(2) << "ShmemCallOutboundLoop: sending S2C_INITIAL_METADATA for stream " << stream_id;
               std::vector<grpc_shmem::KVPair> kvs;
               kvs.push_back({"content-type", "application/grpc"});
               auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
@@ -773,8 +724,7 @@ class ShmemServerTransport final : public ServerTransport {
                 out.data_offset = off;
                 out.data_size = static_cast<uint32_t>(buf.size());
                 grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
-                printf("DEBUG: ShmemCallOutboundLoop: S2C_INITIAL_METADATA sent for stream %u\n", stream_id);
-                fflush(stdout);
+                VLOG(3) << "ShmemCallOutboundLoop: S2C_INITIAL_METADATA sent for stream " << stream_id;
               }
             }
             return Success{};
@@ -785,8 +735,7 @@ class ShmemServerTransport final : public ServerTransport {
             auto* payload = msg->payload();
             const size_t n = payload->Length();
             if (n == 0) return Success{};  // nothing to send
-            printf("DEBUG: ShmemCallOutboundLoop: sending S2C_MESSAGE for stream %u, size=%zu\n", stream_id, n);
-            fflush(stdout);
+            VLOG(2) << "ShmemCallOutboundLoop: sending S2C_MESSAGE for stream " << stream_id << ", size=" << n;
             uint64_t off = 0;
             if (grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb, n, &off)) {
               payload->CopyToBuffer(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off);
@@ -796,8 +745,7 @@ class ShmemServerTransport final : public ServerTransport {
               out.data_offset = off;
               out.data_size = static_cast<uint32_t>(n);
               grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
-              printf("DEBUG: ShmemCallOutboundLoop: S2C_MESSAGE sent for stream %u\n", stream_id);
-              fflush(stdout);
+              VLOG(3) << "ShmemCallOutboundLoop: S2C_MESSAGE sent for stream " << stream_id;
             }
             return Success{};
           }
@@ -805,8 +753,7 @@ class ShmemServerTransport final : public ServerTransport {
         Map(
           call_initiator.PullServerTrailingMetadata(),
           [this, stream_id](ServerMetadataHandle md) {
-            printf("DEBUG: ShmemCallOutboundLoop: sending S2C_TRAILING_METADATA for stream %u\n", stream_id);
-            fflush(stdout);
+            VLOG(2) << "ShmemCallOutboundLoop: sending S2C_TRAILING_METADATA for stream " << stream_id;
             std::vector<grpc_shmem::KVPair> kvs;
             grpc_status_code status = GRPC_STATUS_OK;
             if (auto* s = md->get_pointer(GrpcStatusMetadata()); s) {
@@ -826,16 +773,14 @@ class ShmemServerTransport final : public ServerTransport {
               out.data_offset = off;
               out.data_size = static_cast<uint32_t>(buf.size());
               grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
-              printf("DEBUG: ShmemCallOutboundLoop: S2C_TRAILING_METADATA sent for stream %u\n", stream_id);
-              fflush(stdout);
+              VLOG(3) << "ShmemCallOutboundLoop: S2C_TRAILING_METADATA sent for stream " << stream_id;
             }
             // Clean up stream tracking after sending trailing metadata
             {
               MutexLock lock(&stream_initiators_mu_);
               stream_initiators_.erase(stream_id);
             }
-            printf("DEBUG: ShmemCallOutboundLoop completed for stream %u\n", stream_id);
-            fflush(stdout);
+            VLOG(2) << "ShmemCallOutboundLoop completed for stream " << stream_id;
             return Success{};
           }
         )
@@ -847,7 +792,7 @@ class ShmemServerTransport final : public ServerTransport {
     ExecCtx exec_ctx;
     VLOG(2) << "ExecCtx created, validating control block";
     
-    // STEP 1: VALIDATE CONTROLBLOCK BEFORE USE
+    // Validate ControlBlock before use
     VLOG(2) << "ServerLoop starting, cb_=" << cb_;
     
     if (!cb_) {
@@ -922,19 +867,17 @@ class ShmemServerTransport final : public ServerTransport {
     VLOG(2) << "ServerLoop: Starting command processing loop";
     
     for (;;) {
-      if (stop_.load(std::memory_order_relaxed)) break;  // REVERTED: Remove cleanup_initiated check
+      if (stop_.load(std::memory_order_relaxed)) break;
       loop_count++;
       
-      // Log every 50 iterations to show server is alive
-      if (loop_count % 50 == 0) {
-        printf("DEBUG: ServerLoop: Iteration %d, checking for commands\n", loop_count);
-        fflush(stdout);
+      // Log every 100 iterations to show server is alive
+      if (loop_count % 100 == 0) {
+        VLOG(3) << "ServerLoop: Iteration " << loop_count << ", checking for commands";
         
         // Check if we can access queues
         auto* c2s_queues = cb_->GetC2SQueues();
         if (!c2s_queues) {
-          printf("DEBUG: WARNING - C2S queues pointer is null\n");
-          fflush(stdout);
+          LOG(WARNING) << "C2S queues pointer is null";
         }
       }
       
@@ -944,9 +887,8 @@ class ShmemServerTransport final : public ServerTransport {
           &cmd, sem_adapter_.get());
       
       if (has_command) {
-        printf("DEBUG: ServerLoop: GOT COMMAND! Type: %d, Stream ID: %u (iteration %d) - SERVER: %p\n", 
-               static_cast<int>(cmd.type), cmd.stream_id, loop_count, this);
-        fflush(stdout);
+        VLOG(2) << "ServerLoop: Got command type " << static_cast<int>(cmd.type) 
+                << " for stream " << cmd.stream_id << " (iteration " << loop_count << ")";
       } else {
         // Only log on first few iterations and then every 100 iterations
         if (loop_count <= 5 || (loop_count % 100 == 0)) {
@@ -979,9 +921,9 @@ class ShmemServerTransport final : public ServerTransport {
               const bool use_synthetic = is_cancel_path;  // Use synthetic for special test paths
               const bool use_direct_startcall = !use_synthetic;  // Use direct StartCall for benchmarks and regular calls
               
-              printf("DEBUG: Path selection - path='%s', use_synthetic=%s, use_direct_startcall=%s\n",
-                     st.path.c_str(), use_synthetic ? "true" : "false", use_direct_startcall ? "true" : "false");
-              fflush(stdout);
+              VLOG(2) << "Path selection - path='" << st.path << "', use_synthetic=" 
+                     << (use_synthetic ? "true" : "false") << ", use_direct_startcall=" 
+                     << (use_direct_startcall ? "true" : "false");
 
               if (use_direct_startcall) {
                 // DIRECT STARTCALL PATH (for benchmarks and regular calls)
@@ -993,20 +935,17 @@ class ShmemServerTransport final : public ServerTransport {
                 }
               
               if (dest != nullptr) {
-                printf("DEBUG: ServerLoop - About to create call, dest: %p\n", dest.get());
-                fflush(stdout);
+                VLOG(2) << "ServerLoop - About to create call, dest: " << dest.get();
                 
                 auto arena = call_arena_allocator_->MakeArena();
-                printf("DEBUG: ServerLoop - Created arena: %p\n", arena.get());
-                fflush(stdout);
+                VLOG(3) << "ServerLoop - Created arena: " << arena.get();
                 
                 auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
                 arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
                 
                 // CRITICAL FIX: Build client metadata from the deserialized C2S data
                 // This is the actual client metadata that should be passed to the server call
-                printf("DEBUG: ServerLoop - Building client metadata from C2S data\n");
-                fflush(stdout);
+                VLOG(2) << "ServerLoop - Building client metadata from C2S data";
                 auto md = arena->MakePooledForOverwrite<ClientMetadata>();
                 
                 // Set peer string for shmem transport
@@ -1038,23 +977,18 @@ class ShmemServerTransport final : public ServerTransport {
                                [](absl::string_view, const Slice&) {});
                   }
                 }
-                printf("DEBUG: ServerLoop - Client metadata built with %zu entries\n", kvs_in.size());
-                fflush(stdout);
+                VLOG(2) << "ServerLoop - Client metadata built with " << kvs_in.size() << " entries";
                 
-                printf("DEBUG: ServerLoop - About to call MakeCallPair\n");
-                fflush(stdout);
+                VLOG(2) << "ServerLoop - About to call MakeCallPair";
                 auto call = MakeCallPair(std::move(md), std::move(arena));
-                printf("DEBUG: ServerLoop - MakeCallPair completed, call.handler: %p\n", &call.handler);
-                fflush(stdout);
+                VLOG(3) << "ServerLoop - MakeCallPair completed";
                 
                 st.initiator.emplace(call.initiator);
                 
                 // Start the server call - auth context should come from server channel args now
-                printf("DEBUG: ServerLoop - About to call dest->StartCall()\n");
-                fflush(stdout);
+                VLOG(2) << "ServerLoop - About to call dest->StartCall()";
                 dest->StartCall(std::move(call.handler));
-                printf("DEBUG: ServerLoop - dest->StartCall() completed successfully\n");
-                fflush(stdout);
+                VLOG(2) << "ServerLoop - dest->StartCall() completed successfully";
                 
                 // The client metadata is now properly embedded in the call via MakeCallPair()
                 // No separate metadata pushing needed - this is how inproc transport works
@@ -1074,8 +1008,7 @@ class ShmemServerTransport final : public ServerTransport {
                 }
               } else {
                 // SYNTHETIC PATH (for test hooks like /cancel)
-                printf("DEBUG: Taking synthetic path - sending complete unary response\n");
-                fflush(stdout);
+                VLOG(2) << "Taking synthetic path - sending complete unary response";
                 
                 // 1. Send S2C_INITIAL_METADATA
                 std::vector<grpc_shmem::KVPair> initial_kvs = {
@@ -1431,8 +1364,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
   }
   // Always start S2C reader for cross-process communication
   if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
-    printf("DEBUG: ShmemClientTransport S2C reader thread STARTED\n");
-    fflush(stdout);
+    VLOG(2) << "ShmemClientTransport S2C reader thread started";
     stop_.store(false, std::memory_order_relaxed);
     reader_ = std::thread([this] {
       ExecCtx exec_ctx;
@@ -1456,8 +1388,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
           if (!handler) continue;
           switch (cmd.type) {
             case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
-              printf("DEBUG: ShmemClientTransport received S2C_INITIAL_METADATA for stream %u\n", cmd.stream_id);
-              fflush(stdout);
+              VLOG(2) << "ShmemClientTransport received S2C_INITIAL_METADATA for stream " << cmd.stream_id;
               auto data = cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
               auto kvs = grpc_shmem::DeserializeMetadataKVs(data, cmd.data_size);
               handler->SpawnInfallible(
@@ -1482,8 +1413,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
               break;
             }
             case grpc_shmem::FrameType::S2C_MESSAGE: {
-              printf("DEBUG: ShmemClientTransport received S2C_MESSAGE for stream %u, size=%u\n", cmd.stream_id, cmd.data_size);
-              fflush(stdout);
+              VLOG(2) << "ShmemClientTransport received S2C_MESSAGE for stream " << cmd.stream_id << ", size=" << cmd.data_size;
               grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->GetS2CQueues()->data_rb, cb_, cmd.data_offset, cmd.data_size);
               handler->SpawnInfallible("push-msg", [h = *handler, s]() mutable {
                 SliceBuffer sb;
@@ -1495,8 +1425,7 @@ void ShmemClientTransport::EnsureReaderStarted() {
               break;
             }
             case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
-              printf("DEBUG: ShmemClientTransport received S2C_TRAILING_METADATA for stream %u\n", cmd.stream_id);
-              fflush(stdout);
+              VLOG(2) << "ShmemClientTransport received S2C_TRAILING_METADATA for stream " << cmd.stream_id;
               auto data = cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
               auto kvs = grpc_shmem::DeserializeMetadataKVs(data, cmd.data_size);
               handler->SpawnInfallible(
@@ -1542,8 +1471,8 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
   EnsureReaderStarted();  // Start S2C reader for all RPCs
   // Use global stream ID counter from control block to avoid conflicts between clients
   auto stream_id = cb_->next_stream_id.fetch_add(1, std::memory_order_relaxed);
-  printf("DEBUG: ShmemClientTransport::StartCall - Allocated global stream ID: %u for this client transport: %p (avoiding conflicts)\n", stream_id, this);
-  fflush(stdout);
+  VLOG(2) << "ShmemClientTransport::StartCall - Allocated global stream ID: " << stream_id 
+          << " for client transport: " << this;
   
   // Always insert handler for S2C reader delivery
   {
@@ -1716,20 +1645,14 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     const std::string& server_name, const ChannelArgs& server_channel_args) {
   VLOG(2) << "MakeNamedShmemServerTransport called with server_name: " << server_name;
   
-  printf("DEBUG: MakeNamedShmemServerTransport - Starting for server: %s\n", server_name.c_str());
-  fflush(stdout);
-  
   // Reuse existing auth context if available, otherwise create one
   auto auth_ctx = server_channel_args.GetObjectRef<grpc_auth_context>();
   if (auth_ctx == nullptr) {
-    printf("DEBUG: MakeNamedShmemServerTransport - No auth context provided, creating new one\n");
-    fflush(stdout);
+    VLOG(2) << "No auth context provided, creating new one";
     auth_ctx = MakeShmemAuthContext();
-    printf("DEBUG: MakeNamedShmemServerTransport - Created auth context: %p\n", auth_ctx.get());
-    fflush(stdout);
+    VLOG(2) << "Created auth context: " << auth_ctx.get();
   } else {
-    printf("DEBUG: MakeNamedShmemServerTransport - Reusing provided auth context: %p\n", auth_ctx.get());
-    fflush(stdout);
+    VLOG(2) << "Reusing provided auth context: " << auth_ctx.get();
   }
   
   // Force ring mode for cross-process server and include auth context
@@ -1752,8 +1675,7 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
   VLOG(2) << "Creating new segment...";
   auto s = grpc_shmem::ShmemSegment::Create(cfg);
   
-  printf("DEBUG: Created segment, checking control block...\n");
-  fflush(stdout);
+  VLOG(2) << "Created segment, checking control block...";
   if (s.control() == nullptr) {
     LOG(ERROR) << "Failed to create named shmem segment: " << cfg.name;
     return nullptr;
@@ -1790,8 +1712,7 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   
   auto segment = grpc_shmem::ShmemSegment::Open(segment_name);
   
-  printf("DEBUG: Segment opened, control block: %p\n", segment.control());
-  fflush(stdout);
+  VLOG(2) << "Segment opened, control block: " << segment.control();
   if (segment.control() == nullptr) {
     LOG(ERROR) << "Failed to connect to shmem server: " << server_name;
     return nullptr;
@@ -1803,8 +1724,7 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   
   auto segment_ptr = std::make_unique<grpc_shmem::ShmemSegment>(std::move(segment));
   
-  printf("DEBUG: About to store segment and create client transport\n");
-  fflush(stdout);
+  VLOG(2) << "About to store segment and create client transport";
   
   // Store segment for cleanup
   StoreCrossProcessSegment(cb, std::move(segment_ptr));

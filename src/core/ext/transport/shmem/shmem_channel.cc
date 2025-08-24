@@ -118,16 +118,13 @@ RefCountedPtr<Channel> MakeShmemChannel(
     Server* server, ChannelArgs client_channel_args) {
   // 1) Build the transport pair using distinct server and client ChannelArgs.
   // Add auth context to server args since shmem doesn't do handshakes like TCP
-  printf("DEBUG: MakeShmemChannel - Starting\n");
-  fflush(stdout);
+  VLOG(2) << "MakeShmemChannel starting";
   
   auto auth_ctx = MakeShmemAuthContext();
-  printf("DEBUG: MakeShmemChannel - Created auth context: %p\n", auth_ctx.get());
-  fflush(stdout);
+  VLOG(2) << "Created auth context: " << auth_ctx.get();
   
   auto server_args_with_auth = server->channel_args().SetObject(auth_ctx);
-  printf("DEBUG: MakeShmemChannel - Added auth context to server args\n");
-  fflush(stdout);
+  VLOG(2) << "Added auth context to server args";
   
   auto transports = MakeShmemTransportPair(server_args_with_auth, client_channel_args);
   auto client_transport = std::move(transports.first);
@@ -137,10 +134,9 @@ RefCountedPtr<Channel> MakeShmemChannel(
   auto setup_args = server_args_with_auth
       .Remove(GRPC_ARG_MAX_CONNECTION_IDLE_MS)
       .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS);
-  printf("DEBUG: MakeShmemChannel - About to call SetupTransport\n");
+  VLOG(2) << "About to call SetupTransport";
   auto setup_auth_ctx = setup_args.GetObjectRef<grpc_auth_context>();
-  printf("DEBUG: MakeShmemChannel - Auth context in setup args: %p\n", setup_auth_ctx.get());
-  fflush(stdout);
+  VLOG(2) << "Auth context in setup args: " << setup_auth_ctx.get();
   
   auto error = server->SetupTransport(
       server_transport.get(),
