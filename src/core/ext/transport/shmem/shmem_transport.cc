@@ -217,13 +217,10 @@ class ShmemClientTransport final : public ClientTransport {
     if (reader_started_.load(std::memory_order_acquire)) {
       if (cb_ != nullptr) {
         try {
-          // Wake any waiting reader so it can observe stop_ and exit
-          if (cb_) {
-            // Client only needs to wake its own S2C reader thread
-            // Do NOT wake C2S as that disturbs the server
-            if (cb_->s2c_sem_name[0] != '\0') {
-              s2c_cross_sem_.post();
-            }
+          // CLIENT: Only wake S2C reader thread (client reads S2C responses)
+          // Do NOT wake C2S as that disturbs the server
+          if (cb_->s2c_sem_name[0] != '\0') {
+            s2c_cross_sem_.post();
           }
         } catch (const std::exception& e) {
           LOG(ERROR) << "Error waking semaphores: " << e.what();
@@ -560,22 +557,25 @@ class ShmemServerTransport final : public ServerTransport {
     // Only post semaphores if the ring server loop was actually started
     if (reader_started_.load(std::memory_order_acquire)) {
       if (cb_ != nullptr) {
-        // Wake any waiting reader thread so it can observe stop_ and exit
-        if (cb_) {
-          // Wake both directions using cross-process semaphores
+        try {
+          // SERVER: Only wake C2S reader thread (server reads from C2S queue)  
+          // Do NOT wake S2C as that is for the client
           if (cb_->c2s_sem_name[0] != '\0') {
             c2s_cross_sem_.post();
           }
-          if (cb_->s2c_sem_name[0] != '\0') {
-            s2c_cross_sem_.post();
-          }
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "Error waking semaphores: " << e.what();
         }
       }
       
       if (reader_.joinable()) {
-        LOG(INFO) << "ShmemServerTransport waiting for reader thread to exit";
-        reader_.join();
-        LOG(INFO) << "ShmemServerTransport reader thread joined successfully";
+        try {
+          LOG(INFO) << "ShmemServerTransport waiting for reader thread to exit";
+          reader_.join();
+          LOG(INFO) << "ShmemServerTransport reader thread joined successfully";
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "Error joining reader thread: " << e.what();
+        }
       }
     }
   }
