@@ -59,7 +59,8 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
     // Strategy 1: Try normal contiguous allocation first
     if (offset + size <= rb->capacity) {
       const uint64_t new_head = head + size;
-      if (rb->head.compare_exchange_weak(const_cast<uint64_t&>(head), new_head,
+      uint64_t expected = head;
+      if (rb->head.compare_exchange_weak(expected, new_head,
                                          std::memory_order_release,
                                          std::memory_order_relaxed)) {
         *out_offset = offset;
@@ -78,7 +79,8 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
       const uint64_t new_head = head + required_tail_advancement + size;
       
       if (new_head - tail <= rb->capacity) {
-        if (rb->head.compare_exchange_weak(const_cast<uint64_t&>(head), new_head,
+        uint64_t expected = head;
+        if (rb->head.compare_exchange_weak(expected, new_head,
                                            std::memory_order_release,
                                            std::memory_order_relaxed)) {
           *out_offset = 0;
@@ -93,7 +95,8 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
       // Reset ring to minimize fragmentation
       const uint64_t current_tail = rb->tail.load(std::memory_order_acquire);
       const uint64_t new_tail = current_tail + (used / 2);
-      if (rb->tail.compare_exchange_weak(const_cast<uint64_t&>(current_tail), new_tail,
+      uint64_t expected_tail = current_tail;
+      if (rb->tail.compare_exchange_weak(expected_tail, new_tail,
                                          std::memory_order_acq_rel,
                                          std::memory_order_relaxed)) {
         // Force a fresh attempt after compaction
@@ -126,7 +129,8 @@ bool ReserveWrapping(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset) {
     if (used + size <= rb->capacity) {
       // We have enough space, reserve it (may wrap)
       const uint64_t new_head = head + size;
-      if (rb->head.compare_exchange_weak(const_cast<uint64_t&>(head), new_head,
+      uint64_t expected = head;
+      if (rb->head.compare_exchange_weak(expected, new_head,
                                          std::memory_order_release,
                                          std::memory_order_relaxed)) {
         *out_offset = head % rb->capacity;
@@ -174,24 +178,25 @@ static inline void Wait(ControlBlock* cb, Direction dir, grpc_shmem::TransportSe
 
 bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
                  const Command& cmd, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
-  const char* dir_name = (dir == Direction::kC2S) ? "C2S" : "S2C";
-  VLOG(3) << "PushCommand " << dir_name << " - queue empty: " << (q->command_q.empty() ? "true" : "false");
-  
-  // Check if queue was empty before pushing - if so, we need to signal
+  // Check if queue was empty before pushing
   const bool was_empty = q->command_q.empty();
   const bool ok = q->command_q.push(cmd);
-  VLOG(3) << "PushCommand " << dir_name << " - push result: " << (ok ? "success" : "failed");
-  
-  if (ok && was_empty) {
-    // Memory barrier to ensure command is visible before posting
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    
-    // Always post when queue transitions from empty to non-empty
-    // This ensures reliable event-driven wakeup regardless of timing races
-    VLOG(3) << "PushCommand " << dir_name << " - queue was empty, posting semaphore (event-driven)";
+  if (!ok) return false;
+
+  // Publish the command before checking conditions
+  std::atomic_thread_fence(std::memory_order_release);
+
+  // Get waiter flag for this direction
+  std::atomic<uint32_t>* waiters =
+      (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
+
+  // Post if: (1) peer declared it's sleeping, OR (2) queue was empty (to handle startup)
+  // This hybrid approach should eliminate both race conditions and startup issues
+  if (waiters->load(std::memory_order_acquire) != 0 || was_empty) {
     Post(cb, dir, sem_adapter);
   }
-  return ok;
+
+  return true;
 }
 
 bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,

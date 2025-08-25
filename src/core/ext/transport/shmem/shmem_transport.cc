@@ -18,6 +18,18 @@
 #include <grpc/event_engine/event_engine.h>
 #include <unistd.h>
 
+// Force race condition with artificial delays
+#define FORCE_RACE_DELAY_US 10000  // 10ms delay to force race
+#define FORCE_RACE_CLIENT_DELAY() std::this_thread::sleep_for(std::chrono::microseconds(FORCE_RACE_DELAY_US))
+#define FORCE_RACE_SERVER_DELAY() std::this_thread::sleep_for(std::chrono::microseconds(FORCE_RACE_DELAY_US))
+
+// Server state values for cross-process synchronization
+enum class ServerState : uint32_t {
+  kNotReady = 0,
+  kReady = 1
+};
+
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -332,6 +344,7 @@ class ShmemClientTransport final : public ClientTransport {
   Mutex mu_;
   absl::flat_hash_map<uint32_t, CallHandler> handlers_ ABSL_GUARDED_BY(mu_);
   std::atomic<bool> reader_started_{false};
+  std::atomic<bool> reader_ready_{false};
 
 };
 
@@ -499,6 +512,23 @@ class ShmemServerTransport final : public ServerTransport {
     // EnsureReaderStarted();
   }
 
+  grpc_shmem::ControlBlock* GetControlBlock() const { return cb_; }
+  
+  // RACE CONDITION FIX: Allow client to wait for server readiness
+  void WaitForReady() {
+    VLOG(1) << "CLIENT: WaitForReady called";
+    MutexLock rl(&ready_mu_);
+    if (!ready_) {
+      VLOG(1) << "CLIENT: Server not ready, waiting...";
+      while (!ready_) {
+        ready_cv_.Wait(&ready_mu_);
+      }
+      VLOG(1) << "CLIENT: Server is now ready";
+    } else {
+      VLOG(1) << "CLIENT: Server already ready";
+    }
+  }
+  
   void SetCallDestination(RefCountedPtr<UnstartedCallDestination> h) override {
     MutexLock lock(&dest_mu_);
     dest_ = std::move(h);
@@ -507,12 +537,6 @@ class ShmemServerTransport final : public ServerTransport {
     MutexLock l(&state_tracker_mu_);
     state_tracker_.SetState(GRPC_CHANNEL_READY, absl::OkStatus(),
                             "accept function set");
-    // Wake any announcers waiting for the destination.
-    {
-      MutexLock rl(&ready_mu_);
-      ready_ = true;
-      ready_cv_.SignalAll();
-    }
     
   // Start the reader thread since the server is ready to accept calls.
   // Note: Do NOT override the accept_stream callback here; the core will
@@ -522,6 +546,8 @@ class ShmemServerTransport final : public ServerTransport {
   LOG(INFO) << "SetCallDestination called - starting reader thread";
 
     EnsureReaderStarted();
+    
+    // Note: Readiness signaling moved to ServerLoop after thread is actually ready to read
   }
 
   void Orphan() override {
@@ -726,6 +752,7 @@ class ShmemServerTransport final : public ServerTransport {
           call_initiator.PullServerInitialMetadata(),
           [this, stream_id](std::optional<ServerMetadataHandle> md) {
             if (md.has_value()) {
+              // Server response delay removed - testing other locations
               VLOG(1) << "SERVER: Sending S2C_INITIAL_METADATA stream_id=" << stream_id;
               std::vector<grpc_shmem::KVPair> kvs;
               kvs.push_back({"content-type", "application/grpc"});
@@ -885,6 +912,8 @@ class ShmemServerTransport final : public ServerTransport {
       }
       loop_count++;
       
+      // Delay removed to test next point
+      
       // Log every 100 iterations to show server is alive
       if (loop_count % 100 == 0) {
         VLOG(3) << "ServerLoop: Iteration " << loop_count << ", checking for commands";
@@ -902,6 +931,10 @@ class ShmemServerTransport final : public ServerTransport {
           &cmd, sem_adapter_.get());
       
       if (has_command) {
+        // DELAY TEST POINT 4: After receiving first command
+        if (loop_count == 1) {
+          FORCE_RACE_SERVER_DELAY();
+        }
         VLOG(2) << "ServerLoop: Got command type " << static_cast<int>(cmd.type) 
                 << " for stream " << cmd.stream_id << " (iteration " << loop_count << ")";
       } else {
@@ -1421,14 +1454,24 @@ void ShmemServerTransport::PerformFinalCleanup() {
 
 void ShmemClientTransport::EnsureReaderStarted() {
   if (cb_ == nullptr) {
+    LOG(WARNING) << "CLIENT: EnsureReaderStarted called with null cb_";
     return;
   }
   // Always start S2C reader for cross-process communication
+  LOG(INFO) << "CLIENT: EnsureReaderStarted called";
   if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
+    LOG(INFO) << "CLIENT: Starting new S2C reader thread";
     stop_.store(false, std::memory_order_relaxed);
+    reader_ready_.store(false, std::memory_order_relaxed);
     reader_ = std::thread([this] {
       ExecCtx exec_ctx;
       if (server_ != nullptr) spin_iters_ = server_->spin_iters();
+      
+      // No artificial client delay needed with proper server readiness signaling
+      
+      // Signal that the reader thread is ready
+      reader_ready_.store(true, std::memory_order_release);
+      
       int client_loop_count = 0;
       for (;;) {
         if (stop_.load(std::memory_order_relaxed)) {
@@ -1535,11 +1578,12 @@ void ShmemClientTransport::EnsureReaderStarted() {
 void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
   EnsureReaderStarted();  // Start S2C reader for all RPCs
   
+  // Client delay removed to test server delay
+  
   // CRITICAL FIX: Use a process-unique stream ID that includes PID and timestamp
   // to avoid reuse across benchmark iterations and multiple processes
   static std::atomic<uint64_t> unique_counter{1};
   auto stream_id = (static_cast<uint64_t>(getpid()) << 32) | unique_counter.fetch_add(1, std::memory_order_relaxed);
-  
   VLOG(1) << "CLIENT: StartCall stream_id=" << stream_id;
   
   // Always insert handler for S2C reader delivery
