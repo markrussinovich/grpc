@@ -95,7 +95,7 @@ enum class FrameType : uint8_t {
 // A fixed-size command describing an action for the peer to take, with any
 // payload referenced via an offset into the DataRingBuffer.
 struct Command {
-  uint32_t stream_id;
+  uint64_t stream_id;
   FrameType type;
   // For MESSAGE and METADATA frames, points into the data ring buffer.
   uint64_t data_offset;

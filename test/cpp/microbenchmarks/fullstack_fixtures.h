@@ -31,6 +31,9 @@
 #include <grpcpp/server_builder.h>
 
 #include "absl/log/check.h"
+#include "absl/strings/str_cat.h"
+#include <atomic>
+#include <sstream>
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/chttp2/transport/chttp2_transport.h"
 #include "src/core/ext/transport/shmem/shmem_transport.h" // from grpc_transport_shmem
@@ -169,8 +172,17 @@ class ShmemTransport : public FullstackFixture {
   explicit ShmemTransport(Service* service,
                          const FixtureConfiguration& fixture_configuration =
                              FixtureConfiguration())
-      : FullstackFixture(service, fixture_configuration, "shmem://benchmark") {}
+      : FullstackFixture(service, fixture_configuration, GenerateUniqueServerAddress()) {}
   ~ShmemTransport() override {}
+  
+ private:
+  static std::string GenerateUniqueServerAddress() {
+    static std::atomic<uint64_t> counter{0};
+    uint64_t id = counter.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream thread_id_stream;
+    thread_id_stream << std::this_thread::get_id();
+    return absl::StrCat("shmem://benchmark_", thread_id_stream.str(), "_", id);
+  }
 };
 
 class EndpointPairFixture : public BaseFixture {
