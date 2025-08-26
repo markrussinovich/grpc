@@ -45,6 +45,7 @@ enum class ServerState : uint32_t {
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/time.h"
 #include "src/core/call/call_arena_allocator.h"
 #include "src/core/call/metadata.h"
 #include "src/core/ext/transport/shmem/shmem_framer.h"
@@ -56,10 +57,12 @@ enum class ServerState : uint32_t {
 #include "src/core/lib/promise/map.h"
 #include "src/core/lib/promise/promise.h"
 #include "src/core/lib/promise/try_seq.h"
+#include "src/core/lib/promise/seq.h"
 #include "src/core/lib/promise/for_each.h"
 #include "src/core/lib/promise/status_flag.h"
 #include "src/core/lib/resource_quota/resource_quota.h"
 #include "src/core/lib/slice/slice.h"
+#include "src/core/lib/slice/slice_buffer.h"
 #include "src/core/lib/transport/connectivity_state.h"
 #include "src/core/lib/transport/transport.h"
 #include "src/core/channelz/channelz.h"
@@ -71,6 +74,79 @@ enum class ServerState : uint32_t {
 #include "absl/log/log.h"
 
 // Legacy stream-op scaffolding removed: this transport uses promise-based APIs exclusively.
+
+// Blocking reserve with empty-ring fast wrap support
+static void WaitReserveWithEmptyWrap(grpc_shmem::ShmemQueues* q,
+                                     grpc_shmem::ControlBlock* cb,
+                                     grpc_shmem::Direction dir,
+                                     grpc_shmem::TransportSemaphoreAdapter* sem,
+                                     grpc_shmem::DataRingBuffer* rb,
+                                     uint32_t size,
+                                     uint64_t* out_off,
+                                     uint32_t* out_pad,
+                                     const char* tag) {
+  for (;;) {
+    if (grpc_shmem::ReserveForWrite(rb, size, out_off, out_pad)) return;
+
+    // Snapshot for empty-ring fast wrap
+    const uint64_t cap = rb->capacity;
+    uint64_t head = rb->head.load(std::memory_order_relaxed);
+    uint64_t tail = rb->tail.load(std::memory_order_acquire);
+    uint64_t used = head - tail;
+    uint64_t end_off = head % cap;
+    uint64_t free_to_end = cap - end_off;
+
+    // EMPTY-RING FAST WRAP: realign to offset 0
+    if (used == 0 && end_off != 0 && size > free_to_end && size <= cap) {
+      // Step 1: commit pad by advancing head by free_to_end
+      uint64_t expected = head;
+      if (rb->head.compare_exchange_weak(expected, head + free_to_end,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_relaxed)) {
+        // Step 2: emit PAD so the reader advances tail by free_to_end
+        grpc_shmem::Command pad{};
+        pad.stream_id = 0;
+        pad.type = grpc_shmem::FrameType::DATA_PAD;
+        pad.data_offset = 0;
+        pad.data_size = static_cast<uint32_t>(free_to_end);
+        VLOG(1) << "[EMPTY WRAP] emit PAD=" << free_to_end
+                << " head_before=" << head;
+        grpc_shmem::PushCommand(q, cb, dir, pad, sem);
+
+        // Wait until tail catches up (PAD applied)
+        const uint64_t target = tail + free_to_end;
+        while (rb->tail.load(std::memory_order_acquire) < target) {
+          std::this_thread::yield();
+        }
+        // Now head%cap==0, used==0 -> try reserve again
+        continue;
+      }
+      // CAS failed — loop and retry
+      continue;
+    }
+
+    // Not the empty-ring wrap case; standard backoff
+    std::this_thread::yield();
+  }
+}
+
+// Watchdog helper for blocking reserve operations
+static void WaitReserveWithWatchdog(grpc_shmem::DataRingBuffer* rb, uint32_t size,
+                                    uint64_t* off, uint32_t* pad, const char* tag) {
+  auto t0 = absl::Now();
+  for (;;) {
+    if (grpc_shmem::ReserveForWrite(rb, size, off, pad)) return;
+    if (absl::Now() - t0 > absl::Milliseconds(200)) {
+      VLOG(1) << "[RESERVE STALL] " << tag
+              << " size=" << size
+              << " head=" << rb->head.load(std::memory_order_relaxed)
+              << " tail=" << rb->tail.load(std::memory_order_acquire)
+              << " cap="  << rb->capacity;
+      t0 = absl::Now();  // log again every 200ms if it persists
+    }
+    std::this_thread::yield();
+  }
+}
 
 // Helper to build a valid shmem auth context
 static grpc_core::RefCountedPtr<grpc_auth_context> MakeShmemAuthContext() {
@@ -335,6 +411,13 @@ class ShmemClientTransport final : public ClientTransport {
   
   // Semaphore adapter for queue operations
   std::unique_ptr<grpc_shmem::TransportSemaphoreAdapter> sem_adapter_;
+  
+  // For reassembling chunked S2C messages by stream ID
+  struct StreamChunkState {
+    grpc_core::SliceBuffer accumulator;
+    bool accumulating = false;
+  };
+  std::unordered_map<uint32_t, StreamChunkState> s2c_chunk_accumulators_;
 
   Mutex state_mu_;
   ConnectivityStateTracker state_tracker_
@@ -757,17 +840,20 @@ class ShmemServerTransport final : public ServerTransport {
               std::vector<grpc_shmem::KVPair> kvs;
               kvs.push_back({"content-type", "application/grpc"});
               auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
-              uint64_t off = 0;
-              if (grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb, buf.size(), &off)) {
-                std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off, buf.data(), buf.size());
-                grpc_shmem::Command out{};
-                out.stream_id = stream_id;
-                out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
-                out.data_offset = off;
-                out.data_size = static_cast<uint32_t>(buf.size());
-                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
-                VLOG(3) << "ShmemCallOutboundLoop: S2C_INITIAL_METADATA sent for stream " << stream_id;
+              uint64_t off = 0; uint32_t pad = 0;
+              WaitReserveWithWatchdog(&cb_->GetS2CQueues()->data_rb, buf.size(), &off, &pad, "S2C_INITIAL_METADATA");
+              VLOG(1) << "[RESERVE OK] S2C_INITIAL_METADATA off=" << off
+                      << " size=" << buf.size() << " pad=" << pad;
+              std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off, buf.data(), buf.size());
+              std::atomic_thread_fence(std::memory_order_release);
+              if (pad) {
+                VLOG(1) << "EMIT PAD dir=S2C bytes=" << pad;
+                grpc_shmem::Command pad_cmd{0, grpc_shmem::FrameType::DATA_PAD, 0, pad, 0, 0};
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, pad_cmd, sem_adapter_.get());
               }
+              grpc_shmem::Command out{stream_id, grpc_shmem::FrameType::S2C_INITIAL_METADATA, off, (uint32_t)buf.size(), 0, 0};
+              grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
+              VLOG(3) << "ShmemCallOutboundLoop: S2C_INITIAL_METADATA sent for stream " << stream_id;
             }
             return Success{};
           }
@@ -778,16 +864,105 @@ class ShmemServerTransport final : public ServerTransport {
             const size_t n = payload->Length();
             if (n == 0) return Success{};  // nothing to send
             VLOG(2) << "ShmemCallOutboundLoop: sending S2C_MESSAGE for stream " << stream_id << ", size=" << n;
-            uint64_t off = 0;
-            if (grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb, n, &off)) {
-              payload->CopyToBuffer(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off);
+            
+            auto* rb = &cb_->GetS2CQueues()->data_rb;
+            
+            // Check if message fits in ring buffer capacity
+            if (n <= rb->capacity) {
+              // Normal path: fits in one frame
+              uint64_t off = 0;
+              uint32_t pad = 0;
+              WaitReserveWithWatchdog(rb, n, &off, &pad, "S2C_MESSAGE");
+              VLOG(1) << "[RESERVE OK] S2C_MESSAGE off=" << off
+                      << " size=" << n << " pad=" << pad;
+              unsigned char* base = rb->GetBuffer(cb_);
+              payload->CopyToBuffer(base + off);
+
+              // Ensure the data is visible before announcing it
+              std::atomic_thread_fence(std::memory_order_release);
+
+              if (pad) {
+                VLOG(1) << "EMIT PAD dir=S2C bytes=" << pad;
+                grpc_shmem::Command pad_cmd{};
+                pad_cmd.stream_id = 0;
+                pad_cmd.type = grpc_shmem::FrameType::DATA_PAD;
+                pad_cmd.data_offset = 0;
+                pad_cmd.data_size = pad;
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                        grpc_shmem::Direction::kS2C,
+                                        pad_cmd, sem_adapter_.get());
+              }
+
               grpc_shmem::Command out{};
               out.stream_id = stream_id;
               out.type = grpc_shmem::FrameType::S2C_MESSAGE;
               out.data_offset = off;
               out.data_size = static_cast<uint32_t>(n);
-              grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
+              grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                      grpc_shmem::Direction::kS2C,
+                                      out, sem_adapter_.get());
               VLOG(3) << "ShmemCallOutboundLoop: S2C_MESSAGE sent for stream " << stream_id;
+            } else {
+              // Chunking path: message exceeds ring capacity
+              VLOG(1) << "ShmemCallOutboundLoop: chunking S2C_MESSAGE for stream " << stream_id 
+                      << ", size=" << n << " > capacity=" << rb->capacity;
+              
+              // Copy entire payload to temporary buffer once
+              std::vector<uint8_t> temp_buf(n);
+              payload->CopyToBuffer(temp_buf.data());
+              
+              const uint64_t chunk_size = rb->capacity - 65536; // 64KB headroom for PAD
+              uint64_t remaining = n;
+              uint64_t src_offset = 0;
+              
+              while (remaining > 0) {
+                const uint64_t this_chunk = std::min(remaining, chunk_size);
+                const bool is_last_chunk = (remaining == this_chunk);
+                
+                VLOG(2) << "ShmemCallOutboundLoop: sending S2C chunk stream=" << stream_id
+                        << " chunk_size=" << this_chunk << " remaining_after=" << (remaining - this_chunk)
+                        << " is_last=" << is_last_chunk;
+                
+                uint64_t off = 0;
+                uint32_t pad = 0;
+                WaitReserveWithEmptyWrap(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C,
+                                         sem_adapter_.get(),
+                                         rb, this_chunk, &off, &pad, "S2C_MESSAGE_CHUNK");
+                VLOG(1) << "[RESERVE OK] S2C_MESSAGE_CHUNK off=" << off
+                        << " size=" << this_chunk << " pad=" << pad;
+                unsigned char* base = rb->GetBuffer(cb_);
+                
+                // Copy chunk data
+                std::memcpy(base + off, temp_buf.data() + src_offset, this_chunk);
+                std::atomic_thread_fence(std::memory_order_release);
+                
+                if (pad) {
+                  VLOG(1) << "EMIT PAD dir=S2C bytes=" << pad;
+                  grpc_shmem::Command pad_cmd{};
+                  pad_cmd.stream_id = 0;
+                  pad_cmd.type = grpc_shmem::FrameType::DATA_PAD;
+                  pad_cmd.data_offset = 0;
+                  pad_cmd.data_size = pad;
+                  grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                          grpc_shmem::Direction::kS2C,
+                                          pad_cmd, sem_adapter_.get());
+                }
+                
+                grpc_shmem::Command chunk_cmd{};
+                chunk_cmd.stream_id = stream_id;
+                chunk_cmd.type = is_last_chunk ? grpc_shmem::FrameType::S2C_MESSAGE_CHUNK_LAST 
+                                               : grpc_shmem::FrameType::S2C_MESSAGE_CHUNK;
+                chunk_cmd.data_offset = off;
+                chunk_cmd.data_size = static_cast<uint32_t>(this_chunk);
+                grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
+                                        grpc_shmem::Direction::kS2C,
+                                        chunk_cmd, sem_adapter_.get());
+                
+                src_offset += this_chunk;
+                remaining -= this_chunk;
+              }
+              
+              VLOG(3) << "ShmemCallOutboundLoop: S2C_MESSAGE chunking complete for stream " << stream_id;
             }
             return Success{};
           }
@@ -806,17 +981,20 @@ class ShmemServerTransport final : public ServerTransport {
             }
             kvs.push_back({"grpc-status", std::to_string(status)});
             auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
-            uint64_t off = 0;
-            if (grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb, buf.size(), &off)) {
-              std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off, buf.data(), buf.size());
-              grpc_shmem::Command out{};
-              out.stream_id = stream_id;
-              out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
-              out.data_offset = off;
-              out.data_size = static_cast<uint32_t>(buf.size());
-              grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
-              VLOG(3) << "ShmemCallOutboundLoop: S2C_TRAILING_METADATA sent for stream " << stream_id;
+            uint64_t off = 0; uint32_t pad = 0;
+            WaitReserveWithWatchdog(&cb_->GetS2CQueues()->data_rb, buf.size(), &off, &pad, "S2C_TRAILING_METADATA");
+            VLOG(1) << "[RESERVE OK] S2C_TRAILING_METADATA off=" << off
+                    << " size=" << buf.size() << " pad=" << pad;
+            std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + off, buf.data(), buf.size());
+            std::atomic_thread_fence(std::memory_order_release);
+            if (pad) {
+              VLOG(1) << "EMIT PAD dir=S2C bytes=" << pad;
+              grpc_shmem::Command pad_cmd{0, grpc_shmem::FrameType::DATA_PAD, 0, pad, 0, 0};
+              grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, pad_cmd, sem_adapter_.get());
             }
+            grpc_shmem::Command out{stream_id, grpc_shmem::FrameType::S2C_TRAILING_METADATA, off, (uint32_t)buf.size(), 0, 0};
+            grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, out, sem_adapter_.get());
+            VLOG(3) << "ShmemCallOutboundLoop: S2C_TRAILING_METADATA sent for stream " << stream_id;
             // Clean up stream tracking after sending trailing metadata
             {
               MutexLock lock(&stream_initiators_mu_);
@@ -834,6 +1012,12 @@ class ShmemServerTransport final : public ServerTransport {
     
     // Validate ControlBlock before use
     VLOG(2) << "ServerLoop starting, cb_=" << cb_;
+    
+    LOG(INFO) << "Wire values: C2S_CHUNK=" << static_cast<int>(grpc_shmem::FrameType::C2S_MESSAGE_CHUNK)
+              << " C2S_CHUNK_LAST=" << static_cast<int>(grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST)
+              << " S2C_CHUNK=" << static_cast<int>(grpc_shmem::FrameType::S2C_MESSAGE_CHUNK)
+              << " S2C_CHUNK_LAST=" << static_cast<int>(grpc_shmem::FrameType::S2C_MESSAGE_CHUNK_LAST)
+              << " DATA_PAD=" << static_cast<int>(grpc_shmem::FrameType::DATA_PAD);
     
     if (!cb_) {
       LOG(ERROR) << "FATAL - cb_ is null!";
@@ -899,6 +1083,10 @@ class ShmemServerTransport final : public ServerTransport {
       bool cancelled = false;      // cancellation observed
       std::string path;            // :path from client initial metadata
       std::optional<CallInitiator> initiator;  // call initiator for server communication
+      
+      // For reassembling chunked C2S messages (copied slices, not ring-backed)
+      grpc_core::SliceBuffer c2s_copied_accumulator;
+      bool c2s_copy_accumulating = false;
     };
 
     // Simplified ring-based approach - no complex dispatched call logic needed
@@ -946,8 +1134,26 @@ class ShmemServerTransport final : public ServerTransport {
       }
 
       if (has_command) {
-        VLOG(2) << "Processing command in switch statement";
+        VLOG(1) << "SERVER: POP cmd=" << static_cast<int>(cmd.type)
+                << " stream=" << cmd.stream_id
+                << " size=" << cmd.data_size;
+        
+        // Handle DATA_PAD before stream lookup
+        if (cmd.type == grpc_shmem::FrameType::DATA_PAD) {
+          // No stream; just free the padded bytes.
+          VLOG(1) << "APPLY PAD dir=C2S bytes=" << cmd.data_size
+                  << " tail_before=" << cb_->GetC2SQueues()->data_rb.tail.load(std::memory_order_relaxed);
+          cb_->GetC2SQueues()->data_rb.tail.fetch_add(
+              cmd.data_size, std::memory_order_release);
+          continue;
+        }
+        
         auto& st = streams[cmd.stream_id];
+        
+        VLOG(1) << "[SERVER C2S RB] rb=" << &cb_->GetC2SQueues()->data_rb
+                << " head=" << cb_->GetC2SQueues()->data_rb.head.load(std::memory_order_relaxed)
+                << " tail=" << cb_->GetC2SQueues()->data_rb.tail.load(std::memory_order_relaxed);
+        
         switch (cmd.type) {
           case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
             VLOG(1) << "SERVER: Received C2S_INITIAL_METADATA stream_id=" << cmd.stream_id;
@@ -1064,17 +1270,17 @@ class ShmemServerTransport final : public ServerTransport {
                 std::vector<grpc_shmem::KVPair> initial_kvs = {
                     {"content-type", "application/grpc"}, {"x-shmem", "1"}};
                 auto initial_buf = grpc_shmem::SerializeMetadataKVs(initial_kvs);
-                uint64_t initial_off = 0;
-                grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
-                                              initial_buf.size(), &initial_off);
+                uint64_t initial_off = 0; uint32_t initial_pad = 0;
+                WaitReserveWithWatchdog(&cb_->GetS2CQueues()->data_rb, initial_buf.size(), &initial_off, &initial_pad, "S2C_INITIAL_METADATA_SYNTHETIC");
                 std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + initial_off,
                             initial_buf.data(), initial_buf.size());
-                grpc_shmem::Command initial_out{};
-                initial_out.stream_id = cmd.stream_id;
-                initial_out.type = grpc_shmem::FrameType::S2C_INITIAL_METADATA;
-                initial_out.data_offset = initial_off;
-                initial_out.data_size = static_cast<uint32_t>(initial_buf.size());
-                initial_out.grpc_status_code = 0;
+                std::atomic_thread_fence(std::memory_order_release);
+                if (initial_pad) {
+                  VLOG(1) << "EMIT PAD dir=S2C bytes=" << initial_pad;
+                  grpc_shmem::Command pad_cmd{0, grpc_shmem::FrameType::DATA_PAD, 0, initial_pad, 0, 0};
+                  grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, pad_cmd, sem_adapter_.get());
+                }
+                grpc_shmem::Command initial_out{cmd.stream_id, grpc_shmem::FrameType::S2C_INITIAL_METADATA, initial_off, (uint32_t)initial_buf.size(), 0, 0};
                 grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
                                         grpc_shmem::Direction::kS2C, initial_out, sem_adapter_.get());
                 
@@ -1084,11 +1290,17 @@ class ShmemServerTransport final : public ServerTransport {
                 response_msg.push_back(0x0A);  // field 1, wire type 2 (length-delimited)
                 response_msg.push_back(static_cast<char>(msg_content.size()));  // length
                 response_msg.append(msg_content);  // string data
-                uint64_t msg_off = 0;
-                if (grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
-                                                 response_msg.size(), &msg_off)) {
+                uint64_t msg_off = 0; uint32_t msg_pad = 0;
+                if (grpc_shmem::ReserveForWrite(&cb_->GetS2CQueues()->data_rb,
+                                               response_msg.size(), &msg_off, &msg_pad)) {
                   std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + msg_off,
                              response_msg.data(), response_msg.size());
+                  std::atomic_thread_fence(std::memory_order_release);
+                  if (msg_pad) {
+                    VLOG(1) << "EMIT PAD dir=S2C bytes=" << msg_pad;
+                    grpc_shmem::Command pad_cmd{0, grpc_shmem::FrameType::DATA_PAD, 0, msg_pad, 0, 0};
+                    grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, pad_cmd, sem_adapter_.get());
+                  }
                   grpc_shmem::Command msg_out{};
                   msg_out.stream_id = cmd.stream_id;
                   msg_out.type = grpc_shmem::FrameType::S2C_MESSAGE;
@@ -1103,17 +1315,17 @@ class ShmemServerTransport final : public ServerTransport {
                 std::vector<grpc_shmem::KVPair> trailing_kvs = {
                     {"grpc-status", "0"}};  // GRPC_STATUS_OK
                 auto trailing_buf = grpc_shmem::SerializeMetadataKVs(trailing_kvs);
-                uint64_t trailing_off = 0;
-                grpc_shmem::ReserveContiguous(&cb_->GetS2CQueues()->data_rb,
-                                              trailing_buf.size(), &trailing_off);
+                uint64_t trailing_off = 0; uint32_t trailing_pad = 0;
+                WaitReserveWithWatchdog(&cb_->GetS2CQueues()->data_rb, trailing_buf.size(), &trailing_off, &trailing_pad, "S2C_TRAILING_METADATA_SYNTHETIC");
                 std::memcpy(cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + trailing_off,
                             trailing_buf.data(), trailing_buf.size());
-                grpc_shmem::Command trailing_out{};
-                trailing_out.stream_id = cmd.stream_id;
-                trailing_out.type = grpc_shmem::FrameType::S2C_TRAILING_METADATA;
-                trailing_out.data_offset = trailing_off;
-                trailing_out.data_size = static_cast<uint32_t>(trailing_buf.size());
-                trailing_out.grpc_status_code = 0;  // GRPC_STATUS_OK
+                std::atomic_thread_fence(std::memory_order_release);
+                if (trailing_pad) {
+                  VLOG(1) << "EMIT PAD dir=S2C bytes=" << trailing_pad;
+                  grpc_shmem::Command pad_cmd{0, grpc_shmem::FrameType::DATA_PAD, 0, trailing_pad, 0, 0};
+                  grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, pad_cmd, sem_adapter_.get());
+                }
+                grpc_shmem::Command trailing_out{cmd.stream_id, grpc_shmem::FrameType::S2C_TRAILING_METADATA, trailing_off, (uint32_t)trailing_buf.size(), 0, 0};
                 grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
                                         grpc_shmem::Direction::kS2C, trailing_out, sem_adapter_.get());
                 
@@ -1160,8 +1372,40 @@ class ShmemServerTransport final : public ServerTransport {
             // Note: Do NOT advance C2S tail here; slice destructor will.
             break;
           }
+          case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK:
+          case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST: {
+            auto* rb = &cb_->GetC2SQueues()->data_rb;
+
+            // Copy out of the ring (don't pin)
+            const unsigned char* p = rb->GetBuffer(cb_) + cmd.data_offset;
+            grpc_core::Slice copied = grpc_core::Slice::FromCopiedBuffer(reinterpret_cast<const char*>(p),
+                                               cmd.data_size);
+            st.c2s_copied_accumulator.Append(std::move(copied));
+
+            // Free ring bytes NOW so next reserve can succeed
+            uint64_t tail0 = rb->tail.load(std::memory_order_relaxed);
+            rb->tail.fetch_add(cmd.data_size, std::memory_order_release);
+            uint64_t tail1 = rb->tail.load(std::memory_order_relaxed);
+            VLOG(1) << "[C2S FREE VERIFY] freed=" << cmd.data_size
+                       << " tail_before=" << tail0
+                       << " tail_after=" << tail1;
+
+            // On LAST, deliver one Message from the copied slices
+            if (cmd.type == grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST &&
+                st.initiator.has_value()) {
+              auto init = *st.initiator;
+              grpc_core::SliceBuffer complete = std::move(st.c2s_copied_accumulator);
+              init.SpawnInfallible("push-c2s-chunked-msg",
+                  [init, complete = std::move(complete)]() mutable {
+                    auto msg = Arena::MakePooled<Message>(std::move(complete), 0);
+                    init.SpawnPushMessage(std::move(msg));
+                    return Empty{};
+                  });
+            }
+            break;
+          }
           case grpc_shmem::FrameType::C2S_TRAILING_METADATA: {
-            VLOG(2) << "Handling C2S_TRAILING_METADATA for stream " << cmd.stream_id;
+            VLOG(1) << "SERVER: Received C2S_TRAILING_METADATA stream_id=" << cmd.stream_id;
             // Client half-close: Signal FinishSends to server pipeline
             if (st.initiator.has_value()) {
               st.initiator->SpawnFinishSends();
@@ -1179,8 +1423,12 @@ class ShmemServerTransport final : public ServerTransport {
             }
             break;
           }
-          default:
+          default: {
+            LOG(ERROR) << "[UNHANDLED FRAME] type=" << static_cast<int>(cmd.type)
+                       << " stream=" << cmd.stream_id
+                       << " size=" << cmd.data_size;
             break;
+          }
         }
         ExecCtx::Get()->Flush();
       }
@@ -1483,7 +1731,33 @@ void ShmemClientTransport::EnsureReaderStarted() {
           VLOG(2) << "CLIENT: S2C reader no command, continuing";
           continue;
         }
+        
+        // Handle DATA_PAD before trying to find a handler
+        if (cmd.type == grpc_shmem::FrameType::DATA_PAD) {
+          VLOG(1) << "APPLY PAD dir=S2C bytes=" << cmd.data_size
+                  << " tail_before=" << cb_->GetS2CQueues()->data_rb.tail.load(std::memory_order_relaxed);
+          cb_->GetS2CQueues()->data_rb.tail.fetch_add(
+              cmd.data_size, std::memory_order_release);
+          continue;
+        }
+        
         for (;;) {
+          // NEW: free S2C padding even when PAD arrives as a "next_cmd"
+          if (cmd.type == grpc_shmem::FrameType::DATA_PAD) {
+            VLOG(1) << "APPLY PAD dir=S2C bytes=" << cmd.data_size
+                    << " tail_before=" << cb_->GetS2CQueues()->data_rb.tail.load(std::memory_order_relaxed);
+            cb_->GetS2CQueues()->data_rb.tail.fetch_add(
+                cmd.data_size, std::memory_order_release);
+            // Fetch the next command to process
+            grpc_shmem::Command next_cmd;
+            if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_,
+                  grpc_shmem::Direction::kS2C, 0, &next_cmd, sem_adapter_.get())) {
+              break;  // nothing else pending
+            }
+            cmd = next_cmd;
+            continue;  // keep draining
+          }
+
           std::unique_ptr<CallHandler> handler;
           {
             MutexLock lock(&mu_);
@@ -1491,7 +1765,10 @@ void ShmemClientTransport::EnsureReaderStarted() {
             if (it != handlers_.end())
               handler = std::make_unique<CallHandler>(it->second);
           }
-          if (!handler) continue;
+          if (!handler) {
+            // No handler yet; stop draining so outer loop can fetch fresh work later.
+            break;
+          }
           switch (cmd.type) {
             case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
               VLOG(1) << "CLIENT: Received S2C_INITIAL_METADATA stream_id=" << cmd.stream_id;
@@ -1528,6 +1805,39 @@ void ShmemClientTransport::EnsureReaderStarted() {
                 h.SpawnPushMessage(std::move(msg));
                 return Empty{};
               });
+              break;
+            }
+            case grpc_shmem::FrameType::S2C_MESSAGE_CHUNK:
+            case grpc_shmem::FrameType::S2C_MESSAGE_CHUNK_LAST: {
+              VLOG(2) << "ShmemClientTransport received S2C_MESSAGE_CHUNK"
+                      << (cmd.type == grpc_shmem::FrameType::S2C_MESSAGE_CHUNK_LAST ? "_LAST" : "")
+                      << " for stream " << cmd.stream_id << ", size=" << cmd.data_size;
+
+              auto& chunk_state = s2c_chunk_accumulators_[cmd.stream_id];
+              if (!chunk_state.accumulating) {
+                chunk_state.accumulating = true;
+              }
+
+              // Copy from ring into owned slice, then immediately free ring bytes.
+              auto* rb = &cb_->GetS2CQueues()->data_rb;
+              unsigned char* src = rb->GetBuffer(cb_) + cmd.data_offset;
+              grpc_core::Slice copied = grpc_core::Slice::FromCopiedBuffer(
+                  reinterpret_cast<const char*>(src), cmd.data_size);
+              chunk_state.accumulator.Append(std::move(copied));
+              rb->tail.fetch_add(cmd.data_size, std::memory_order_release);
+
+              if (cmd.type == grpc_shmem::FrameType::S2C_MESSAGE_CHUNK_LAST) {
+                VLOG(2) << "S2C_MESSAGE_CHUNK_LAST: assembling complete message (copied) for stream "
+                        << cmd.stream_id;
+                grpc_core::SliceBuffer complete = std::move(chunk_state.accumulator);
+                s2c_chunk_accumulators_.erase(cmd.stream_id);
+                handler->SpawnInfallible("push-chunked-msg",
+                    [h = *handler, complete = std::move(complete)]() mutable {
+                      auto msg = Arena::MakePooled<Message>(std::move(complete), 0);
+                      h.SpawnPushMessage(std::move(msg));
+                      return Empty{};
+                    });
+              }
               break;
             }
             case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
@@ -1576,6 +1886,8 @@ void ShmemClientTransport::EnsureReaderStarted() {
 }
 
 void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
+  ExecCtx exec_ctx;  // CRITICAL: Ensure SpawnGuarded tasks actually execute
+  VLOG(1) << "CLIENT: StartCall scheduling send pipelines";
   EnsureReaderStarted();  // Start S2C reader for all RPCs
   
   // Client delay removed to test server delay
@@ -1626,21 +1938,19 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                }
 
                auto vec = grpc_shmem::SerializeMetadataKVs(kvs);
-               uint64_t off = 0;
-               grpc_shmem::ReserveContiguous(&cb->GetC2SQueues()->data_rb,
-                                             vec.size(), &off);
-               VLOG(3) << "About to memcpy metadata to ring buffer, off=" << off << ", size=" << vec.size();
-               std::memcpy(cb->GetC2SQueues()->data_rb.GetBuffer(cb) + off,
-                           vec.data(), vec.size());
-               VLOG(3) << "memcpy completed, creating command";
-               grpc_shmem::Command cmd{};
-               cmd.stream_id = stream_id;
-               cmd.type = grpc_shmem::FrameType::C2S_INITIAL_METADATA;
-               cmd.data_offset = off;
-               cmd.data_size = static_cast<uint32_t>(vec.size());
-               VLOG(3) << "About to push command to C2S queue";
-               grpc_shmem::PushCommand(cb->GetC2SQueues(), cb,
-                                       grpc_shmem::Direction::kC2S, cmd, sem_adapter_.get());
+               uint64_t off = 0; uint32_t pad = 0;
+               WaitReserveWithWatchdog(&cb->GetC2SQueues()->data_rb, vec.size(), &off, &pad, "C2S_INITIAL_METADATA");
+               VLOG(1) << "[RESERVE OK] C2S_INITIAL_METADATA off=" << off
+                       << " size=" << vec.size() << " pad=" << pad;
+               std::memcpy(cb->GetC2SQueues()->data_rb.GetBuffer(cb) + off, vec.data(), vec.size());
+               std::atomic_thread_fence(std::memory_order_release);
+               if (pad) {
+                 VLOG(1) << "EMIT PAD dir=C2S bytes=" << pad;
+                 grpc_shmem::Command pad_cmd{0, grpc_shmem::FrameType::DATA_PAD, 0, pad, 0, 0};
+                 grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S, pad_cmd, sem_adapter_.get());
+               }
+               grpc_shmem::Command cmd{stream_id, grpc_shmem::FrameType::C2S_INITIAL_METADATA, off, (uint32_t)vec.size(), 0, 0};
+               grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S, cmd, sem_adapter_.get());
                
                VLOG(1) << "CLIENT: Pushed C2S_INITIAL_METADATA stream_id=" << stream_id;
                return absl::OkStatus();
@@ -1650,6 +1960,10 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
   auto send_message = [cb, stream_id, this](MessageHandle m) -> StatusFlag {
     auto* payload = m->payload();
     const size_t n = payload->Length();
+    
+    VLOG(1) << "CLIENT: send_message stream=" << stream_id
+            << " len=" << n
+            << " ring_cap=" << cb->GetC2SQueues()->data_rb.capacity;
     if (n == 0) {
       // Still need to send the frame even for 0-byte messages for proper gRPC flow
       grpc_shmem::Command cmd{};
@@ -1661,24 +1975,108 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                               cmd, sem_adapter_.get());
       return Success{};
     }
-    uint64_t off = 0;
-    if (grpc_shmem::ReserveContiguous(&cb->GetC2SQueues()->data_rb, n, &off)) {
-      payload->CopyToBuffer(cb->GetC2SQueues()->data_rb.GetBuffer(cb) + off);
-      grpc_shmem::Command cmd{};
-      cmd.stream_id = stream_id;
-      cmd.type = grpc_shmem::FrameType::C2S_MESSAGE;
-      cmd.data_offset = off;
-      cmd.data_size = static_cast<uint32_t>(n);
+
+    auto* rb = &cb->GetC2SQueues()->data_rb;
+    
+    if (n <= rb->capacity) {
+      // Small message: use existing single-frame path
+      VLOG(1) << "C2S SINGLE ENQ path: len=" << n << " <= cap=" << rb->capacity;
+      uint64_t off = 0;
+      uint32_t pad = 0;
+      WaitReserveWithWatchdog(rb, n, &off, &pad, "C2S_MESSAGE");
+      VLOG(1) << "[RESERVE OK] C2S_MESSAGE off=" << off
+              << " size=" << n << " pad=" << pad;
+      unsigned char* base = rb->GetBuffer(cb);
+      payload->CopyToBuffer(base + off);
+
+      std::atomic_thread_fence(std::memory_order_release);
+
+      if (pad) {
+        VLOG(1) << "EMIT PAD dir=C2S bytes=" << pad;
+        grpc_shmem::Command pad_cmd{0, grpc_shmem::FrameType::DATA_PAD, 0, pad, 0, 0};
+        grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S,
+                                pad_cmd, sem_adapter_.get());
+      }
+
+      grpc_shmem::Command cmd{stream_id, grpc_shmem::FrameType::C2S_MESSAGE, off, static_cast<uint32_t>(n), 0, 0};
       grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S,
                               cmd, sem_adapter_.get());
+    } else {
+      // Large message: use chunking
+      VLOG(1) << "C2S CHUNKING path: len=" << n << " > cap=" << rb->capacity;
+      VLOG(1) << "C2S_MESSAGE chunking: total=" << n
+              << " max_chunk=" << (rb->capacity - 65536);
+      
+      // Allocate temporary buffer and copy payload once
+      VLOG(1) << "C2S CHUNKING: Allocating temp buffer size=" << n;
+      std::unique_ptr<unsigned char[]> tmp(new unsigned char[n]);
+      VLOG(1) << "C2S CHUNKING: Copying payload to temp buffer";
+      payload->CopyToBuffer(tmp.get());
+      VLOG(1) << "C2S CHUNKING: Payload copied, starting chunk loop";
+      
+      VLOG(1) << "[CLIENT C2S RB] rb=" << rb
+              << " head=" << rb->head.load(std::memory_order_relaxed)
+              << " tail=" << rb->tail.load(std::memory_order_relaxed);
+      
+      // Leave headroom for padding
+      const size_t max_chunk = rb->capacity - 65536;
+      size_t offset = 0;
+      
+      while (offset < n) {
+        const size_t chunk = std::min(n - offset, max_chunk);
+        const bool is_last = (offset + chunk == n);
+        
+        uint64_t chunk_off = 0;
+        uint32_t pad = 0;
+        WaitReserveWithEmptyWrap(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S,
+                                 sem_adapter_.get(),
+                                 rb, chunk, &chunk_off, &pad, "C2S_MESSAGE_CHUNK");
+        VLOG(1) << "[RESERVE OK] C2S_MESSAGE_CHUNK off=" << chunk_off
+                << " size=" << chunk << " pad=" << pad;
+        
+        std::memcpy(rb->GetBuffer(cb) + chunk_off, tmp.get() + offset, chunk);
+        std::atomic_thread_fence(std::memory_order_release);
+        
+        if (pad) {
+          VLOG(1) << "EMIT PAD dir=C2S bytes=" << pad;
+          grpc_shmem::Command pad_cmd{0, grpc_shmem::FrameType::DATA_PAD, 0, pad, 0, 0};
+          grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S,
+                                  pad_cmd, sem_adapter_.get());
+        }
+        
+        grpc_shmem::FrameType frame_type = is_last ? grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST 
+                                                   : grpc_shmem::FrameType::C2S_MESSAGE_CHUNK;
+        grpc_shmem::Command cmd{stream_id, frame_type, chunk_off, static_cast<uint32_t>(chunk), 0, 0};
+        grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S,
+                                cmd, sem_adapter_.get());
+        
+        VLOG(1) << "C2S CHUNK ENQ stream=" << stream_id
+                << " off=" << chunk_off
+                << " size=" << chunk
+                << " last=" << is_last;
+        offset += chunk;
+      }
     }
     return Success{};
   };
   child_call_handler.SpawnGuarded(
-      "c2s_messages",
-      ForEach(MessagesFrom(child_call_handler), std::move(send_message)));
-
-  // Client trailing metadata (EOS) will be sent automatically when client closes
+      "c2s_messages_and_eos",
+      TrySeq(
+        ForEach(MessagesFrom(child_call_handler), std::move(send_message)),
+        [cb, stream_id, this]() -> StatusFlag {
+          // Explicit client half-close (no payload)
+          grpc_shmem::Command eos{};
+          eos.stream_id = stream_id;
+          eos.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
+          eos.data_offset = 0;
+          eos.data_size = 0;
+          VLOG(1) << "CLIENT: Sending C2S_TRAILING_METADATA stream_id=" << stream_id;
+          bool success = grpc_shmem::PushCommand(cb->GetC2SQueues(), cb,
+                                                 grpc_shmem::Direction::kC2S,
+                                                 eos, sem_adapter_.get());
+          return StatusFlag(success);
+        }
+      ));
 }
 
 // Global storage for cross-process segments (keyed by control block pointer)

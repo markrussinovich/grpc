@@ -16,8 +16,10 @@
 #ifndef GRPC_SRC_CORE_EXT_TRANSPORT_SHMEM_SHMEM_QUEUE_H
 #define GRPC_SRC_CORE_EXT_TRANSPORT_SHMEM_SHMEM_QUEUE_H
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <thread>
 
 #include "src/core/ext/transport/shmem/shmem_transport.h"
 
@@ -44,6 +46,33 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset);
 // Reserve space allowing wrapping - for very large messages
 // Returns true and fills out_offset. May wrap around ring buffer.
 bool ReserveWrapping(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset);
+
+// Reserves space for a contiguous write, possibly wrapping. Returns:
+//   - out_offset: where to place the payload (mod capacity)
+//   - out_pad: bytes of padding to skip to reach offset 0 (0 if no pad needed)
+// The function only moves rb->head. It NEVER touches rb->tail.
+bool ReserveForWrite(DataRingBuffer* rb, uint32_t size,
+                     uint64_t* out_offset, uint32_t* out_pad);
+
+// Blocking version of ReserveForWrite that waits with backoff until space is available.
+// This prevents dropping required frames when the ring is momentarily full after wraps.
+inline bool ReserveForWriteBlocking(DataRingBuffer* rb,
+                                    uint32_t size,
+                                    uint64_t* out_offset,
+                                    uint32_t* out_pad) {
+  // Spin/yield with a short sleep so the peer can process PAD/frames and advance tail.
+  for (int attempts = 0; ; ++attempts) {
+    if (ReserveForWrite(rb, size, out_offset, out_pad)) return true;
+    if (attempts < 50) {
+      std::this_thread::yield();
+    } else if (attempts < 200) {
+      // exponential-ish backoff
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  }
+}
 
 // Release 'size' bytes previously consumed starting from some offset; simply
 // advance tail (consumer side responsibility).

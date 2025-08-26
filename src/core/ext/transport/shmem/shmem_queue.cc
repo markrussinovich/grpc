@@ -18,6 +18,8 @@
 #include <chrono>
 #include <thread>
 
+#include "absl/log/log.h"
+
 namespace grpc_shmem {
 
 bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
@@ -41,13 +43,6 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
         std::this_thread::yield();
       } else if (attempt < 20) {
         std::this_thread::sleep_for(std::chrono::nanoseconds(100));
-      } else if (medium_message) {
-        // For medium/large messages, aggressively advance tail to create space
-        // Use more conservative advancement for medium messages
-        const uint64_t advance_amount = large_message ? 
-          std::min(static_cast<uint64_t>(size / 2), rb->capacity / 8) :
-          std::min(static_cast<uint64_t>(size / 4), rb->capacity / 16);
-        rb->tail.fetch_add(advance_amount, std::memory_order_acq_rel);
       } else {
         return false;
       }
@@ -90,19 +85,7 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
       }
     }
     
-    // Strategy 3: For very large messages, force compaction
-    if (large_message && attempt > 50) {
-      // Reset ring to minimize fragmentation
-      const uint64_t current_tail = rb->tail.load(std::memory_order_acquire);
-      const uint64_t new_tail = current_tail + (used / 2);
-      uint64_t expected_tail = current_tail;
-      if (rb->tail.compare_exchange_weak(expected_tail, new_tail,
-                                         std::memory_order_acq_rel,
-                                         std::memory_order_relaxed)) {
-        // Force a fresh attempt after compaction
-        attempt = 0;
-      }
-    }
+    // Strategy 3: For very large messages was removed - writer no longer touches tail
     
     // Progressive backoff
     if (attempt < 5) {
@@ -178,25 +161,57 @@ static inline void Wait(ControlBlock* cb, Direction dir, grpc_shmem::TransportSe
 
 bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
                  const Command& cmd, grpc_shmem::TransportSemaphoreAdapter* sem_adapter) {
-  // Check if queue was empty before pushing
-  const bool was_empty = q->command_q.empty();
-  const bool ok = q->command_q.push(cmd);
-  if (!ok) return false;
+  // Fast path: try a few times without sleeping
+  for (int attempts = 0; ; ++attempts) {
+    const bool was_empty = q->command_q.empty();   // approximate is fine
+    if (q->command_q.push(cmd)) {
+      std::atomic_thread_fence(std::memory_order_release);
 
-  // Publish the command before checking conditions
-  std::atomic_thread_fence(std::memory_order_release);
+      // Log successful enqueue for important frame types
+      switch (cmd.type) {
+        case grpc_shmem::FrameType::DATA_PAD:
+        case grpc_shmem::FrameType::C2S_MESSAGE:
+        case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK:
+        case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST:
+        case grpc_shmem::FrameType::C2S_TRAILING_METADATA:
+        case grpc_shmem::FrameType::S2C_INITIAL_METADATA:
+        case grpc_shmem::FrameType::S2C_MESSAGE:
+        case grpc_shmem::FrameType::S2C_MESSAGE_CHUNK:
+        case grpc_shmem::FrameType::S2C_MESSAGE_CHUNK_LAST:
+        case grpc_shmem::FrameType::S2C_TRAILING_METADATA:
+          VLOG(1) << "PushCommand OK dir=" << (dir == Direction::kC2S ? "C2S" : "S2C")
+                  << " type=" << static_cast<int>(cmd.type)
+                  << " stream=" << cmd.stream_id
+                  << " size=" << cmd.data_size;
+          break;
+        default: break;
+      }
 
-  // Get waiter flag for this direction
-  std::atomic<uint32_t>* waiters =
-      (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
+      // Wake based on waiter flag, or first-item heuristic for startup
+      std::atomic<uint32_t>* waiters =
+          (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
+      if (waiters->load(std::memory_order_acquire) != 0 || was_empty) {
+        Post(cb, dir, sem_adapter);
+      }
+      return true;
+    }
 
-  // Post if: (1) peer declared it's sleeping, OR (2) queue was empty (to handle startup)
-  // This hybrid approach should eliminate both race conditions and startup issues
-  if (waiters->load(std::memory_order_acquire) != 0 || was_empty) {
-    Post(cb, dir, sem_adapter);
+    // Queue is full — nudge the peer and backoff
+    Post(cb, dir, sem_adapter);  // help wake the reader if it's asleep
+
+    if (attempts < 32) {
+      std::this_thread::yield();
+    } else if (attempts < 128) {
+      std::this_thread::sleep_for(std::chrono::microseconds(10));
+    } else {
+      // Diagnostic: print once every ~1ms while wedged
+      static thread_local int warned = 0;
+      if ((++warned % 100) == 1) {
+        VLOG(1) << "PushCommand backoff: dir=" << (dir == Direction::kC2S ? "C2S" : "S2C");
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(1000));
+    }
   }
-
-  return true;
 }
 
 bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
@@ -232,6 +247,8 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   std::atomic<uint32_t>* waiters = (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
   if (pop_call_count <= 10) {
     VLOG(3) << "PopCommandHybrid " << dir_name << " - setting waiter flag";
+    VLOG(3) << "PopCommandHybrid: sleeping dir=" << dir_name
+            << " cmdq_empty=" << q->command_q.empty();
   }
   waiters->store(1, std::memory_order_release);
   
@@ -257,6 +274,62 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
     return true;
   }
   return false;
+}
+
+bool ReserveForWrite(DataRingBuffer* rb, uint32_t size,
+                     uint64_t* out_offset, uint32_t* out_pad) {
+  if (size > rb->capacity) return false;
+
+  for (;;) {
+    uint64_t head = rb->head.load(std::memory_order_relaxed);
+    uint64_t tail = rb->tail.load(std::memory_order_acquire);
+    uint64_t used = head - tail;
+    if (used + size > rb->capacity) {
+      VLOG(1) << "ReserveForWrite FAIL size=" << size
+              << " head=" << head << " tail=" << tail
+              << " used=" << used
+              << " cap=" << rb->capacity << " (not enough total space)";
+      return false;  // not enough total space
+    }
+
+    uint64_t end_off = head % rb->capacity;
+    uint64_t free_to_end = rb->capacity - end_off;
+
+    uint64_t new_head;
+    uint32_t pad = 0;
+    uint64_t offset;
+
+    if (size <= free_to_end) {
+      // Fits to end; no pad needed.
+      new_head = head + size;
+      offset = end_off;
+      pad = 0;
+    } else {
+      // Needs wrap; ensure total free includes the pad.
+      if (used + size + free_to_end > rb->capacity) {
+        VLOG(1) << "ReserveForWrite FAIL size=" << size
+                << " head=" << head << " tail=" << tail
+                << " used=" << used
+                << " end_off=" << end_off
+                << " free_to_end=" << free_to_end
+                << " cap=" << rb->capacity << " (not enough space including pad)";
+        return false;  // not enough space including pad
+      }
+      new_head = head + free_to_end + size;   // writer owns head, so OK to include pad
+      offset = 0;                              // write starts at beginning
+      pad = static_cast<uint32_t>(free_to_end);
+    }
+
+    uint64_t expected = head;
+    if (rb->head.compare_exchange_weak(expected, new_head,
+                                       std::memory_order_acq_rel,
+                                       std::memory_order_relaxed)) {
+      *out_offset = offset;   // mod capacity
+      *out_pad = pad;         // 0 if no wrap
+      return true;
+    }
+    // CAS failed — retry with updated head/tail
+  }
 }
 
 }  // namespace grpc_shmem

@@ -87,10 +87,24 @@ enum class FrameType : uint8_t {
   C2S_MESSAGE = 0x02,
   C2S_TRAILING_METADATA = 0x03,
   C2S_CANCEL = 0x04,
+  // For client->server message chunking:
+  C2S_MESSAGE_CHUNK = 0x31,
+  C2S_MESSAGE_CHUNK_LAST = 0x32,
   S2C_INITIAL_METADATA = 0x81,
   S2C_MESSAGE = 0x82,
   S2C_TRAILING_METADATA = 0x83,
+  // For server->client message chunking:
+  S2C_MESSAGE_CHUNK = 0x41,
+  S2C_MESSAGE_CHUNK_LAST = 0x42,
+  DATA_PAD = 0xFA   // 250 - tells reader to advance data_rb.tail by data_size bytes
 };
+
+// Compile-time guards to prevent wire protocol drift
+static_assert(static_cast<int>(FrameType::C2S_MESSAGE_CHUNK)      == 0x31, "wire drift");
+static_assert(static_cast<int>(FrameType::C2S_MESSAGE_CHUNK_LAST) == 0x32, "wire drift");
+static_assert(static_cast<int>(FrameType::S2C_MESSAGE_CHUNK)      == 0x41, "wire drift");
+static_assert(static_cast<int>(FrameType::S2C_MESSAGE_CHUNK_LAST) == 0x42, "wire drift");
+static_assert(static_cast<int>(FrameType::DATA_PAD)               == 0xFA, "wire drift");
 
 // A fixed-size command describing an action for the peer to take, with any
 // payload referenced via an offset into the DataRingBuffer.
