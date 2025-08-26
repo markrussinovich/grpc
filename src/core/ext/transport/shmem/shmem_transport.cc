@@ -1087,6 +1087,9 @@ class ShmemServerTransport final : public ServerTransport {
       // For reassembling chunked C2S messages (copied slices, not ring-backed)
       grpc_core::SliceBuffer c2s_copied_accumulator;
       bool c2s_copy_accumulating = false;
+      
+      // Pending message to be delivered before trailing metadata
+      std::unique_ptr<grpc_core::SliceBuffer> pending_message;
     };
 
     // Simplified ring-based approach - no complex dispatched call logic needed
@@ -1392,20 +1395,23 @@ class ShmemServerTransport final : public ServerTransport {
 
             // On LAST, deliver one Message from the copied slices
             if (cmd.type == grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST &&
-                st.initiator.has_value()) {
-              auto init = *st.initiator;
-              grpc_core::SliceBuffer complete = std::move(st.c2s_copied_accumulator);
-              init.SpawnInfallible("push-c2s-chunked-msg",
-                  [init, complete = std::move(complete)]() mutable {
-                    auto msg = Arena::MakePooled<Message>(std::move(complete), 0);
-                    init.SpawnPushMessage(std::move(msg));
-                    return Empty{};
-                  });
+                st.initiator.has_value() && !st.cancelled && !st.completed) {
+              // Store the message in stream state to be delivered before trailing metadata
+              st.pending_message = std::make_unique<grpc_core::SliceBuffer>(std::move(st.c2s_copied_accumulator));
             }
             break;
           }
           case grpc_shmem::FrameType::C2S_TRAILING_METADATA: {
             VLOG(1) << "SERVER: Received C2S_TRAILING_METADATA stream_id=" << cmd.stream_id;
+            
+            // Deliver any pending chunked message BEFORE half-close
+            if (st.pending_message && st.initiator.has_value() && !st.cancelled) {
+              auto init = *st.initiator;
+              auto msg = Arena::MakePooled<Message>(std::move(*st.pending_message), 0);
+              init.SpawnPushMessage(std::move(msg));
+              st.pending_message.reset();
+            }
+            
             // Client half-close: Signal FinishSends to server pipeline
             if (st.initiator.has_value()) {
               st.initiator->SpawnFinishSends();
@@ -1414,6 +1420,8 @@ class ShmemServerTransport final : public ServerTransport {
               cb_->GetC2SQueues()->data_rb.tail.fetch_add(
                   cmd.data_size, std::memory_order_release);
             }
+            // Mark stream as completed for cleanup
+            st.completed = true;
             break;
           }
           case grpc_shmem::FrameType::C2S_CANCEL: {
