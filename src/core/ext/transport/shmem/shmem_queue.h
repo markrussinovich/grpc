@@ -86,6 +86,8 @@ class TransportSemaphoreAdapter {
   virtual ~TransportSemaphoreAdapter() = default;
   virtual void Post(ControlBlock* cb, bool is_c2s) = 0;
   virtual void Wait(bool is_c2s) = 0;
+  // Batching support - returns true if should post after adding this command
+  virtual bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added) { return true; }
 };
 
 // Push a command and optionally wake the sleeping peer if the queue was empty

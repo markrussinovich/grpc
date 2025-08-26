@@ -187,10 +187,17 @@ bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
         default: break;
       }
 
-      // Wake based on waiter flag, or first-item heuristic for startup
-      std::atomic<uint32_t>* waiters =
-          (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
-      if (waiters->load(std::memory_order_acquire) != 0 || was_empty) {
+      // Use batching logic if adapter supports it, otherwise fall back to old logic
+      bool should_post = true;
+      if (sem_adapter) {
+        should_post = sem_adapter->ShouldPost(dir == Direction::kC2S, 
+                                             sizeof(Command) + cmd.data_size, 1);
+      } else {
+        // Legacy fallback: wake based on waiter flag or first-item heuristic
+        should_post = was_empty;
+      }
+      
+      if (should_post) {
         Post(cb, dir, sem_adapter);
       }
       return true;
@@ -244,29 +251,21 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   
   // Declare intent to sleep, then re-check before actually sleeping to avoid
   // lost wakeups
-  std::atomic<uint32_t>* waiters = (dir == Direction::kC2S) ? &cb->c2s_waiters : &cb->s2c_waiters;
   if (pop_call_count <= 10) {
-    VLOG(3) << "PopCommandHybrid " << dir_name << " - setting waiter flag";
+    VLOG(3) << "PopCommandHybrid " << dir_name << " - preparing to wait";
     VLOG(3) << "PopCommandHybrid: sleeping dir=" << dir_name
             << " cmdq_empty=" << q->command_q.empty();
   }
-  waiters->store(1, std::memory_order_release);
   
-  // Memory barrier to ensure waiter flag is visible before checking queue
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  
-  // One last check after setting waiters flag and memory barrier
+  // One last check before waiting
   if (q->command_q.pop(tmp)) {
     *out = tmp;
-    waiters->store(0, std::memory_order_relaxed);
     return true;
   }
   
   // Sleep until woken up by producer (event-driven)
-  // RACE CONDITION FIX: Always use semaphores for proper cross-process coordination
-  // The startup delay logic was causing race conditions
+  // Uses futex doorbell for efficient cross-process coordination
   Wait(cb, dir, sem_adapter);
-  waiters->store(0, std::memory_order_relaxed);
   
   // Upon wake, try again (one attempt)
   if (q->command_q.pop(tmp)) {

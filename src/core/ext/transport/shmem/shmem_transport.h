@@ -45,23 +45,18 @@ struct ControlBlock {
   // Global stream ID counter to prevent conflicts between multiple clients
   std::atomic<uint32_t> next_stream_id{1};
 
-  // --- Lightweight Synchronization Semaphores ---
-  // Used to wake a sleeping reader thread when the command queue transitions
-  // from empty to non-empty.
-  EventFdSemaphore c2s_sem;
-  EventFdSemaphore s2c_sem;
-  // Set by the consumer just before sleeping; producers check this to avoid
-  // spurious posts. 0 = not waiting, 1 = waiting.
-  std::atomic<uint32_t> c2s_waiters{0};
-  std::atomic<uint32_t> s2c_waiters{0};
+  // --- Futex-based Doorbell Synchronization ---
+  // Replaces semaphores with lower-overhead futex doorbells
+  struct Doorbell {
+    std::atomic<uint32_t> seq{0};     // publisher increments on batch boundary
+    std::atomic<uint32_t> waiter{0};  // consumer sets to 1 before sleeping
+  };
+  Doorbell c2s_db;
+  Doorbell s2c_db;
 
   // NEW: offsets to the two ShmemQueues blocks, relative to this ControlBlock*
   uint64_t c2s_queues_offset = 0;
   uint64_t s2c_queues_offset = 0;
-
-  // NEW: names for named semaphores (POSIX shm-safe)
-  char c2s_sem_name[64] = {0};
-  char s2c_sem_name[64] = {0};
 
   // Helpers (these are used throughout your transport)
   inline ShmemQueues* GetC2SQueues() {

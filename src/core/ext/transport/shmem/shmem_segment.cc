@@ -124,38 +124,11 @@ void ShmemSegment::InitQueues(void* base, size_t size, ControlBlock* cb,
     std::string c2s_name = "/" + server_name + "_c2s";
     std::string s2c_name = "/" + server_name + "_s2c";
     
-    // Copy names to fixed-size arrays in shared memory
-    strncpy(cb->c2s_sem_name, c2s_name.c_str(), sizeof(cb->c2s_sem_name) - 1);
-    strncpy(cb->s2c_sem_name, s2c_name.c_str(), sizeof(cb->s2c_sem_name) - 1);
-    cb->c2s_sem_name[sizeof(cb->c2s_sem_name) - 1] = '\0';
-    cb->s2c_sem_name[sizeof(cb->s2c_sem_name) - 1] = '\0';
-    
-    LOG(INFO) << "Set semaphore names: c2s='" << cb->c2s_sem_name 
-              << "', s2c='" << cb->s2c_sem_name << "'";
-    
-    // Create both c2s and s2c cross-process semaphores
-    CrossProcessSemaphore::UnlinkNamed(server_name + "_c2s");
-    CrossProcessSemaphore temp_c2s;
-    auto c2s_status = temp_c2s.CreateNamed(server_name + "_c2s", 0);
-    if (!c2s_status.ok()) {
-      LOG(WARNING) << "Failed to create c2s cross-process semaphore: " << c2s_status;
-    } else {
-      LOG(INFO) << "Created c2s cross-process semaphore successfully";
-    }
-    
-    CrossProcessSemaphore::UnlinkNamed(server_name + "_s2c");
-    CrossProcessSemaphore temp_s2c;
-    auto s2c_status = temp_s2c.CreateNamed(server_name + "_s2c", 0);
-    if (!s2c_status.ok()) {
-      LOG(WARNING) << "Failed to create s2c cross-process semaphore: " << s2c_status;
-    } else {
-      LOG(INFO) << "Created s2c cross-process semaphore successfully";
-    }
+    // Futex doorbells are initialized directly in ControlBlock struct - no setup needed
+    LOG(INFO) << "Using futex doorbells for server: " << server_name;
   } else {
-    // Clear semaphore names for in-process mode
-    cb->c2s_sem_name[0] = '\0';
-    cb->s2c_sem_name[0] = '\0';
-    LOG(INFO) << "Cleared semaphore names for in-process mode";
+    // In-process mode also uses futex doorbells
+    LOG(INFO) << "Using futex doorbells for in-process mode";
   }
 
   // Layout: [ControlBlock | ShmemQueues c2s | ShmemQueues s2c | c2s_data | s2c_data]
@@ -206,11 +179,17 @@ ShmemSegment ShmemSegment::Create(const SegmentConfig& cfg) {
   }
   
   // Place control block at the start and initialize it properly
-  auto* cb = new(base) ControlBlock();  // Placement new to initialize fields
+  auto* cb = new(base) ControlBlock{};  // Value-initialize (zeros atomics & POD)
   
   // Set magic/version during creation using atomic stores
   cb->magic_number.store(0x47525043534D454Dull, std::memory_order_release); // "GRPCSMEM"
   cb->transport_version.store(1, std::memory_order_release);
+  
+  // Explicitly zero-initialize doorbell atomics (belt-and-suspenders)
+  cb->c2s_db.seq.store(0, std::memory_order_relaxed);
+  cb->c2s_db.waiter.store(0, std::memory_order_relaxed);
+  cb->s2c_db.seq.store(0, std::memory_order_relaxed);
+  cb->s2c_db.waiter.store(0, std::memory_order_relaxed);
   
   // Set additional fields
   cb->server_state.store(1);  // listening

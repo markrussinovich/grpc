@@ -73,6 +73,19 @@ enum class ServerState : uint32_t {
 #include "include/grpc/grpc_security.h"
 #include "absl/log/log.h"
 
+// Linux futex support for low-latency signaling
+#include <linux/futex.h>
+#include <sys/syscall.h>
+
+// Futex helper functions for doorbell synchronization
+static inline int futex_wait(uint32_t* addr, uint32_t expected, const struct timespec* ts = nullptr) {
+  return syscall(SYS_futex, addr, FUTEX_WAIT, expected, ts, nullptr, 0);
+}
+
+static inline int futex_wake(uint32_t* addr, int count = 1) {
+  return syscall(SYS_futex, addr, FUTEX_WAKE, count, nullptr, nullptr, 0);
+}
+
 // Legacy stream-op scaffolding removed: this transport uses promise-based APIs exclusively.
 
 // Blocking reserve with empty-ring fast wrap support
@@ -182,32 +195,61 @@ struct ShmemServerData {
   std::vector<grpc_shmem::KVPair> initial_md;
 };
 
-// Concrete implementation of TransportSemaphoreAdapter
-class ConcreteSemaphoreAdapter : public grpc_shmem::TransportSemaphoreAdapter {
+// Correct futex doorbell adapter - fixed deadlock issues
+class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
  public:
-  ConcreteSemaphoreAdapter(grpc_shmem::CrossProcessSemaphore* c2s_sem, 
-                          grpc_shmem::CrossProcessSemaphore* s2c_sem)
-      : c2s_sem_(c2s_sem), s2c_sem_(s2c_sem) {}
+  explicit FutexDoorbellAdapter(grpc_shmem::ControlBlock* cb) : cb_(cb) {}
   
   void Post(grpc_shmem::ControlBlock* cb, bool is_c2s) override {
-    if (is_c2s && c2s_sem_) {
-      c2s_sem_->post();
-    } else if (!is_c2s && s2c_sem_) {
-      s2c_sem_->post();
-    }
+    auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
+    
+    // Increment sequence to signal new data
+    db.seq.fetch_add(1, std::memory_order_release);
+    
+    // Wake any waiting threads (don't check waiter flag - just wake)
+    futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
   }
   
   void Wait(bool is_c2s) override {
-    if (is_c2s && c2s_sem_) {
-      c2s_sem_->wait();
-    } else if (!is_c2s && s2c_sem_) {
-      s2c_sem_->wait();
+    auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
+    
+    // Get current sequence
+    uint32_t current_seq = db.seq.load(std::memory_order_acquire);
+    
+    // Short spin to avoid futex syscall in fast path
+    for (int i = 0; i < 2000; ++i) {
+      if (db.seq.load(std::memory_order_acquire) != current_seq) {
+        return; // Data arrived during spin
+      }
+      __builtin_ia32_pause();
     }
+    
+    // Set waiter flag
+    db.waiter.store(1, std::memory_order_release);
+    
+    // Final check after setting waiter flag
+    uint32_t final_seq = db.seq.load(std::memory_order_acquire);
+    if (final_seq != current_seq) {
+      db.waiter.store(0, std::memory_order_relaxed);
+      return; // Data arrived while setting waiter
+    }
+    
+    // Use futex wait with timeout to avoid blocking indefinitely
+    struct timespec timeout = {0, 1000000}; // 1ms timeout
+    futex_wait(reinterpret_cast<uint32_t*>(&db.seq), final_seq, &timeout);
+    
+    // Clear waiter flag when waking up
+    db.waiter.store(0, std::memory_order_relaxed);
+    
+    // Always return after one wait - don't loop infinitely
+  }
+
+  bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added) override {
+    return true;
   }
   
  private:
-  grpc_shmem::CrossProcessSemaphore* c2s_sem_;
-  grpc_shmem::CrossProcessSemaphore* s2c_sem_;
+  grpc_shmem::ControlBlock* cb_;
 };
 
 // Helper function to handle ReserveContiguous with retry/backoff
@@ -247,30 +289,10 @@ class ShmemClientTransport final : public ClientTransport {
       int32_t current_count = cb_->process_count.fetch_add(1, std::memory_order_acq_rel) + 1;
       LOG(INFO) << "ShmemClientTransport attached, process count now: " << current_count;
       
-      // Initialize cross-process semaphores if names are available
-      if (cb_->c2s_sem_name[0] != '\0') {
-        auto status = c2s_cross_sem_.InitFromName(cb_->c2s_sem_name);
-        if (status.ok()) {
-          LOG(INFO) << "Initialized c2s cross-process semaphore: " << cb_->c2s_sem_name;
-        } else {
-          LOG(WARNING) << "Failed to initialize c2s semaphore: " << status;
-        }
-      }
-      if (cb_->s2c_sem_name[0] != '\0') {
-        VLOG(2) << "CLIENT initializing S2C semaphore: '" << cb_->s2c_sem_name << "'";
-        auto status = s2c_cross_sem_.InitFromName(cb_->s2c_sem_name);
-        if (status.ok()) {
-          VLOG(2) << "CLIENT S2C semaphore initialized successfully: '" << cb_->s2c_sem_name << "'";
-          LOG(INFO) << "Initialized s2c cross-process semaphore: " << cb_->s2c_sem_name;
-        } else {
-          LOG(WARNING) << "CLIENT S2C semaphore initialization FAILED: '" << cb_->s2c_sem_name << "'";
-          LOG(WARNING) << "Failed to initialize s2c semaphore: " << status;
-        }
-      }
+      // Futex doorbells are initialized directly in ControlBlock, no additional setup needed
       
-      // Create semaphore adapter for queue operations
-      sem_adapter_ = std::make_unique<ConcreteSemaphoreAdapter>(
-          &c2s_cross_sem_, &s2c_cross_sem_);
+      // Create futex doorbell adapter for low-latency queue operations
+      sem_adapter_ = std::make_unique<FutexDoorbellAdapter>(cb_);
     }
   }
 
@@ -304,22 +326,19 @@ class ShmemClientTransport final : public ClientTransport {
   void WaitForThreadsToExit() {
     // Only wake semaphores if a ring reader thread was started
     if (reader_started_.load(std::memory_order_acquire)) {
-      // RACE CONDITION FIX: Post multiple times to ensure reader wakes up
+      // RACE CONDITION FIX: Wake reader threads during shutdown
       // and add a small delay to allow reader thread to check stop flag
       if (cb_ != nullptr) {
         try {
-          // CLIENT: Only wake S2C reader thread (client reads S2C responses)
-          // Do NOT wake C2S as that disturbs the server
-          if (cb_->s2c_sem_name[0] != '\0') {
-            // Post multiple times to handle race condition where reader might be
-            // between stop flag check and semaphore wait
-            for (int i = 0; i < 3; i++) {
-              s2c_cross_sem_.post();
-              std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
+          // With futex doorbells, we need to actively wake any waiting reader threads
+          // CLIENT: Wake S2C reader thread (client reads S2C responses)
+          auto& db = cb_->s2c_db;
+          if (db.waiter.load(std::memory_order_acquire)) {
+            db.seq.fetch_add(1, std::memory_order_release);
+            futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
           }
         } catch (const std::exception& e) {
-          LOG(ERROR) << "Error waking semaphores: " << e.what();
+          LOG(ERROR) << "Error waking futex doorbells: " << e.what();
         }
       }
       
@@ -405,11 +424,8 @@ class ShmemClientTransport final : public ClientTransport {
   std::atomic<bool> cleanup_complete_{false};
   std::thread reader_;
   int spin_iters_ = kDefaultSpinIters;
-  // Cross-process semaphores for both directions
-  grpc_shmem::CrossProcessSemaphore c2s_cross_sem_;
-  grpc_shmem::CrossProcessSemaphore s2c_cross_sem_;
   
-  // Semaphore adapter for queue operations
+  // Futex doorbell adapter for queue operations
   std::unique_ptr<grpc_shmem::TransportSemaphoreAdapter> sem_adapter_;
   
   // For reassembling chunked S2C messages by stream ID
@@ -533,30 +549,10 @@ class ShmemServerTransport final : public ServerTransport {
         int32_t current_count = cb_->process_count.fetch_add(1, std::memory_order_acq_rel) + 1;
         LOG(INFO) << "ShmemServerTransport attached, process count now: " << current_count;
         
-        // Initialize cross-process semaphores if names are available
-        if (cb_->c2s_sem_name[0] != '\0') {
-          auto status = c2s_cross_sem_.InitFromName(cb_->c2s_sem_name);
-          if (status.ok()) {
-            LOG(INFO) << "Initialized c2s cross-process semaphore: " << cb_->c2s_sem_name;
-          } else {
-            LOG(WARNING) << "Failed to initialize c2s semaphore: " << status;
-          }
-        }
-        if (cb_->s2c_sem_name[0] != '\0') {
-          VLOG(2) << "SERVER initializing S2C semaphore: '" << cb_->s2c_sem_name << "'";
-          auto status = s2c_cross_sem_.InitFromName(cb_->s2c_sem_name);
-          if (status.ok()) {
-            VLOG(2) << "SERVER S2C semaphore initialized successfully: '" << cb_->s2c_sem_name << "'";
-            LOG(INFO) << "Initialized s2c cross-process semaphore: " << cb_->s2c_sem_name;
-          } else {
-            LOG(WARNING) << "SERVER S2C semaphore initialization FAILED: '" << cb_->s2c_sem_name << "'";
-            LOG(WARNING) << "Failed to initialize s2c semaphore: " << status;
-          }
-        }
+        // Futex doorbells are initialized directly in ControlBlock, no additional setup needed
         
-        // Create semaphore adapter for queue operations
-        sem_adapter_ = std::make_unique<ConcreteSemaphoreAdapter>(
-            &c2s_cross_sem_, &s2c_cross_sem_);
+        // Create futex doorbell adapter for low-latency queue operations  
+        sem_adapter_ = std::make_unique<FutexDoorbellAdapter>(cb_);
       } catch (const std::exception& e) {
         LOG(ERROR) << "Error during server transport initialization: " << e.what();
       }
@@ -681,22 +677,19 @@ class ShmemServerTransport final : public ServerTransport {
   void WaitForThreadsToExit() {
     // Only post semaphores if the ring server loop was actually started
     if (reader_started_.load(std::memory_order_acquire)) {
-      // RACE CONDITION FIX: Post multiple times to ensure reader wakes up
+      // RACE CONDITION FIX: Wake reader threads during shutdown
       // and add a small delay to allow reader thread to check stop flag
       if (cb_ != nullptr) {
         try {
-          // SERVER: Only wake C2S reader thread (server reads from C2S queue)  
-          // Do NOT wake S2C as that is for the client
-          if (cb_->c2s_sem_name[0] != '\0') {
-            // Post multiple times to handle race condition where reader might be
-            // between stop flag check and semaphore wait
-            for (int i = 0; i < 3; i++) {
-              c2s_cross_sem_.post();
-              std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
+          // With futex doorbells, we need to actively wake any waiting reader threads
+          // SERVER: Wake C2S reader thread (server reads from C2S queue)
+          auto& db = cb_->c2s_db;
+          if (db.waiter.load(std::memory_order_acquire)) {
+            db.seq.fetch_add(1, std::memory_order_release);
+            futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
           }
         } catch (const std::exception& e) {
-          LOG(ERROR) << "Error waking semaphores: " << e.what();
+          LOG(ERROR) << "Error waking futex doorbells: " << e.what();
         }
       }
       
@@ -1488,11 +1481,8 @@ class ShmemServerTransport final : public ServerTransport {
 
   std::unique_ptr<grpc_shmem::ShmemSegment> segment_;
   grpc_shmem::ControlBlock* cb_ = nullptr;
-  // Cross-process semaphores for both directions
-  grpc_shmem::CrossProcessSemaphore c2s_cross_sem_;
-  grpc_shmem::CrossProcessSemaphore s2c_cross_sem_;
   
-  // Semaphore adapter for queue operations
+  // Futex doorbell adapter for queue operations
   std::unique_ptr<grpc_shmem::TransportSemaphoreAdapter> sem_adapter_;
   
   std::atomic<bool> shutdown_initiated_{false};
@@ -1669,20 +1659,11 @@ void ShmemClientTransport::PerformFinalCleanup() {
   if (cb_ == nullptr) return;
   
   try {
-    // Extract server name from semaphore names for cleanup
-    std::string c2s_sem_name = cb_->c2s_sem_name;
-    if (!c2s_sem_name.empty() && c2s_sem_name[0] == '/') {
-      // Extract server name from "/server_name_c2s" format
-      size_t underscore_pos = c2s_sem_name.find_last_of('_');
-      if (underscore_pos != std::string::npos && underscore_pos > 1) {
-        std::string server_name = c2s_sem_name.substr(1, underscore_pos - 1);
-        LOG(INFO) << "ShmemClientTransport: Cleaning up semaphores for server: " << server_name;
-        grpc_shmem::ShmemSegment::RemoveNamedSemaphores(server_name);
-      }
-    }
+    // With futex doorbells, no named semaphore cleanup needed
     
     // Clean up from global cross-process segments map
     RemoveCrossProcessSegment(cb_);
+    LOG(INFO) << "ShmemClientTransport: Final cleanup complete";
   } catch (const std::exception& e) {
     LOG(ERROR) << "ShmemClientTransport::PerformFinalCleanup error: " << e.what();
   }
@@ -1692,17 +1673,8 @@ void ShmemServerTransport::PerformFinalCleanup() {
   if (cb_ == nullptr) return;
   
   try {
-    // Extract server name from semaphore names for cleanup
-    std::string c2s_sem_name = cb_->c2s_sem_name;
-    if (!c2s_sem_name.empty() && c2s_sem_name[0] == '/') {
-      // Extract server name from "/server_name_c2s" format
-      size_t underscore_pos = c2s_sem_name.find_last_of('_');
-      if (underscore_pos != std::string::npos && underscore_pos > 1) {
-        std::string server_name = c2s_sem_name.substr(1, underscore_pos - 1);
-        LOG(INFO) << "ShmemServerTransport: Cleaning up semaphores for server: " << server_name;
-        grpc_shmem::ShmemSegment::RemoveNamedSemaphores(server_name);
-      }
-    }
+    // With futex doorbells, no named semaphore cleanup needed
+    LOG(INFO) << "ShmemServerTransport: Final cleanup complete";
   } catch (const std::exception& e) {
     LOG(ERROR) << "ShmemServerTransport::PerformFinalCleanup error: " << e.what();
   }
@@ -2106,16 +2078,7 @@ void RemoveCrossProcessSegment(grpc_shmem::ControlBlock* cb) {
   if (it != g_cross_process_segments.end()) {
     LOG(INFO) << "RemoveCrossProcessSegment: Found segment for cb=" << cb;
     
-    // Extract server name from semaphore names to clean up semaphores
-    if (cb && cb->c2s_sem_name[0] != '\0') {
-      std::string c2s_name = cb->c2s_sem_name;
-      if (c2s_name.size() > 4 && c2s_name.substr(c2s_name.size() - 4) == "_c2s") {
-        // Extract server name: "/server_name_c2s" -> "server_name"
-        std::string server_name = c2s_name.substr(1, c2s_name.size() - 5); // Remove "/" prefix and "_c2s" suffix
-        LOG(INFO) << "RemoveCrossProcessSegment: Cleaning up semaphores for server_name='" << server_name << "'";
-        grpc_shmem::ShmemSegment::RemoveNamedSemaphores(server_name);
-      }
-    }
+    // With futex doorbells, no named semaphore cleanup needed
     
     // Destroy the ShmemSegment object (this will call Unmap() in its destructor)
     it->second.reset();
