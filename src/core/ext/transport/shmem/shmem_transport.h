@@ -57,6 +57,16 @@ struct ControlBlock {
   // NEW: offsets to the two ShmemQueues blocks, relative to this ControlBlock*
   uint64_t c2s_queues_offset = 0;
   uint64_t s2c_queues_offset = 0;
+  
+  // OPTIMIZATION: Direct communication for 0-byte messages (bypass ring buffers)
+  struct DirectCall {
+    std::atomic<uint32_t> pending{0};  // 0=none, 1=call pending, 2=response ready
+    std::atomic<uint32_t> stream_id{0};
+    std::atomic<uint32_t> status{0};    // gRPC status code
+    char method_name[256];              // :path metadata
+    char status_message[128];           // status message if needed
+  };
+  DirectCall direct_call;
 
   // Helpers (these are used throughout your transport)
   inline ShmemQueues* GetC2SQueues() {
