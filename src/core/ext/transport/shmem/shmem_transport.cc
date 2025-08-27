@@ -267,9 +267,7 @@ bool ReserveContiguousWithRetry(grpc_shmem::DataRingBuffer* rb, size_t n, uint64
 
 // Note: kMaxMessageSize was previously defined here but is unused in the current implementation
 constexpr absl::string_view kArgShmemSpinIters = "grpc.shmem.spin_iters";
-constexpr int kDefaultSpinIters =
-    0;  // No spinning by default - optimize for dispatched workloads
-
+constexpr int kDefaultSpinIters = 2000;  
 class ShmemServerTransport;
 
 // Forward declarations for cross-process segment management
@@ -901,8 +899,8 @@ class ShmemServerTransport final : public ServerTransport {
                       << ", size=" << n << " > capacity=" << rb->capacity;
               
               // Copy entire payload to temporary buffer once
-              std::vector<uint8_t> temp_buf(n);
-              payload->CopyToBuffer(temp_buf.data());
+              std::unique_ptr<unsigned char[]> tmp(new unsigned char[n]);  // no zero-fill
+              payload->CopyToBuffer(tmp.get());
               
               const uint64_t chunk_size = rb->capacity - 65536; // 64KB headroom for PAD
               uint64_t remaining = n;
@@ -932,7 +930,7 @@ class ShmemServerTransport final : public ServerTransport {
                 unsigned char* base = rb->GetBuffer(cb_);
                 
                 // Copy chunk data
-                std::memcpy(base + off, temp_buf.data() + src_offset, this_chunk);
+                std::memcpy(base + off, tmp.get() + src_offset, this_chunk);
                 std::atomic_thread_fence(std::memory_order_release);
                 
                 if (pad) {
