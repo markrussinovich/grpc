@@ -909,7 +909,13 @@ class ShmemServerTransport final : public ServerTransport {
               uint64_t src_offset = 0;
               
               while (remaining > 0) {
-                const uint64_t this_chunk = std::min(remaining, chunk_size);
+                const uint64_t cap = rb->capacity;
+                const uint64_t end_off = rb->head.load(std::memory_order_relaxed) % cap;
+                const uint32_t free_to_end = static_cast<uint32_t>(cap - end_off);
+                uint64_t this_chunk = std::min(remaining, chunk_size);
+                if (remaining > free_to_end && free_to_end > 0 && free_to_end < this_chunk) {
+                  this_chunk = free_to_end;  // next chunk will naturally start at off=0 (no PAD)
+                }
                 const bool is_last_chunk = (remaining == this_chunk);
                 
                 VLOG(2) << "ShmemCallOutboundLoop: sending S2C chunk stream=" << stream_id
@@ -2003,7 +2009,14 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
       size_t offset = 0;
       
       while (offset < n) {
-        const size_t chunk = std::min(n - offset, max_chunk);
+        const size_t remaining = n - offset;
+        const uint64_t cap = rb->capacity;
+        const uint64_t end_off = rb->head.load(std::memory_order_relaxed) % cap;
+        const uint32_t free_to_end = static_cast<uint32_t>(cap - end_off);
+        size_t chunk = std::min(remaining, max_chunk);
+        if (remaining > free_to_end && free_to_end > 0 && free_to_end < chunk) {
+          chunk = free_to_end;  // next chunk will naturally start at off=0 (no PAD)
+        }
         const bool is_last = (offset + chunk == n);
         
         uint64_t chunk_off = 0;
