@@ -88,6 +88,10 @@ class TransportSemaphoreAdapter {
   virtual void Wait(bool is_c2s) = 0;
   // Batching support - returns true if should post after adding this command
   virtual bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added) { return true; }
+  
+  // OPTIMIZATION: Return file descriptor for event loop integration
+  // Returns -1 if FD-based polling not supported
+  virtual int fd(bool is_c2s) { return -1; }
 };
 
 // Push a command and optionally wake the sleeping peer if the queue was empty

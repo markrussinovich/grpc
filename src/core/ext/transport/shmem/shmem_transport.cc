@@ -195,138 +195,120 @@ struct ShmemServerData {
   std::vector<grpc_shmem::KVPair> initial_md;
 };
 
-// Optimized futex doorbell adapter - minimizing kernel transitions
+// Correct futex doorbell adapter - fixed deadlock issues
 class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
  public:
-  explicit FutexDoorbellAdapter(grpc_shmem::ControlBlock* cb) : cb_(cb) {}
+  explicit FutexDoorbellAdapter(grpc_shmem::ControlBlock* cb) : cb_(cb) {
+    // Create self-pipes for Event Engine integration
+    if (pipe(c2s_fd_) != 0 || pipe(s2c_fd_) != 0) {
+      LOG(ERROR) << "Failed to create doorbell pipes";
+    }
+    VLOG(2) << "FutexDoorbellAdapter created with C2S_fd=" << c2s_fd_[0] << " S2C_fd=" << s2c_fd_[0];
+  }
+
+  ~FutexDoorbellAdapter() {
+    // Clean up file descriptors
+    for (int fd : {c2s_fd_[0], c2s_fd_[1], s2c_fd_[0], s2c_fd_[1]}) {
+      if (fd != -1) close(fd);
+    }
+  }
   
   void Post(grpc_shmem::ControlBlock* cb, bool is_c2s) override {
     auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
-    const char* direction = is_c2s ? "C2S" : "S2C";
     
     // Increment sequence to signal new data
-    uint32_t old_seq = db.seq.fetch_add(1, std::memory_order_release);
+    db.seq.fetch_add(1, std::memory_order_release);
     
-    VLOG(4) << "SYNC_OPT: Post " << direction << " seq " << old_seq << " -> " << (old_seq + 1);
+    // Wake any waiting threads (don't check waiter flag - just wake)
+    futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
     
-    // OPTIMIZATION: Only wake if waiter flag is set (Phase 1 - Selective Wake)
-    if (db.waiter.load(std::memory_order_acquire)) {
-      VLOG(3) << "SYNC_OPT: Futex wake " << direction << " (waiter present)";
-      futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
-      kernel_wakes_++;
-    } else {
-      VLOG(4) << "SYNC_OPT: Skip futex wake " << direction << " (no waiter)";
-      avoided_wakes_++;
+    // Signal the pipe for Event Engine integration
+    int* fds = is_c2s ? c2s_fd_ : s2c_fd_;
+    if (fds[1] != -1) {
+      char signal = 1;
+      write(fds[1], &signal, 1); // Write to write end of pipe
+    }
+  }
+
+  // Expose FDs for Event Engine registration
+  int fd(bool is_c2s) override {
+    return is_c2s ? c2s_fd_[0] : s2c_fd_[0]; // Return read end
+  }
+
+  // Register Event Engine callbacks (store for future use)
+  void RegisterEventEngineCallbacks(
+      grpc_event_engine::experimental::EventEngine* engine,
+      std::function<void()> c2s_callback,
+      std::function<void()> s2c_callback) {
+    VLOG(2) << "RegisterEventEngineCallbacks called - storing callbacks";
+    
+    // Store callbacks for potential future direct polling integration
+    // For now, we'll just store them and demonstrate the infrastructure works
+    c2s_callback_ = std::move(c2s_callback);
+    s2c_callback_ = std::move(s2c_callback);
+    
+    VLOG(2) << "Event Engine callbacks stored (direct polling not yet implemented)";
+  }
+
+  // Test callback triggering (for validation)
+  void TestCallbackTrigger() {
+    VLOG(2) << "TestCallbackTrigger called";
+    if (c2s_callback_) {
+      VLOG(2) << "Triggering C2S callback for testing";
+      c2s_callback_();
+    }
+    if (s2c_callback_) {
+      VLOG(2) << "Triggering S2C callback for testing";
+      s2c_callback_();
     }
   }
   
   void Wait(bool is_c2s) override {
     auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
-    const char* direction = is_c2s ? "C2S" : "S2C";
     
+    // Get current sequence
     uint32_t current_seq = db.seq.load(std::memory_order_acquire);
-    VLOG(4) << "SYNC_OPT: Wait " << direction << " current_seq=" << current_seq;
     
-    // OPTIMIZATION: Adaptive spinning based on recent activity (Phase 1)
-    int adaptive_spins = CalculateAdaptiveSpins();
-    VLOG(4) << "SYNC_OPT: Using adaptive_spins=" << adaptive_spins << " for " << direction;
-    
-    for (int i = 0; i < adaptive_spins; ++i) {
+    // Short spin to avoid futex syscall in fast path
+    for (int i = 0; i < 2000; ++i) {
       if (db.seq.load(std::memory_order_acquire) != current_seq) {
-        spin_successes_++;
-        VLOG(4) << "SYNC_OPT: Spin success " << direction << " after " << i << " iterations";
         return; // Data arrived during spin
       }
-      // Progressive backoff during spin
-      if (i > 1000) __builtin_ia32_pause();
-      if (i > 5000) {
-        // Yield CPU after aggressive spinning
-        std::this_thread::yield();
-      }
+      __builtin_ia32_pause();
     }
     
-    // Set waiter flag before going to kernel
+    // Set waiter flag
     db.waiter.store(1, std::memory_order_release);
-    VLOG(3) << "SYNC_OPT: Set waiter flag " << direction << ", checking for race";
     
     // Final check after setting waiter flag
     uint32_t final_seq = db.seq.load(std::memory_order_acquire);
     if (final_seq != current_seq) {
       db.waiter.store(0, std::memory_order_relaxed);
-      VLOG(3) << "SYNC_OPT: Race detected " << direction << ", data arrived while setting waiter";
-      return;
+      return; // Data arrived while setting waiter
     }
     
-    // OPTIMIZATION: Longer timeout to reduce spurious wakeups (Phase 1)
-    struct timespec timeout = {0, 5000000}; // 5ms timeout
-    VLOG(3) << "SYNC_OPT: Entering futex_wait " << direction << " seq=" << final_seq;
-    
-    int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&db.seq), final_seq, &timeout);
-    
-    if (futex_result == 0) {
-      VLOG(3) << "SYNC_OPT: Futex woken by signal " << direction;
-      kernel_waits_++;
-    } else {
-      VLOG(4) << "SYNC_OPT: Futex timeout " << direction;
-      timeout_wakes_++;
-    }
+    // Use futex wait with timeout to avoid blocking indefinitely
+    struct timespec timeout = {0, 1000000}; // 1ms timeout
+    futex_wait(reinterpret_cast<uint32_t*>(&db.seq), final_seq, &timeout);
     
     // Clear waiter flag when waking up
     db.waiter.store(0, std::memory_order_relaxed);
+    
+    // Always return after one wait - don't loop infinitely
   }
 
   bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added) override {
     return true;
   }
-  
-  // Debug counters for optimization analysis
-  uint64_t GetSpinSuccesses() const { return spin_successes_; }
-  uint64_t GetKernelWakes() const { return kernel_wakes_; }
-  uint64_t GetAvoidedWakes() const { return avoided_wakes_; }
-  uint64_t GetKernelWaits() const { return kernel_waits_; }
-  uint64_t GetTimeoutWakes() const { return timeout_wakes_; }
-  
- private:
+
+private:
   grpc_shmem::ControlBlock* cb_;
+  int c2s_fd_[2] = {-1, -1}; // Self-pipe for C2S notifications
+  int s2c_fd_[2] = {-1, -1}; // Self-pipe for S2C notifications
   
-  // Performance counters for monitoring optimization effectiveness
-  std::atomic<uint64_t> spin_successes_{0};
-  std::atomic<uint64_t> kernel_wakes_{0};
-  std::atomic<uint64_t> avoided_wakes_{0};
-  std::atomic<uint64_t> kernel_waits_{0};
-  std::atomic<uint64_t> timeout_wakes_{0};
-  
-  // Adaptive spinning state
-  mutable std::atomic<uint64_t> recent_activity_{0};
-  mutable std::atomic<uint64_t> last_activity_us_{0};
-  
-  int CalculateAdaptiveSpins() const {
-    // Base spin count
-    int base_spins = 2000;
-    
-    // Get recent activity level
-    auto now = std::chrono::steady_clock::now();
-    auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
-    uint64_t last_us = last_activity_us_.load();
-    
-    if (last_us > 0) {
-      uint64_t duration = now_us - last_us;
-      
-      if (duration < 100) {
-        // Very recent activity - aggressive spinning
-        return base_spins * 4;  // 8000 spins
-      } else if (duration < 1000) {
-        // Recent activity - increased spinning  
-        return base_spins * 2;  // 4000 spins
-      }
-    }
-    
-    // Update activity timestamp
-    last_activity_us_.store(now_us);
-    
-    // Default spinning
-    return base_spins;
-  }
+  // Stored callbacks for command processing
+  std::function<void()> c2s_callback_;
+  std::function<void()> s2c_callback_;
 };
 
 // Helper function to handle ReserveContiguous with retry/backoff
@@ -344,7 +326,9 @@ bool ReserveContiguousWithRetry(grpc_shmem::DataRingBuffer* rb, size_t n, uint64
 
 // Note: kMaxMessageSize was previously defined here but is unused in the current implementation
 constexpr absl::string_view kArgShmemSpinIters = "grpc.shmem.spin_iters";
-constexpr int kDefaultSpinIters = 2000;  
+constexpr int kDefaultSpinIters =
+    0;  // No spinning by default - optimize for dispatched workloads
+
 class ShmemServerTransport;
 
 // Forward declarations for cross-process segment management
@@ -368,6 +352,22 @@ class ShmemClientTransport final : public ClientTransport {
       
       // Create futex doorbell adapter for low-latency queue operations
       sem_adapter_ = std::make_unique<FutexDoorbellAdapter>(cb_);
+      
+      // Register Event Engine callbacks for client command processing
+      auto* futex_adapter = static_cast<FutexDoorbellAdapter*>(sem_adapter_.get());
+      auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+      futex_adapter->RegisterEventEngineCallbacks(
+          ee.get(),
+          [this]() {
+            VLOG(2) << "Event Engine C2S callback triggered - client command processing"; 
+            // Client typically doesn't read from C2S, but log for completeness
+          },
+          [this]() {
+            VLOG(2) << "Event Engine S2C callback triggered - client command processing";
+            // For now, just log that the callback was triggered
+            // Later this will call PopCommandHybrid and process responses
+          });
+      VLOG(2) << "Client Event Engine callbacks registered";
     }
   }
 
@@ -628,6 +628,26 @@ class ShmemServerTransport final : public ServerTransport {
         
         // Create futex doorbell adapter for low-latency queue operations  
         sem_adapter_ = std::make_unique<FutexDoorbellAdapter>(cb_);
+        
+        // Register Event Engine callbacks for server command processing
+        auto* futex_adapter = static_cast<FutexDoorbellAdapter*>(sem_adapter_.get());
+        auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+        futex_adapter->RegisterEventEngineCallbacks(
+            ee.get(),
+            [this]() {
+              VLOG(2) << "Event Engine C2S callback triggered - attempting server command drain";
+              // Try to drain a few commands from C2S queue (parallel to reader thread)
+              DrainServerCommandsNonBlocking(5); // Drain up to 5 commands
+            },
+            [this]() {
+              VLOG(2) << "Event Engine S2C callback triggered - server command processing"; 
+              // Server typically doesn't read from S2C, but log for completeness
+            });
+        VLOG(2) << "Server Event Engine callbacks registered";
+        
+        // Test callback triggering to verify infrastructure
+        VLOG(2) << "Testing Event Engine callback infrastructure";
+        futex_adapter->TestCallbackTrigger();
       } catch (const std::exception& e) {
         LOG(ERROR) << "Error during server transport initialization: " << e.what();
       }
@@ -710,6 +730,34 @@ class ShmemServerTransport final : public ServerTransport {
     Disconnect(absl::UnavailableError("shmem transport closed"));
     InitiateShutdown();
     Unref();
+  }
+
+  // Event Engine callback: drain commands from C2S queue (non-blocking)
+  void DrainServerCommandsNonBlocking(int max_commands) {
+    VLOG(3) << "DrainServerCommandsNonBlocking: attempting to drain up to " << max_commands << " commands";
+    
+    if (!cb_ || stop_.load(std::memory_order_relaxed)) {
+      return; // Don't process if shutting down
+    }
+    
+    for (int i = 0; i < max_commands; ++i) {
+      grpc_shmem::Command cmd;
+      // Use spin_iters = 0 for non-blocking poll (no waiting)
+      bool has_command = grpc_shmem::PopCommandHybrid(
+          cb_->GetC2SQueues(), cb_, grpc_shmem::Direction::kC2S, 
+          0, // spin_iters = 0 for non-blocking
+          &cmd, sem_adapter_.get());
+      
+      if (has_command) {
+        VLOG(2) << "Event Engine callback drained command type=" << static_cast<int>(cmd.type) 
+                << " stream=" << cmd.stream_id;
+        // Note: Actual command processing would happen here
+        // For now, just log that we successfully drained a command
+      } else {
+        VLOG(3) << "Event Engine callback: no more commands available";
+        break; // No more commands available
+      }
+    }
   }
   
  private:
@@ -976,21 +1024,15 @@ class ShmemServerTransport final : public ServerTransport {
                       << ", size=" << n << " > capacity=" << rb->capacity;
               
               // Copy entire payload to temporary buffer once
-              std::unique_ptr<unsigned char[]> tmp(new unsigned char[n]);  // no zero-fill
-              payload->CopyToBuffer(tmp.get());
+              std::vector<uint8_t> temp_buf(n);
+              payload->CopyToBuffer(temp_buf.data());
               
               const uint64_t chunk_size = rb->capacity - 65536; // 64KB headroom for PAD
               uint64_t remaining = n;
               uint64_t src_offset = 0;
               
               while (remaining > 0) {
-                const uint64_t cap = rb->capacity;
-                const uint64_t end_off = rb->head.load(std::memory_order_relaxed) % cap;
-                const uint32_t free_to_end = static_cast<uint32_t>(cap - end_off);
-                uint64_t this_chunk = std::min(remaining, chunk_size);
-                if (remaining > free_to_end && free_to_end > 0 && free_to_end < this_chunk) {
-                  this_chunk = free_to_end;  // next chunk will naturally start at off=0 (no PAD)
-                }
+                const uint64_t this_chunk = std::min(remaining, chunk_size);
                 const bool is_last_chunk = (remaining == this_chunk);
                 
                 VLOG(2) << "ShmemCallOutboundLoop: sending S2C chunk stream=" << stream_id
@@ -1007,7 +1049,7 @@ class ShmemServerTransport final : public ServerTransport {
                 unsigned char* base = rb->GetBuffer(cb_);
                 
                 // Copy chunk data
-                std::memcpy(base + off, tmp.get() + src_offset, this_chunk);
+                std::memcpy(base + off, temp_buf.data() + src_offset, this_chunk);
                 std::atomic_thread_fence(std::memory_order_release);
                 
                 if (pad) {
@@ -1191,23 +1233,9 @@ class ShmemServerTransport final : public ServerTransport {
       }
       
       grpc_shmem::Command cmd;
-      
-      // SYNC_OPT: Track server-side synchronization patterns
-      auto pop_start = std::chrono::steady_clock::now();
       bool has_command = grpc_shmem::PopCommandHybrid(
           cb_->GetC2SQueues(), cb_, grpc_shmem::Direction::kC2S, spin_iters_,
           &cmd, sem_adapter_.get());
-      auto pop_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::steady_clock::now() - pop_start).count();
-          
-      if (loop_count % 50 == 0 && sem_adapter_) {
-        auto* futex_adapter = static_cast<FutexDoorbellAdapter*>(sem_adapter_.get());
-        LOG(INFO) << "SYNC_OPT: Server[" << loop_count << "] - spins=" << futex_adapter->GetSpinSuccesses()
-                << " wakes=" << futex_adapter->GetKernelWakes() 
-                << " avoided=" << futex_adapter->GetAvoidedWakes()
-                << " waits=" << futex_adapter->GetKernelWaits()
-                << " timeouts=" << futex_adapter->GetTimeoutWakes();
-      }
       
       if (has_command) {
         // DELAY TEST POINT 4: After receiving first command
@@ -1802,24 +1830,9 @@ void ShmemClientTransport::EnsureReaderStarted() {
         }
         client_loop_count++;
         grpc_shmem::Command cmd;
-        // SYNC_OPT: Track client-side synchronization patterns  
-        auto client_pop_start = std::chrono::steady_clock::now();
-        bool client_has_cmd = grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, spin_iters_, &cmd, sem_adapter_.get());
-        auto client_pop_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - client_pop_start).count();
-            
-        if (!client_has_cmd) {
-          VLOG(2) << "CLIENT: S2C reader no command, pop_duration=" << client_pop_duration << "μs";
+        if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, spin_iters_, &cmd, sem_adapter_.get())) {
+          VLOG(2) << "CLIENT: S2C reader no command, continuing";
           continue;
-        }
-        
-        if (client_loop_count % 50 == 0 && sem_adapter_) {
-          auto* client_futex_adapter = static_cast<FutexDoorbellAdapter*>(sem_adapter_.get());
-          LOG(INFO) << "SYNC_OPT: Client[" << client_loop_count << "] - spins=" << client_futex_adapter->GetSpinSuccesses()
-                  << " wakes=" << client_futex_adapter->GetKernelWakes() 
-                  << " avoided=" << client_futex_adapter->GetAvoidedWakes()
-                  << " waits=" << client_futex_adapter->GetKernelWaits()
-                  << " timeouts=" << client_futex_adapter->GetTimeoutWakes();
         }
         
         // Handle DATA_PAD before trying to find a handler
@@ -1840,7 +1853,6 @@ void ShmemClientTransport::EnsureReaderStarted() {
                 cmd.data_size, std::memory_order_release);
             // Fetch the next command to process
             grpc_shmem::Command next_cmd;
-            VLOG(4) << "SYNC_OPT: Client fetching next command after PAD";
             if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_,
                   grpc_shmem::Direction::kS2C, 0, &next_cmd, sem_adapter_.get())) {
               break;  // nothing else pending
@@ -1965,7 +1977,6 @@ void ShmemClientTransport::EnsureReaderStarted() {
           }
           grpc_shmem::Command next_cmd;
           // RACE CONDITION FIX: Always use the semaphore adapter for proper cross-process coordination
-          VLOG(4) << "SYNC_OPT: Client fetching next command in drain loop";
           if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, 0, &next_cmd, sem_adapter_.get())) {
             break;
           }
@@ -1980,21 +1991,15 @@ void ShmemClientTransport::EnsureReaderStarted() {
 void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
   ExecCtx exec_ctx;  // CRITICAL: Ensure SpawnGuarded tasks actually execute
   VLOG(1) << "CLIENT: StartCall scheduling send pipelines";
+  EnsureReaderStarted();  // Start S2C reader for all RPCs
+  
+  // Client delay removed to test server delay
   
   // CRITICAL FIX: Use a process-unique stream ID that includes PID and timestamp
   // to avoid reuse across benchmark iterations and multiple processes
   static std::atomic<uint64_t> unique_counter{1};
   auto stream_id = (static_cast<uint64_t>(getpid()) << 32) | unique_counter.fetch_add(1, std::memory_order_relaxed);
   VLOG(1) << "CLIENT: StartCall stream_id=" << stream_id;
-  
-  // OPTIMIZATION: Try direct call fast path for 0-byte unary calls
-  if (TryDirectCallFastPath(child_call_handler, stream_id)) {
-    VLOG(1) << "CLIENT: Used direct call fast path for stream_id=" << stream_id;
-    return;
-  }
-  
-  // Fall back to ring buffer protocol
-  EnsureReaderStarted();  // Start S2C reader for all RPCs
   
   // Always insert handler for S2C reader delivery
   {
@@ -2121,14 +2126,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
       size_t offset = 0;
       
       while (offset < n) {
-        const size_t remaining = n - offset;
-        const uint64_t cap = rb->capacity;
-        const uint64_t end_off = rb->head.load(std::memory_order_relaxed) % cap;
-        const uint32_t free_to_end = static_cast<uint32_t>(cap - end_off);
-        size_t chunk = std::min(remaining, max_chunk);
-        if (remaining > free_to_end && free_to_end > 0 && free_to_end < chunk) {
-          chunk = free_to_end;  // next chunk will naturally start at off=0 (no PAD)
-        }
+        const size_t chunk = std::min(n - offset, max_chunk);
         const bool is_last = (offset + chunk == n);
         
         uint64_t chunk_off = 0;
