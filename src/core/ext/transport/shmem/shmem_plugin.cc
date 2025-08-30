@@ -69,6 +69,8 @@ class ShmemEndpointTransport final : public EndpointTransport {
  public:
   absl::StatusOr<grpc_channel*> ChannelCreate(
       std::string target, const ChannelArgs& args) override {
+    fprintf(stderr, "*** DEBUG: ChannelCreate called with target: %s ***\n", target.c_str());
+    fflush(stderr);
     // Parse shmem:// URI to extract server name
     auto uri_result = URI::Parse(target);
     if (!uri_result.ok()) {
@@ -91,7 +93,8 @@ class ShmemEndpointTransport final : public EndpointTransport {
     // Force ring mode (not dispatch-only) for cross-process communication
     ChannelArgs client_args = args
         .Set("grpc.experimental.promise_based_shmem_transport", true)
-        .Set("grpc.shmem.dispatch_only", false);
+        .Set("grpc.shmem.dispatch_only", false)
+        .Set("grpc.shmem.server_name", server_name);
     
     auto client_transport = ConnectToShmemServerTransport(server_name, client_args);
     if (!client_transport) {
@@ -133,6 +136,9 @@ class ShmemEndpointTransport final : public EndpointTransport {
 
     // Register server and create transport (but reader thread won't start until SetCallDestination)
     std::string server_name = uri.authority();
+    fprintf(stderr, "*** DEBUG: AddPort called for shmem server: %s ***\n", server_name.c_str());
+    fflush(stderr);
+    LOG(INFO) << "AddPort: Registering shmem server: " << server_name;
     VLOG(2) << "AddPort: Registering shmem server: " << server_name;
     ShmemServerRegistry::Get().RegisterServer(server_name, server);
     
@@ -173,6 +179,7 @@ class ShmemEndpointTransport final : public EndpointTransport {
         .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS)
         .SetObject(auth_context);
         
+    LOG(INFO) << "Plugin - About to call SetupTransport with auth context: " << auth_context.get();
     VLOG(2) << "Plugin - About to call SetupTransport with auth context: " << auth_context.get();
     
     auto result = server->SetupTransport(server_transport.get(), nullptr, setup_args, nullptr);
@@ -182,6 +189,7 @@ class ShmemEndpointTransport final : public EndpointTransport {
     }
     
     server_transport.release(); // Server takes ownership
+    LOG(INFO) << "AddPort: Server transport set up successfully";
     VLOG(2) << "AddPort: Server transport set up successfully";
     
     // Return a fake port number since shmem doesn't use real network ports
@@ -192,8 +200,14 @@ class ShmemEndpointTransport final : public EndpointTransport {
 }  // namespace
 
 void RegisterShmemTransport(CoreConfiguration::Builder* builder) {
+  fprintf(stderr, "*** DEBUG: RegisterShmemTransport called! ***\n");
+  fflush(stderr);
+  LOG(INFO) << "RegisterShmemTransport called - registering shmem endpoint transport";
   builder->endpoint_transport_registry()->RegisterTransport(
       "shmem", std::make_unique<ShmemEndpointTransport>());
+  LOG(INFO) << "RegisterShmemTransport completed - shmem transport registered";
+  fprintf(stderr, "*** DEBUG: RegisterShmemTransport completed! ***\n");
+  fflush(stderr);
 }
 
 }  // namespace grpc_core

@@ -67,8 +67,14 @@ void RunServer() {
   std::cout << "Building and starting server..." << std::endl;
   std::unique_ptr<Server> server(builder.BuildAndStart());
   
-  std::cout << "Server listening on " << server_address << " ... ";
-  server->Wait();
+  if (server) {
+    std::cout << "BuildAndStart succeeded!" << std::endl;
+    std::cout << "Server listening on " << server_address << " ... ";
+    server->Wait();
+  } else {
+    std::cout << "ERROR: BuildAndStart failed - server is null!" << std::endl;
+    return;
+  }
 }
 
 int main(int argc, char** argv) {

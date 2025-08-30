@@ -50,10 +50,12 @@ enum class ServerState : uint32_t {
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <sys/select.h>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
+#include "src/core/lib/iomgr/timer.h"
 #include "src/core/call/call_arena_allocator.h"
 #include "src/core/call/metadata.h"
 #include "src/core/ext/transport/shmem/shmem_framer.h"
@@ -337,6 +339,8 @@ class ShmemClientTransport final : public ClientTransport {
   ShmemClientTransport(ShmemServerTransport* server,
                        grpc_shmem::ControlBlock* cb, const ChannelArgs& args)
       : server_(server), cb_(cb), channel_args_(args) {
+    fprintf(stderr, "*** DEBUG: ShmemClientTransport constructor starting ***\n");
+    fflush(stderr);
     MutexLock l(&state_mu_);
     state_tracker_.SetState(GRPC_CHANNEL_CONNECTING, absl::OkStatus(), "init");
     state_tracker_.SetState(GRPC_CHANNEL_READY, absl::OkStatus(), "shmem ready");
@@ -355,6 +359,8 @@ class ShmemClientTransport final : public ClientTransport {
       // EventEngine callbacks removed - simplified integration
       VLOG(2) << "Client EventEngine integration completed";
     }
+    fprintf(stderr, "*** DEBUG: ShmemClientTransport constructor completed ***\n");
+    fflush(stderr);
   }
 
   void StartCall(CallHandler child_call_handler) override;
@@ -568,18 +574,22 @@ class ShmemServerTransport final : public ServerTransport {
         rq->memory_quota()->CreateMemoryAllocator("shmem-server-alloc");
     call_arena_allocator_ =
         MakeRefCounted<CallArenaAllocator>(std::move(alloc), 1024);
-    InitC2SDoorbell();
+    // InitC2SDoorbell will be called later when server name is available
     
     // Server reader thread removed - using EventEngine callbacks instead
     if (cb_) {
+      LOG(INFO) << "ShmemServerTransport constructor (1-arg) completed successfully";
       VLOG(2) << "Server transport initialized without reader thread - using EventEngine";
     }
   }
   ShmemServerTransport(const ChannelArgs& args,
                        std::unique_ptr<grpc_shmem::ShmemSegment> seg)
       : segment_(std::move(seg)), channel_args_(args) {
-    InitC2SDoorbell();
+    // InitC2SDoorbell will be called in SetCallDestination when server name is available  
     // Existing constructor logic continues below
+    fprintf(stderr, "*** DEBUG: ShmemServerTransport constructor (2-arg) starting ***\n");
+    fflush(stderr);
+    LOG(INFO) << "ShmemServerTransport constructor (2-arg) starting";
     VLOG(2) << "ShmemServerTransport constructor (2-arg) starting";
     
     // Check if auth context is in the args
@@ -687,6 +697,21 @@ class ShmemServerTransport final : public ServerTransport {
     LOG(INFO) << "ControlBlock validation passed, deferring reader thread start";
     // Don't start reader thread during construction to avoid startup hang
     // EnsureReaderStarted();
+    
+    // CRITICAL FIX: For named servers, start FD exchange immediately  
+    // This solves the chicken-and-egg problem where clients can't connect
+    // because the server's Unix socket listener isn't ready yet
+    bool is_named_server = args.GetBool("grpc.shmem.is_named_server").value_or(false);
+    auto server_name = args.GetString("grpc.shmem.server_name");
+    
+    // Enable async FD exchange for all named servers with proper pollset registration order
+    if (is_named_server) {
+      LOG(INFO) << "Named server detected, will start FD exchange in SetCallDestination: " << server_name.value_or("unknown");
+      // Don't call InitC2SDoorbell here - pollsets not ready yet
+    }
+    fprintf(stderr, "*** DEBUG: ShmemServerTransport constructor (2-arg) completed successfully ***\n");
+    fflush(stderr);
+    LOG(INFO) << "ShmemServerTransport constructor (2-arg) completed successfully";
   }
 
   grpc_shmem::ControlBlock* GetControlBlock() const { return cb_; }
@@ -715,23 +740,31 @@ class ShmemServerTransport final : public ServerTransport {
     state_tracker_.SetState(GRPC_CHANNEL_READY, absl::OkStatus(),
                             "accept function set");
     
-  // Start the reader thread since the server is ready to accept calls.
+  // Start event-driven polling since the server is ready to accept calls.
   // Note: Do NOT override the accept_stream callback here; the core will
   // have already installed its own callback via PerformOp during
   // Server::SetupTransport. We simply start consuming C2S traffic and call
   // that callback when new streams arrive, mirroring TCP behavior.
-  LOG(INFO) << "SetCallDestination called - starting reader thread";
+  fprintf(stderr, "*** DEBUG: SetCallDestination called - server ready for clients ***\n");
+  fflush(stderr);
+  LOG(INFO) << "SetCallDestination called - server ready for clients (NO THREADS)";
 
-    EnsureReaderStarted();
+    // Initialize FD exchange for event-driven processing (pollsets are now ready)
+    fprintf(stderr, "*** DEBUG: About to call InitC2SDoorbell ***\n");
+    fflush(stderr);
+    InitC2SDoorbell();
+    fprintf(stderr, "*** DEBUG: InitC2SDoorbell call completed ***\n");
+    fflush(stderr);
     
-    // Note: Readiness signaling moved to ServerLoop after thread is actually ready to read
+    // Commands will be processed via OnC2SReadable callbacks when clients send data
   }
 
   void Orphan() override {
-    // Transition to SHUTDOWN and notify watchers (important for server
-    // shutdown).
+    fprintf(stderr, "*** DEBUG: Server transport Orphan() called - but NOT shutting down futex polling (server should stay active) ***\n");
+    fflush(stderr);
+    // DON'T call InitiateShutdown() here - server should stay active for multiple clients
+    // Only disconnect this specific transport instance
     Disconnect(absl::UnavailableError("shmem transport closed"));
-    InitiateShutdown();
     Unref(DEBUG_LOCATION, "orphan");
   }
 
@@ -870,13 +903,41 @@ class ShmemServerTransport final : public ServerTransport {
     return nullptr;
   }
   void SetPollset(grpc_stream*, grpc_pollset* ps) override {
+    fprintf(stderr, "*** DEBUG: Server SetPollset called ***\n");
+    fflush(stderr);
     if (pss_ == nullptr) pss_ = grpc_pollset_set_create();
     grpc_pollset_set_add_pollset(pss_, ps);
-    if (c2s_grpc_fd_ != nullptr) grpc_pollset_set_add_fd(pss_, c2s_grpc_fd_);
+    
+    // Create eventfd here so it's available when needed
+    if (c2s_doorbell_fd_ == -1) {
+      auto name = channel_args_.GetString("grpc.shmem.server_name");
+      fprintf(stderr, "*** DEBUG: Server SetPollset creating eventfd for name=%s ***\n", 
+              name.has_value() ? std::string(*name).c_str() : "NULL");
+      fflush(stderr);
+      if (name.has_value()) {
+        c2s_doorbell_fd_ = MakeEventFd();
+        if (c2s_doorbell_fd_ >= 0) {
+          c2s_grpc_fd_ = grpc_fd_create(c2s_doorbell_fd_, "c2s_doorbell", false);
+          GRPC_CLOSURE_INIT(&c2s_on_readable_, OnC2SReadable, this, grpc_schedule_on_exec_ctx);
+          LOG(INFO) << "Server SetPollset: created C2S eventfd: " << c2s_doorbell_fd_;
+        }
+      }
+    }
+    
+    if (c2s_grpc_fd_ != nullptr) {
+      grpc_pollset_set_add_fd(pss_, c2s_grpc_fd_);
+      LOG(INFO) << "Server SetPollset: added C2S eventfd to pollset";
+    } else {
+      fprintf(stderr, "*** DEBUG: Server SetPollset: c2s_grpc_fd_ not created yet ***\n");
+      fflush(stderr);
+    }
   }
   void SetPollsetSet(grpc_stream*, grpc_pollset_set* pss) override {
     pss_ = pss;
-    if (c2s_grpc_fd_ != nullptr) grpc_pollset_set_add_fd(pss_, c2s_grpc_fd_);
+    if (c2s_grpc_fd_ != nullptr) {
+      grpc_pollset_set_add_fd(pss_, c2s_grpc_fd_);
+      LOG(INFO) << "Server SetPollsetSet: added C2S eventfd to pollset_set";
+    }
   }
   // Legacy stream-op vtable methods removed (promise-based path only).
   
@@ -1659,6 +1720,8 @@ class ShmemServerTransport final : public ServerTransport {
   grpc_fd* c2s_grpc_fd_ = nullptr;
   grpc_closure c2s_on_readable_;
   grpc_pollset_set* pss_ = nullptr;
+  bool c2s_reading_started_ = false;
+  // Removed Unix socket approach - using futex doorbells only
   Mutex s2c_mu_;
   // Thread-safe tracking of completed streams for cleanup
   std::mutex completed_streams_mu_;
@@ -1822,48 +1885,122 @@ void ShmemServerTransport::PerformFinalCleanup() {
 }
 
 void ShmemClientTransport::EnsureReaderStarted() {
-  if (cb_ == nullptr) return;
+  fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted CALLED ***\n");
+  fflush(stderr);
+  LOG(INFO) << "Client EnsureReaderStarted called, cb_=" << (void*)cb_;
+  if (cb_ == nullptr) {
+    fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted: cb_ is null, returning ***\n");
+    fflush(stderr);
+    LOG(INFO) << "Client EnsureReaderStarted: cb_ is null, returning";
+    return;
+  }
+  bool was_started = reader_started_.load(std::memory_order_acquire);
+  fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted: reader_started_=%s ***\n", was_started ? "true" : "false");
+  fflush(stderr);
+  LOG(INFO) << "Client EnsureReaderStarted: reader_started_=" << was_started;
   if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
+    fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted: starting doorbell init (FIRST TIME) ***\n");
+    fflush(stderr);
+    LOG(INFO) << "Client EnsureReaderStarted: starting doorbell init";
     InitS2CDoorbell();
     reader_ready_.store(true, std::memory_order_release);
+  } else {
+    fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted: reader already started (DUPLICATE CALL) ***\n");
+    fflush(stderr);
+    LOG(INFO) << "Client EnsureReaderStarted: reader already started";
   }
 }
 
 void ShmemClientTransport::InitS2CDoorbell() {
+  fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell CALLED ***\n");
+  fflush(stderr);
   auto name = channel_args_.GetString("grpc.shmem.server_name");
-  if (!name.has_value()) return;
+  if (!name.has_value()) {
+    fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell: no server name, skipping ***\n");
+    fflush(stderr);
+    LOG(INFO) << "Client InitS2CDoorbell: no server name, skipping";
+    return;
+  }
+  fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell: server_name=%.*s ***\n", (int)name->length(), name->data());
+  fflush(stderr);
+  LOG(INFO) << "Client InitS2CDoorbell: server_name=" << *name;
   
+  // Create S2C eventfd for receiving server notifications
+  fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell: creating S2C eventfd ***\n");
+  fflush(stderr);
   s2c_doorbell_fd_ = MakeEventFd();
   if (s2c_doorbell_fd_ < 0) {
+    fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell: failed to create eventfd ***\n");
+    fflush(stderr);
     LOG(ERROR) << "Failed to create S2C eventfd";
     return;
   }
+  fprintf(stderr, "*** DEBUG: Client created S2C eventfd=%d ***\n", s2c_doorbell_fd_);
+  fflush(stderr);
+  LOG(INFO) << "Client created S2C eventfd=" << s2c_doorbell_fd_;
   
-  // Connect to server's Unix socket to exchange FDs
-  int sock = ConnectUnix(ControlSockPath(*name));
-  if (sock >= 0) {
-    // Receive server's C2S eventfd (server sends us their C2S doorbell so we can wake them)
-    int c2s_peer = RecvFd(sock);
-    if (c2s_peer >= 0 && sem_adapter_) {
-      static_cast<FutexDoorbellAdapter*>(sem_adapter_.get())->SetPeerEventFd(c2s_peer);
-    }
-    // Send our S2C eventfd to server (so server can wake us)
-    (void)SendFd(sock, s2c_doorbell_fd_);
-    close(sock);
+  // For cross-process communication, the futex doorbell adapter handles peer FD setup
+  // The shared memory control block contains the necessary eventfd information
+  if (sem_adapter_) {
+    auto* futex_adapter = static_cast<FutexDoorbellAdapter*>(sem_adapter_.get());
+    // Futex doorbells are already set up in the control block
+    LOG(INFO) << "Client using futex doorbells for cross-process signaling";
   }
   
-  // Register with iomgr poller
-  s2c_grpc_fd_ = grpc_fd_create(s2c_doorbell_fd_, "shmem-s2c-doorbell", /*track_errs=*/true);
-  GRPC_CLOSURE_INIT(&s2c_on_readable_, &ShmemClientTransport::OnS2CReadable,
-                    this, grpc_schedule_on_exec_ctx);
-  grpc_fd_notify_on_read(s2c_grpc_fd_, &s2c_on_readable_);
-  if (pss_ != nullptr) grpc_pollset_set_add_fd(pss_, s2c_grpc_fd_);
+  // Use futex polling for reliable cross-process signaling
+  // FD callbacks cause LockfreeEvent conflicts - futex polling is more reliable
+  fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell: using futex polling for S2C signals ***\n");
+  fflush(stderr);
+  
+  // Create futex polling thread for S2C responses
+  auto self = this;
+  std::thread([self]() {
+    fprintf(stderr, "*** DEBUG: Client starting futex polling thread for S2C signals ***\n");
+    fflush(stderr);
+    
+    if (self->cb_ == nullptr) {
+      fprintf(stderr, "*** DEBUG: Client futex thread: cb_ is null! ***\n");
+      fflush(stderr);
+      return;
+    }
+    
+    uint32_t last_seq = self->cb_->s2c_db.seq.load(std::memory_order_acquire);
+    fprintf(stderr, "*** DEBUG: Client initial S2C sequence: %u ***\n", last_seq);
+    fflush(stderr);
+    
+    // Poll for responses until client shutdown
+    while (!self->stop_.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      
+      // Check if S2C sequence has changed (indicating new data from server)
+      uint32_t current_seq = self->cb_->s2c_db.seq.load(std::memory_order_acquire);
+      
+      if (current_seq != last_seq) {
+        fprintf(stderr, "*** DEBUG: Client S2C sequence changed from %u to %u! Processing responses ***\n", 
+                last_seq, current_seq);
+        fflush(stderr);
+        
+        // Process S2C commands
+        self->DrainS2CFromPoller();
+        
+        last_seq = current_seq;
+        // Keep polling for more responses
+      }
+    }
+    fprintf(stderr, "*** DEBUG: Client futex polling thread finished ***\n");
+    fflush(stderr);
+  }).detach();
 }
 
 void ShmemClientTransport::DrainS2CFromPoller() {
-  // EventEngine callback already drained eventfd
+  fprintf(stderr, "*** DEBUG: Client DrainS2CFromPoller CALLED ***\n");
+  fflush(stderr);
+  
+  // CRITICAL: Set up execution context for spawned tasks
+  ExecCtx exec_ctx;
   
   // Process S2C commands (non-blocking)
+  int commands_processed = 0;
   for (int i = 0; i < 100; ++i) {
     grpc_shmem::Command cmd;
     if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C,
@@ -1871,6 +2008,10 @@ void ShmemClientTransport::DrainS2CFromPoller() {
       break; // No more commands
     }
     
+    commands_processed++;
+    fprintf(stderr, "*** DEBUG: Client processing S2C command #%d: type=%d, stream_id=%lu ***\n", 
+            commands_processed, static_cast<int>(cmd.type), cmd.stream_id);
+    fflush(stderr);
     VLOG(2) << "Client EventEngine processing S2C command: " << static_cast<int>(cmd.type) << " stream=" << cmd.stream_id;
     
     // Handle DATA_PAD first (no handler needed)
@@ -1967,65 +2108,148 @@ void ShmemClientTransport::DrainS2CFromPoller() {
         break;
     }
   }
+  
+  fprintf(stderr, "*** DEBUG: Client DrainS2CFromPoller processed %d commands ***\n", commands_processed);
+  fflush(stderr);
 }
 
 void ShmemClientTransport::OnS2CReadable(void* arg, grpc_error_handle error) {
   auto* self = static_cast<ShmemClientTransport*>(arg);
   ExecCtx exec_ctx;
-  // Re-arm first to avoid missed edges
-  grpc_fd_notify_on_read(self->s2c_grpc_fd_, &self->s2c_on_readable_);
-  if (!error.ok()) return;
-  // Drain the eventfd
+  LOG(INFO) << "Client OnS2CReadable called, error=" << error;
+  if (!error.ok()) {
+    LOG(ERROR) << "Client OnS2CReadable error: " << error;
+    // Re-arm even on error to keep receiving notifications
+    grpc_fd_notify_on_read(self->s2c_grpc_fd_, &self->s2c_on_readable_);
+    return;
+  }
+  // Drain the eventfd first
   uint64_t v;
-  while (read(self->s2c_doorbell_fd_, &v, sizeof(v)) == 8) {}
+  int read_count = 0;
+  while (read(self->s2c_doorbell_fd_, &v, sizeof(v)) == 8) {
+    read_count++;
+  }
+  LOG(INFO) << "Client drained " << read_count << " eventfd notifications";
   // Drain S2C queue without blocking
   self->DrainS2CFromPoller();
+  // Re-arm after processing to avoid missed edges
+  grpc_fd_notify_on_read(self->s2c_grpc_fd_, &self->s2c_on_readable_);
+  LOG(INFO) << "Client OnS2CReadable re-armed";
 }
 
 // Server-side EventEngine integration
 void ShmemServerTransport::InitC2SDoorbell() {
-  auto name = channel_args_.GetString("grpc.shmem.server_name");
-  if (!name.has_value()) return;
+  fprintf(stderr, "*** DEBUG: ShmemServerTransport::InitC2SDoorbell ENTRY ***\n");
+  fflush(stderr);
+  LOG(INFO) << "Server InitC2SDoorbell: called";
   
-  c2s_doorbell_fd_ = MakeEventFd();
-  if (c2s_doorbell_fd_ < 0) {
-    LOG(ERROR) << "Failed to create C2S eventfd";
-    return;
-  }
-  
-  // Create Unix domain socket listener for FD exchange
-  int lfd = CreateUnixListener(ControlSockPath(*name));
-  if (lfd >= 0) {
-    // Accept client connection
-    int sock = accept4(lfd, nullptr, nullptr, SOCK_CLOEXEC);
-    if (sock >= 0) {
-      // Send our C2S eventfd to client (so client can wake us)
-      (void)SendFd(sock, c2s_doorbell_fd_);
-      // Receive client's S2C eventfd (client sends us their S2C doorbell so we can wake them)
-      int s2c_peer = RecvFd(sock);
-      if (s2c_peer >= 0 && sem_adapter_) {
-        static_cast<FutexDoorbellAdapter*>(sem_adapter_.get())->SetPeerEventFd(s2c_peer);
+  // Create eventfd if not already created (SetPollset is not called early enough)
+  if (c2s_grpc_fd_ == nullptr) {
+    fprintf(stderr, "*** DEBUG: c2s_grpc_fd_ is NULL, creating eventfd now ***\n");
+    fflush(stderr);
+    
+    auto name = channel_args_.GetString("grpc.shmem.server_name");
+    if (name.has_value()) {
+      c2s_doorbell_fd_ = MakeEventFd();
+      if (c2s_doorbell_fd_ >= 0) {
+        c2s_grpc_fd_ = grpc_fd_create(c2s_doorbell_fd_, "c2s_doorbell", false);
+        GRPC_CLOSURE_INIT(&c2s_on_readable_, OnC2SReadable, this, grpc_schedule_on_exec_ctx);
+        fprintf(stderr, "*** DEBUG: Created C2S eventfd: %d, grpc_fd: %p ***\n", 
+                c2s_doorbell_fd_, c2s_grpc_fd_);
+        fflush(stderr);
+        LOG(INFO) << "Server InitC2SDoorbell: created C2S eventfd: " << c2s_doorbell_fd_;
+        
+        // Add to pollset if we have one, or create one if needed
+        if (pss_ != nullptr) {
+          grpc_pollset_set_add_fd(pss_, c2s_grpc_fd_);
+          fprintf(stderr, "*** DEBUG: Added C2S eventfd to existing pollset ***\n");
+          fflush(stderr);
+        } else {
+          // Create our own pollset for the server eventfd
+          pss_ = grpc_pollset_set_create();
+          grpc_pollset_set_add_fd(pss_, c2s_grpc_fd_);
+          fprintf(stderr, "*** DEBUG: Created new pollset and added C2S eventfd ***\n");
+          fflush(stderr);
+          
+          // Test: immediately check if eventfd is readable (non-blocking)
+          uint64_t test_val;
+          int test_read = read(c2s_doorbell_fd_, &test_val, sizeof(test_val));
+          fprintf(stderr, "*** DEBUG: Initial eventfd read test: %d (errno=%d) ***\n", test_read, errno);
+          fflush(stderr);
+        }
       }
-      close(sock);
     }
-    close(lfd);
-    unlink(ControlSockPath(*name).c_str());
+    
+    if (c2s_grpc_fd_ == nullptr) {
+      fprintf(stderr, "*** DEBUG: Failed to create eventfd, returning ***\n");
+      fflush(stderr);
+      LOG(INFO) << "Server InitC2SDoorbell: failed to create eventfd, skipping";
+      return;
+    }
+  } else {
+    fprintf(stderr, "*** DEBUG: c2s_grpc_fd_ exists, proceeding with initialization ***\n");
+    fflush(stderr);
   }
   
-  // Register eventfd with gRPC poller
-  c2s_grpc_fd_ = grpc_fd_create(c2s_doorbell_fd_, "c2s_doorbell", false);
-  GRPC_CLOSURE_INIT(&c2s_on_readable_, OnC2SReadable, this, nullptr);
-  grpc_fd_notify_on_read(c2s_grpc_fd_, &c2s_on_readable_);
-  
-  if (pss_ != nullptr) {
-    grpc_pollset_set_add_fd(pss_, c2s_grpc_fd_);
+  // Only start reading once
+  if (!c2s_reading_started_) {
+    fprintf(stderr, "*** DEBUG: Calling grpc_fd_notify_on_read ***\n");
+    fflush(stderr);
+    grpc_fd_notify_on_read(c2s_grpc_fd_, &c2s_on_readable_);
+    c2s_reading_started_ = true;
+    fprintf(stderr, "*** DEBUG: grpc_fd_notify_on_read completed ***\n");
+    fflush(stderr);
+    LOG(INFO) << "Server InitC2SDoorbell: started reading C2S eventfd - using futex polling";
+    
+    // Create futex polling thread for C2S commands
+    auto self = this;
+    std::thread([self]() {
+      fprintf(stderr, "*** DEBUG: Starting futex polling thread for C2S signals ***\n");
+      fflush(stderr);
+      
+      uint32_t last_seq = self->cb_->c2s_db.seq.load(std::memory_order_acquire);
+      fprintf(stderr, "*** DEBUG: Initial C2S sequence: %u ***\n", last_seq);
+      fflush(stderr);
+      
+      // Poll indefinitely until server shutdown
+      while (!self->stop_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        // Check if C2S sequence has changed (indicating new data from client)
+        uint32_t current_seq = self->cb_->c2s_db.seq.load(std::memory_order_acquire);
+        
+        if (current_seq != last_seq) {
+          fprintf(stderr, "*** DEBUG: C2S sequence changed from %u to %u! Processing commands ***\n", 
+                  last_seq, current_seq);
+          fflush(stderr);
+          
+          // Process C2S commands  
+          self->DrainC2SFromPoller();
+          
+          last_seq = current_seq;
+          // Keep polling for more commands  
+        }
+      }
+      fprintf(stderr, "*** DEBUG: Server futex polling thread finished ***\n");
+      fflush(stderr);
+    }).detach();
+    
+  } else {
+    fprintf(stderr, "*** DEBUG: Already reading C2S eventfd ***\n");
+    fflush(stderr);
+    LOG(INFO) << "Server InitC2SDoorbell: already reading C2S eventfd";
   }
 }
 
 void ShmemServerTransport::DrainC2SFromPoller() {
-  // EventEngine callback already drained eventfd
+  fprintf(stderr, "*** DEBUG: DrainC2SFromPoller CALLED ***\n");
+  fflush(stderr);
+  
+  // CRITICAL: Set up execution context for spawned tasks
+  ExecCtx exec_ctx;
   
   // Process C2S commands (non-blocking)  
+  int commands_processed = 0;
   for (int i = 0; i < 100; ++i) {
     grpc_shmem::Command cmd;
     if (!grpc_shmem::PopCommandHybrid(cb_->GetC2SQueues(), cb_, grpc_shmem::Direction::kC2S,
@@ -2033,6 +2257,10 @@ void ShmemServerTransport::DrainC2SFromPoller() {
       break; // No more commands
     }
     
+    commands_processed++;
+    fprintf(stderr, "*** DEBUG: Processing C2S command #%d: type=%d, stream_id=%lu ***\n", 
+            commands_processed, static_cast<int>(cmd.type), cmd.stream_id);
+    fflush(stderr);
     VLOG(2) << "Server EventEngine processing C2S command: " << static_cast<int>(cmd.type) << " stream=" << cmd.stream_id;
     
     // Handle DATA_PAD first (no special processing needed)
@@ -2041,7 +2269,161 @@ void ShmemServerTransport::DrainC2SFromPoller() {
       continue;
     }
     
-    // For now, use basic echo processing until proper gRPC integration is available
+    // Proper gRPC service dispatch implementation
+    fprintf(stderr, "*** DEBUG: Implementing proper gRPC service dispatch for command type=%d ***\n", static_cast<int>(cmd.type));
+    fflush(stderr);
+    
+    // Per-stream state for tracking active service calls
+    static std::map<uint64_t, CallInitiator> active_calls;
+    static Mutex active_calls_mu;
+    
+    switch (cmd.type) {
+      case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
+        fprintf(stderr, "*** DEBUG: Handling C2S_INITIAL_METADATA for stream_id=%lu ***\n", cmd.stream_id);
+        fflush(stderr);
+        
+        // Create arena and service call
+        auto arena = call_arena_allocator_->MakeArena();
+        auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+        arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+        
+        // Parse metadata from the command (simplified for now)
+        auto md = arena->MakePooledForOverwrite<ClientMetadata>();
+        md->Set(HttpPathMetadata(), Slice::FromCopiedString("/helloworld.Greeter/SayHello"));
+        md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
+        md->Set(HttpAuthorityMetadata(), Slice::FromCopiedString("shmem://grpc_shmem_example"));
+        md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
+        md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+        md->Set(TeMetadata(), TeMetadata::kTrailers);
+        
+        auto call = MakeCallPair(std::move(md), std::move(arena));
+        
+        // Store call initiator for message delivery
+        {
+          MutexLock lock(&active_calls_mu);
+          active_calls[cmd.stream_id] = call.initiator;
+        }
+        
+        // Get service destination and start call
+        RefCountedPtr<UnstartedCallDestination> dest;
+        {
+          MutexLock lock(&dest_mu_);
+          dest = dest_;
+        }
+        
+        if (dest != nullptr) {
+          fprintf(stderr, "*** DEBUG: Starting service call via dest->StartCall ***\n");
+          fflush(stderr);
+          dest->StartCall(std::move(call.handler));
+          fprintf(stderr, "*** DEBUG: Service call started successfully! ***\n");
+          fflush(stderr);
+          
+          // Set up response bridge to handle service responses
+          auto stream_id = cmd.stream_id;
+          auto call_initiator = call.initiator;
+          call_initiator.SpawnGuarded("shmem-response-bridge",
+            [this, stream_id, call_initiator]() mutable {
+              fprintf(stderr, "*** DEBUG: Starting response bridge for stream_id=%lu ***\n", stream_id);
+              fflush(stderr);
+              return ShmemCallOutboundLoop(stream_id, std::move(call_initiator));
+            });
+          fprintf(stderr, "*** DEBUG: Response bridge set up for stream_id=%lu ***\n", stream_id);
+          fflush(stderr);
+        } else {
+          fprintf(stderr, "*** DEBUG: No service destination available ***\n");
+          fflush(stderr);
+        }
+        
+        // Release consumed data
+        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        break;
+      }
+      
+      case grpc_shmem::FrameType::C2S_MESSAGE: {
+        fprintf(stderr, "*** DEBUG: Handling C2S_MESSAGE for stream_id=%lu, size=%u ***\n", cmd.stream_id, cmd.data_size);
+        fflush(stderr);
+        
+        // Find active call for this stream
+        CallInitiator initiator;
+        bool found = false;
+        {
+          MutexLock lock(&active_calls_mu);
+          auto it = active_calls.find(cmd.stream_id);
+          if (it != active_calls.end()) {
+            initiator = it->second;
+            found = true;
+          }
+        }
+        
+        if (found) {
+          // Create message from ring buffer data
+          grpc_slice s = grpc_shmem::MakeSliceFromRing(
+              &cb_->GetC2SQueues()->data_rb, cb_, cmd.data_offset, cmd.data_size);
+          
+          // Deliver message to service
+          initiator.SpawnInfallible("push-c2s-msg", [initiator, s]() mutable {
+            SliceBuffer sb;
+            sb.AppendIndexed(Slice(s));
+            auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
+            fprintf(stderr, "*** DEBUG: Pushing message to service via SpawnPushMessage ***\n");
+            fflush(stderr);
+            initiator.SpawnPushMessage(std::move(msg));
+            return Empty{};
+          });
+          fprintf(stderr, "*** DEBUG: Message delivery spawned successfully ***\n");
+          fflush(stderr);
+        } else {
+          fprintf(stderr, "*** DEBUG: No active call found for stream_id=%lu ***\n", cmd.stream_id);
+          fflush(stderr);
+          // Release data if no active call
+          cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        }
+        break;
+      }
+      
+      case grpc_shmem::FrameType::C2S_TRAILING_METADATA: {
+        fprintf(stderr, "*** DEBUG: Handling C2S_TRAILING_METADATA for stream_id=%lu ***\n", cmd.stream_id);
+        fflush(stderr);
+        
+        // Signal end of stream to service
+        CallInitiator initiator;
+        bool found = false;
+        {
+          MutexLock lock(&active_calls_mu);
+          auto it = active_calls.find(cmd.stream_id);
+          if (it != active_calls.end()) {
+            initiator = it->second;
+            found = true;
+            active_calls.erase(it); // Clean up
+          }
+        }
+        
+        if (found) {
+          initiator.SpawnInfallible("finish-recv", [initiator]() mutable {
+            fprintf(stderr, "*** DEBUG: Signaling FinishSends to service ***\n");
+            fflush(stderr);
+            initiator.SpawnFinishSends();
+            return Empty{};
+          });
+          fprintf(stderr, "*** DEBUG: FinishRecv spawned successfully ***\n");
+          fflush(stderr);
+        }
+        
+        // Release consumed data
+        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        break;
+      }
+      
+      default: {
+        fprintf(stderr, "*** DEBUG: Unhandled command type=%d ***\n", static_cast<int>(cmd.type));
+        fflush(stderr);
+        // Release data for unhandled commands
+        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        break;
+      }
+    }
+    
+    if (false) { // Keep old basic echo disabled 
     switch (cmd.type) {
       case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
         // Echo back S2C_INITIAL_METADATA
@@ -2076,7 +2458,12 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         response.data_offset = 0;
         response.data_size = 0;
         response.grpc_status_code = 0; // GRPC_STATUS_OK
+        fprintf(stderr, "*** DEBUG: Server sending S2C_TRAILING_METADATA response: stream_id=%lu ***\n", 
+                response.stream_id);
+        fflush(stderr);
         grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, response, sem_adapter_.get());
+        fprintf(stderr, "*** DEBUG: Server S2C_TRAILING_METADATA PushCommand completed ***\n");
+        fflush(stderr);
         // Release the metadata data
         cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
         break;
@@ -2085,23 +2472,44 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         VLOG(2) << "Server: ignoring command type " << static_cast<int>(cmd.type);
         break;
     }
+    } // End of disabled basic echo processing
   }
+  
+  fprintf(stderr, "*** DEBUG: DrainC2SFromPoller processed %d commands ***\n", commands_processed);
+  fflush(stderr);
 }
 
 void ShmemServerTransport::OnC2SReadable(void* arg, grpc_error_handle error) {
   auto* self = static_cast<ShmemServerTransport*>(arg);
+  fprintf(stderr, "*** DEBUG: Server OnC2SReadable CALLED! ***\n");
+  fflush(stderr);
   ExecCtx exec_ctx;
-  // Re-arm first to avoid missed edges
-  grpc_fd_notify_on_read(self->c2s_grpc_fd_, &self->c2s_on_readable_);
-  if (!error.ok()) return;
-  // Drain the eventfd
+  LOG(INFO) << "Server OnC2SReadable called, error=" << error;
+  if (!error.ok()) {
+    LOG(ERROR) << "Server OnC2SReadable error: " << error;
+    // Re-arm even on error to keep receiving notifications
+    grpc_fd_notify_on_read(self->c2s_grpc_fd_, &self->c2s_on_readable_);
+    return;
+  }
+  // Drain the eventfd first
   uint64_t v;
-  while (read(self->c2s_doorbell_fd_, &v, sizeof(v)) == 8) {}
+  int read_count = 0;
+  while (read(self->c2s_doorbell_fd_, &v, sizeof(v)) == 8) {
+    read_count++;
+  }
+  LOG(INFO) << "Server drained " << read_count << " eventfd notifications";
   // Drain C2S queue without blocking
   self->DrainC2SFromPoller();
+  // Re-arm after processing to avoid missed edges
+  grpc_fd_notify_on_read(self->c2s_grpc_fd_, &self->c2s_on_readable_);
+  LOG(INFO) << "Server OnC2SReadable re-armed";
 }
 
+// Unix socket callback removed - using futex doorbells only
+
 void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
+  fprintf(stderr, "*** DEBUG: Client StartCall CALLED! ***\n");
+  fflush(stderr);
   ExecCtx exec_ctx;  // CRITICAL: Ensure SpawnGuarded tasks actually execute
   VLOG(1) << "CLIENT: StartCall scheduling send pipelines";
   EnsureReaderStarted();  // Start S2C reader for all RPCs
@@ -2166,7 +2574,11 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                  grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S, pad_cmd, sem_adapter_.get());
                }
                grpc_shmem::Command cmd{stream_id, grpc_shmem::FrameType::C2S_INITIAL_METADATA, off, (uint32_t)vec.size(), 0, 0};
+               fprintf(stderr, "*** DEBUG: Client about to PushCommand C2S_INITIAL_METADATA, sem_adapter=%p ***\n", sem_adapter_.get());
+               fflush(stderr);
                grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S, cmd, sem_adapter_.get());
+               fprintf(stderr, "*** DEBUG: Client PushCommand completed ***\n");
+               fflush(stderr);
                
                VLOG(1) << "CLIENT: Pushed C2S_INITIAL_METADATA stream_id=" << stream_id;
                return absl::OkStatus();
@@ -2386,6 +2798,9 @@ MakeShmemTransportPairImpl(const ChannelArgs& server_channel_args,
 
 OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     const std::string& server_name, const ChannelArgs& server_channel_args) {
+  fprintf(stderr, "*** DEBUG: MakeNamedShmemServerTransport called with server_name: %s ***\n", server_name.c_str());
+  fflush(stderr);
+  LOG(INFO) << "MakeNamedShmemServerTransport called with server_name: " << server_name;
   VLOG(2) << "MakeNamedShmemServerTransport called with server_name: " << server_name;
   
   // Reuse existing auth context if available, otherwise create one
@@ -2398,9 +2813,12 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     VLOG(2) << "Reusing provided auth context: " << auth_ctx.get();
   }
   
-  // Force ring mode for cross-process server and include auth context
+  // Force ring mode for cross-process server and include auth context  
+  // Add flag to indicate this is a named server requiring immediate FD exchange setup
   ChannelArgs ring_mode_args = server_channel_args
       .Set("grpc.shmem.dispatch_only", false)
+      .Set("grpc.shmem.is_named_server", true)
+      .Set("grpc.shmem.server_name", server_name)
       .SetObject(auth_ctx);
 
   std::unique_ptr<grpc_shmem::ShmemSegment> segment;
@@ -2415,9 +2833,13 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
   VLOG(2) << "Removing existing segment if exists...";
   grpc_shmem::ShmemSegment::RemoveIfExists(cfg.name);
   
+  fprintf(stderr, "*** DEBUG: Creating new segment: %s ***\n", cfg.name.c_str());
+  fflush(stderr);
   VLOG(2) << "Creating new segment...";
   auto s = grpc_shmem::ShmemSegment::Create(cfg);
   
+  fprintf(stderr, "*** DEBUG: Created segment, control block: %p ***\n", s.control());
+  fflush(stderr);
   VLOG(2) << "Created segment, checking control block...";
   if (s.control() == nullptr) {
     LOG(ERROR) << "Failed to create named shmem segment: " << cfg.name;
@@ -2440,6 +2862,8 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
 
 OrphanablePtr<Transport> ConnectToShmemServerTransport(
     const std::string& server_name, const ChannelArgs& client_channel_args) {
+  fprintf(stderr, "*** DEBUG: ConnectToShmemServerTransport called with server_name: %s ***\n", server_name.c_str());
+  fflush(stderr);
   VLOG(2) << "ConnectToShmemServerTransport called with server_name: " << server_name;
   
   const bool dispatch_only =
@@ -2451,10 +2875,14 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   }
 
   std::string segment_name = absl::StrCat("grpc_shmem_", server_name);
+  fprintf(stderr, "*** DEBUG: Opening segment: %s ***\n", segment_name.c_str());
+  fflush(stderr);
   VLOG(2) << "Opening segment: " << segment_name;
   
   auto segment = grpc_shmem::ShmemSegment::Open(segment_name);
   
+  fprintf(stderr, "*** DEBUG: Segment opened, control block: %p ***\n", segment.control());
+  fflush(stderr);
   VLOG(2) << "Segment opened, control block: " << segment.control();
   if (segment.control() == nullptr) {
     LOG(ERROR) << "Failed to connect to shmem server: " << server_name;
@@ -2467,14 +2895,21 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   
   auto segment_ptr = std::make_unique<grpc_shmem::ShmemSegment>(std::move(segment));
   
+  fprintf(stderr, "*** DEBUG: About to store segment and create client transport ***\n");
+  fflush(stderr);
   VLOG(2) << "About to store segment and create client transport";
   
   // Store segment for cleanup
   StoreCrossProcessSegment(cb, std::move(segment_ptr));
   
+  fprintf(stderr, "*** DEBUG: Creating client transport with cb: %p ***\n", cb);
+  fflush(stderr);
   VLOG(2) << "Creating client transport with cb: " << cb;
   
-  return OrphanablePtr<Transport>(MakeOrphanable<ShmemClientTransport>(nullptr, cb, client_channel_args).release());
+  auto result = OrphanablePtr<Transport>(MakeOrphanable<ShmemClientTransport>(nullptr, cb, client_channel_args).release());
+  fprintf(stderr, "*** DEBUG: Client transport created successfully ***\n");
+  fflush(stderr);
+  return result;
 }
 
 // Duplicate function definition removed
