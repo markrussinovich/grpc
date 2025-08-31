@@ -113,7 +113,50 @@ static RefCountedPtr<Channel> MakeLameChannelFromStatus(const absl::Status& st,
 
 }  // namespace
 
-// Exact analog of MakeInprocChannel(...) but for shmem. [1]
+// Legacy-compatible shmem channel creation (for AsyncService support)
+RefCountedPtr<Channel> MakeLegacyShmemChannel(
+    Server* server, ChannelArgs client_channel_args) {
+  // Legacy approach: similar to legacy_inproc but using shmem transport
+  VLOG(2) << "MakeLegacyShmemChannel starting - legacy server integration";
+  
+  auto auth_ctx = MakeShmemAuthContext();
+  auto server_args_with_auth = server->channel_args().SetObject(auth_ctx);
+  
+  auto transports = MakeShmemTransportPair(server_args_with_auth, client_channel_args);
+  auto client_transport = std::move(transports.first);
+  auto server_transport = std::move(transports.second);
+
+  // Legacy server integration - no promise-based setup
+  auto setup_args = server_args_with_auth
+      .Remove(GRPC_ARG_MAX_CONNECTION_IDLE_MS)
+      .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS);
+  
+  auto error = server->SetupTransport(
+      server_transport.get(),
+      /*accept_stream_fn=*/nullptr,
+      setup_args,
+      /*socket_node=*/nullptr);
+  
+  if (!error.ok()) {
+    return MakeLameChannelFromStatus(error, "server transport setup failed");
+  }
+  (void)server_transport.release();
+
+  // Create LEGACY channel - do NOT set GRPC_ARG_USE_V3_STACK
+  auto channel_result = ChannelCreate(
+      /*target=*/"shmem",
+      client_channel_args.Set(GRPC_ARG_DEFAULT_AUTHORITY, "shmem.authority"),
+      GRPC_CLIENT_DIRECT_CHANNEL,
+      /*optional_transport=*/client_transport.release());
+  
+  if (!channel_result.ok()) {
+    return MakeLameChannelFromStatus(channel_result.status(),
+                                     "legacy shmem channel creation failed");
+  }
+  return std::move(*channel_result);
+}
+
+// Promise-based shmem channel creation (for modern server stack)
 RefCountedPtr<Channel> MakeShmemChannel(
     Server* server, ChannelArgs client_channel_args) {
   // 1) Build the transport pair using distinct server and client ChannelArgs.
@@ -194,17 +237,26 @@ extern "C" grpc_channel* grpc_shmem_channel_create(
                          .channel_args_preconditioning()
                          .PreconditionChannelArgs(args);
   
-  // Follow the same pattern as inproc: check if we should use promise-based transport
-  // For now, always use legacy transport to match inproc behavior (IsPromiseBasedInprocTransportEnabled() returns false)
-  bool use_promise_based = client_args
-      .GetBool("grpc.experimental.promise_based_shmem_transport")
-      .value_or(false);  // Default to false like inproc
+  // Default: promise/v3 path via SetCallDestination (what most modern servers expect)
+  // Benchmark / CQ-based servers: opt-in to the legacy accept_stream path via channel arg
+  bool use_legacy_cq_mode = client_args
+      .GetBool("grpc.experimental.shmem_use_legacy_cq_mode")
+      .value_or(false);  // Default to promise-based mode (modern server stack)
       
-  if (!use_promise_based) {
-    // Use inproc legacy for full legacy filter+CQ behavior; use original args.
-    return grpc_inproc_channel_create(server, args, nullptr);
+  if (use_legacy_cq_mode) {
+    // LEGACY MODE: Use accept_stream callbacks for CQ-based servers (AsyncService)
+    // This ensures full AsyncService/completion queue compatibility
+    VLOG(2) << "Creating legacy shmem channel with accept_stream support (opt-in CQ mode)";
+    
+    // Create channel using legacy server integration (no V3 stack)
+    auto ch = grpc_core::MakeLegacyShmemChannel(grpc_core::Server::FromC(server),
+                                                std::move(client_args));
+    return ch.release()->c_ptr();
   }
   
+  // DEFAULT MODE: Promise-based transport with SetCallDestination integration
+  // This works with both modern promise-based servers and AsyncService (via dual-mode architecture)
+  VLOG(2) << "Creating promise-based shmem channel (default mode)";
   auto ch = grpc_core::MakeShmemChannel(grpc_core::Server::FromC(server),
                                         std::move(client_args));
   return ch.release()->c_ptr();

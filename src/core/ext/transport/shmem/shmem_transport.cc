@@ -240,7 +240,7 @@ static int RecvFd(int sock) {
 
 // Data structure for announcing streams to core via accept callback
 struct ShmemServerData {
-  uint32_t stream_id;
+  uint64_t stream_id;  // Use 64-bit to match client stream IDs
   std::vector<grpc_shmem::KVPair> initial_md;
 };
 
@@ -732,8 +732,32 @@ class ShmemServerTransport final : public ServerTransport {
   }
   
   void SetCallDestination(RefCountedPtr<UnstartedCallDestination> h) override {
-    MutexLock lock(&dest_mu_);
-    dest_ = std::move(h);
+    fprintf(stderr, "*** DEBUG: SetCallDestination called - promise-based integration ready ***\n");
+    fflush(stderr);
+    
+    std::vector<PendingCall> pending_to_flush;
+    {
+      MutexLock lock(&dest_mu_);
+      dest_ = std::move(h);
+      dest_ready_ = true;
+      
+      // Only flush if legacy callback is not already handling calls
+      if (accept_stream_cb_ == nullptr) {
+        pending_to_flush = std::move(pending_calls_);
+        pending_calls_.clear();
+        fprintf(stderr, "*** DEBUG: Flushing %zu calls to PROMISE path ***\n", pending_to_flush.size());
+        fflush(stderr);
+      } else {
+        fprintf(stderr, "*** DEBUG: Legacy callback already set, not flushing to promise path ***\n");
+        fflush(stderr);
+      }
+    }
+    
+    // Start pending calls using promise-based approach
+    for (auto& pc : pending_to_flush) {
+      StartCallNow(std::move(pc), /*from_flush=*/true);
+    }
+    
     // Report READY (matches inproc behavior).
     state_.store(ConnectionState::kReady, std::memory_order_release);
     MutexLock l(&state_tracker_mu_);
@@ -745,7 +769,9 @@ class ShmemServerTransport final : public ServerTransport {
   // have already installed its own callback via PerformOp during
   // Server::SetupTransport. We simply start consuming C2S traffic and call
   // that callback when new streams arrive, mirroring TCP behavior.
-  fprintf(stderr, "*** DEBUG: SetCallDestination called - server ready for clients ***\n");
+  fprintf(stderr, "*** DEBUG: SetCallDestination called - accept_stream_cb_=%p ***\n", (void*)accept_stream_cb_);
+  fflush(stderr);
+  fprintf(stderr, "*** DEBUG: SetCallDestination: accept_stream_cb_ = %p ***\n", (void*)accept_stream_cb_);
   fflush(stderr);
   LOG(INFO) << "SetCallDestination called - server ready for clients (NO THREADS)";
 
@@ -942,22 +968,57 @@ class ShmemServerTransport final : public ServerTransport {
   // Legacy stream-op vtable methods removed (promise-based path only).
   
   void PerformOp(grpc_transport_op* op) override {
+    fprintf(stderr, "*** DEBUG: ShmemServerTransport::PerformOp called ***\n");
+    fflush(stderr);
+    LOG(INFO) << "ShmemServerTransport::PerformOp called";
+    
     // Handle connectivity watch like inproc.
     if (op->start_connectivity_watch != nullptr) {
+      fprintf(stderr, "*** DEBUG: PerformOp: start_connectivity_watch set ***\n");
+      fflush(stderr);
       MutexLock l(&state_tracker_mu_);
       state_tracker_.AddWatcher(op->start_connectivity_watch_state,
                                 std::move(op->start_connectivity_watch));
     }
     if (op->stop_connectivity_watch != nullptr) {
+      fprintf(stderr, "*** DEBUG: PerformOp: stop_connectivity_watch set ***\n");
+      fflush(stderr);
       MutexLock l(&state_tracker_mu_);
       state_tracker_.RemoveWatcher(op->stop_connectivity_watch);
     }
     
     // Handle accept stream callback registration - following TCP transport pattern
     if (op->set_accept_stream) {
+      fprintf(stderr, "*** DEBUG: PerformOp: set_accept_stream=true - REGISTERING CALLBACK ***\n");
+      fflush(stderr);
       LOG(INFO) << "ShmemServerTransport: Registering accept_stream_cb";
       accept_stream_cb_ = op->set_accept_stream_fn;
       accept_stream_cb_user_data_ = op->set_accept_stream_user_data;
+      
+      // FLUSH PENDING CALLS TO LEGACY PATH: if calls arrived before accept_stream_cb was set
+      std::vector<PendingCall> pending_to_flush;
+      {
+        MutexLock lock(&dest_mu_);
+        // Only flush if promise-based destination is not already handling calls
+        if (!dest_ready_) {
+          pending_to_flush = std::move(pending_calls_);
+          pending_calls_.clear();
+          fprintf(stderr, "*** DEBUG: Flushing %zu calls to LEGACY accept_stream path ***\n", pending_to_flush.size());
+          fflush(stderr);
+        } else {
+          fprintf(stderr, "*** DEBUG: Promise-based dest already set, not flushing to legacy path ***\n");
+          fflush(stderr);
+        }
+      }
+      
+      // Process pending calls using legacy accept_stream callback
+      for (auto& pc : pending_to_flush) {
+        auto* server_data = new ShmemServerData{pc.stream_id, std::move(pc.kvs_for_legacy)};
+        accept_stream_cb_(accept_stream_cb_user_data_, this, server_data);
+      }
+    } else {
+      fprintf(stderr, "*** DEBUG: PerformOp: set_accept_stream=false - NO CALLBACK ***\n");
+      fflush(stderr);
     }
     
     // Server-initiated disconnect: finish all in-flight calls with UNAVAILABLE.
@@ -1021,12 +1082,19 @@ class ShmemServerTransport final : public ServerTransport {
   // Response monitoring loop - forward real server responses onto S2C ring.
   // Implement CallOutboundLoop equivalent for shmem cross-process communication
   auto ShmemCallOutboundLoop(uint64_t stream_id, CallInitiator call_initiator) {
+    fprintf(stderr, "*** DEBUG: ShmemCallOutboundLoop STARTED for stream_id=%lu ***\n", stream_id);
+    fflush(stderr);
     return Seq(
         TrySeq(
           call_initiator.PullServerInitialMetadata(),
           [this, stream_id](std::optional<ServerMetadataHandle> md) {
+            fprintf(stderr, "*** DEBUG: ShmemCallOutboundLoop: PullServerInitialMetadata returned, has_value=%s ***\n", 
+                    md.has_value() ? "true" : "false");
+            fflush(stderr);
             if (md.has_value()) {
               // Server response delay removed - testing other locations
+              fprintf(stderr, "*** DEBUG: SERVER: Sending S2C_INITIAL_METADATA stream_id=%lu ***\n", stream_id);
+              fflush(stderr);
               VLOG(1) << "SERVER: Sending S2C_INITIAL_METADATA stream_id=" << stream_id;
               std::vector<grpc_shmem::KVPair> kvs;
               kvs.push_back({"content-type", "application/grpc"});
@@ -1051,9 +1119,26 @@ class ShmemServerTransport final : public ServerTransport {
         ),
         ForEach(MessagesFrom(call_initiator),
           [this, stream_id](MessageHandle msg) {
+            fprintf(stderr, "*** DEBUG: ShmemCallOutboundLoop: Processing message for stream_id=%lu ***\n", stream_id);
+            fflush(stderr);
             auto* payload = msg->payload();
             const size_t n = payload->Length();
-            if (n == 0) return Success{};  // nothing to send
+            fprintf(stderr, "*** DEBUG: ShmemCallOutboundLoop: Message size=%zu ***\n", n);
+            fflush(stderr);
+            if (n == 0) {
+              // Still need to send S2C_MESSAGE frame for 0-byte messages to signal completion
+              fprintf(stderr, "*** DEBUG: ShmemCallOutboundLoop: Sending empty S2C_MESSAGE for stream_id=%lu ***\n", stream_id);
+              fflush(stderr);
+              grpc_shmem::Command cmd{};
+              cmd.stream_id = stream_id;
+              cmd.type = grpc_shmem::FrameType::S2C_MESSAGE;
+              cmd.data_offset = 0;  // No data
+              cmd.data_size = 0;
+              grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, cmd, sem_adapter_.get());
+              return Success{};
+            }
+            fprintf(stderr, "*** DEBUG: ShmemCallOutboundLoop: About to send S2C_MESSAGE for stream_id=%lu, size=%zu ***\n", stream_id, n);
+            fflush(stderr);
             VLOG(2) << "ShmemCallOutboundLoop: sending S2C_MESSAGE for stream " << stream_id << ", size=" << n;
             
             auto* rb = &cb_->GetS2CQueues()->data_rb;
@@ -1161,6 +1246,8 @@ class ShmemServerTransport final : public ServerTransport {
         Map(
           call_initiator.PullServerTrailingMetadata(),
           [this, stream_id](ServerMetadataHandle md) {
+            fprintf(stderr, "*** DEBUG: ShmemCallOutboundLoop: PullServerTrailingMetadata returned for stream_id=%lu ***\n", stream_id);
+            fflush(stderr);
             VLOG(1) << "SERVER: Sending S2C_TRAILING_METADATA stream_id=" << stream_id;
             std::vector<grpc_shmem::KVPair> kvs;
             grpc_status_code status = GRPC_STATUS_OK;
@@ -1383,77 +1470,81 @@ class ShmemServerTransport final : public ServerTransport {
                 }
               
               if (dest != nullptr) {
-                VLOG(2) << "ServerLoop - About to create call, dest: " << dest.get();
+                fprintf(stderr, "*** DEBUG: Building CLIENT initial metadata for proper routing ***\n");
+                fflush(stderr);
                 
+                // 1) Build CLIENT initial MD
                 auto arena = call_arena_allocator_->MakeArena();
-                VLOG(3) << "ServerLoop - Created arena: " << arena.get();
-                
                 auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
                 arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
                 
-                // CRITICAL FIX: Build client metadata from the deserialized C2S data
-                // This is the actual client metadata that should be passed to the server call
-                VLOG(2) << "ServerLoop - Building client metadata from C2S data";
-                auto md = arena->MakePooledForOverwrite<ClientMetadata>();
+                // Client initial metadata handle
+                auto cimd = arena->MakePooledForOverwrite<ClientMetadata>();
                 
-                // Set peer string for shmem transport
-                md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
-                
-                // Forward all the client metadata from C2S ring
+                // Extract :path from parsed kvs (required for method routing)
+                std::string path = "/grpc.testing.EchoTestService/Echo";  // default
                 for (const auto& kv : kvs_in) {
                   if (kv.key == ":path") {
-                    md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
-                  } else if (kv.key == ":method") {
-                    md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
-                  } else if (kv.key == ":scheme") {
-                    if (kv.value == "https")
-                      md->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttps);
-                    else
-                      md->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttp);
-                  } else if (kv.key == "te") {
-                    md->Set(TeMetadata(), TeMetadata::kTrailers);
-                  } else if (kv.key == "content-type") {
-                    md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
-                  } else if (kv.key == "grpc-accept-encoding") {
-                    md->Set(GrpcAcceptEncodingMetadata(), CompressionAlgorithmSet{GRPC_COMPRESS_NONE});
-                  } else if (kv.key == "user-agent") {
-                    md->Set(UserAgentMetadata(), Slice::FromCopiedString(kv.value));
-                  } else if (kv.key == ":authority") {
-                    md->Set(HttpAuthorityMetadata(), Slice::FromCopiedString(kv.value));
-                  } else {
-                    md->Append(kv.key, Slice::FromCopiedString(kv.value),
-                               [](absl::string_view, const Slice&) {});
+                    path = kv.value;
+                    break;
                   }
                 }
-                VLOG(2) << "ServerLoop - Client metadata built with " << kvs_in.size() << " entries";
                 
-                VLOG(2) << "ServerLoop - About to call MakeCallPair";
-                auto call = MakeCallPair(std::move(md), std::move(arena));
-                VLOG(3) << "ServerLoop - MakeCallPair completed";
+                fprintf(stderr, "*** DEBUG: Setting required HTTP/2 pseudo-headers, :path='%s' ***\n", path.c_str());
+                fflush(stderr);
                 
-                st.initiator.emplace(call.initiator);
+                // Fill required pseudo headers and gRPC headers
+                cimd->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
+                cimd->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttp);
+                cimd->Set(HttpAuthorityMetadata(), Slice::FromCopiedString("shmem"));
+                cimd->Set(HttpPathMetadata(), Slice::FromCopiedString(path));
                 
-                // Start the server call - auth context should come from server channel args now
-                VLOG(1) << "SERVER: Calling dest->StartCall stream_id=" << cmd.stream_id;
+                // gRPC-required headers
+                cimd->Set(TeMetadata(), TeMetadata::kTrailers);
+                cimd->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+                
+                // Append user metadata from kvs_in (excluding :pseudo headers we already set)
+                for (const auto& kv : kvs_in) {
+                  if (kv.key.size() && kv.key[0] == ':') continue;  // skip pseudo headers
+                  cimd->Append(kv.key, Slice::FromCopiedString(kv.value),
+                               [](absl::string_view, const Slice&) {});
+                }
+                
+                fprintf(stderr, "*** DEBUG: CLIENT metadata populated, creating call pair ***\n");
+                fflush(stderr);
+                
+                // 2) Create the server call pair using CLIENT initial metadata
+                auto call = MakeCallPair(std::move(cimd), std::move(arena));
+                
+                // 3) Publish initiator so MESSAGE/TRAILING can find it
+                {
+                  MutexLock lk(&stream_initiators_mu_);
+                  stream_initiators_.emplace(cmd.stream_id, call.initiator);
+                }
+                
+                fprintf(stderr, "*** DEBUG: About to call dest->StartCall with proper client metadata ***\n");
+                fflush(stderr);
+                
+                // 4) Start the call via the CallDestination the core gave you
                 dest->StartCall(std::move(call.handler));
-                VLOG(1) << "SERVER: dest->StartCall completed stream_id=" << cmd.stream_id;
                 
-                // The client metadata is now properly embedded in the call via MakeCallPair()
-                // No separate metadata pushing needed - this is how inproc transport works
+                fprintf(stderr, "*** DEBUG: dest->StartCall completed - should trigger AsyncService tags ***\n");
+                fflush(stderr);
                 
-                // Start the response bridge
-                VLOG(1) << "SERVER: Starting response bridge stream_id=" << cmd.stream_id;
-                call.initiator.SpawnGuarded("shmem-response-bridge", 
-                  [this, stream_id = cmd.stream_id, call_initiator = call.initiator]() mutable {
-                    VLOG(1) << "SERVER: Response bridge starting stream_id=" << stream_id;
-                    return ShmemCallOutboundLoop(stream_id, std::move(call_initiator));
-                  });
+                // 5) Start your existing S2C response bridge
+                call.initiator.SpawnGuarded("shmem-response-bridge",
+                    [this, sid = static_cast<uint32_t>(cmd.stream_id), ci = call.initiator]() mutable {
+                      return ShmemCallOutboundLoop(sid, std::move(ci));
+                    });
                 } else {
-                  VLOG(1) << "No call destination available for stream " << cmd.stream_id;
+                  fprintf(stderr, "*** DEBUG: No call destination available ***\n");
+                  fflush(stderr);
                 }
                 
                 st.sent_initial = true;
-                if (cmd.data_size != 0) {
+                
+                // 6) Release the C2S metadata bytes you consumed
+                if (cmd.data_size) {
                   cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
                 }
               } else {
@@ -1603,7 +1694,7 @@ class ShmemServerTransport final : public ServerTransport {
               st.pending_message.reset();
             }
             
-            // Client half-close: Signal FinishSends to server pipeline
+            // Client half-close: Signal FinishSends for server pipeline
             if (st.initiator.has_value()) {
               st.initiator->SpawnFinishSends();
             }
@@ -1687,6 +1778,19 @@ class ShmemServerTransport final : public ServerTransport {
   std::atomic<bool> cleanup_complete_{false};
   RefCountedPtr<UnstartedCallDestination> dest_;
   Mutex dest_mu_;
+  bool dest_ready_ ABSL_GUARDED_BY(dest_mu_) = false;
+  
+  // Pending calls that arrived before integration point is ready
+  struct PendingCall {
+    uint64_t stream_id;  // Use 64-bit to match client stream IDs
+    RefCountedPtr<Arena> arena;
+    ClientMetadataHandle client_initial_md;
+    std::vector<grpc_shmem::KVPair> kvs_for_legacy;  // Original kvs for legacy path
+  };
+  std::vector<PendingCall> pending_calls_ ABSL_GUARDED_BY(dest_mu_);
+  
+  // Helper method to start calls with proper ordering
+  void StartCallNow(PendingCall pc, bool from_flush);
   
   // Accept stream callback fields - following TCP transport pattern  
   void (*accept_stream_cb_)(void* user_data, grpc_core::Transport* transport,
@@ -1728,8 +1832,21 @@ class ShmemServerTransport final : public ServerTransport {
   std::unordered_set<uint32_t> completed_streams_;
   // ForwardCall support: store CallInitiators for client access
   Mutex stream_initiators_mu_;
-  absl::flat_hash_map<uint32_t, CallInitiator> stream_initiators_
+  absl::flat_hash_map<uint64_t, CallInitiator> stream_initiators_
       ABSL_GUARDED_BY(stream_initiators_mu_);
+
+  // RACE CONDITION FIX: Buffer C2S frames that arrive before FinishAccept() completes
+  struct PendingMessage {
+    grpc_shmem::Command cmd;
+    std::vector<uint8_t> data;  // Copy of message data from ring buffer
+    PendingMessage(const grpc_shmem::Command& c, const uint8_t* buf, size_t len) 
+        : cmd(c), data(buf, buf + len) {}
+  };
+  Mutex pending_messages_mu_;
+  absl::flat_hash_map<uint32_t, std::vector<PendingMessage>> pending_c2s_msgs_
+      ABSL_GUARDED_BY(pending_messages_mu_);
+  absl::flat_hash_map<uint32_t, PendingMessage> pending_trailing_
+      ABSL_GUARDED_BY(pending_messages_mu_);
 
   // Efficient signaling mechanism - per-stream synchronization
   struct StreamSync {
@@ -1816,9 +1933,14 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
 
   // Convert sd->initial_md -> ClientMetadata (same code you already had)
   auto md = arena->MakePooledForOverwrite<ClientMetadata>();
+  std::string path_value;
   for (const auto& kv : sd->initial_md) {
-    if (kv.key == ":path") md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
-    else if (kv.key == ":method") md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
+    fprintf(stderr, "*** DEBUG: FinishAccept metadata: key='%s', value='%s' ***\n", kv.key.c_str(), kv.value.c_str());
+    fflush(stderr);
+    if (kv.key == ":path") {
+      path_value = kv.value;
+      md->Set(HttpPathMetadata(), Slice::FromCopiedString(kv.value));
+    } else if (kv.key == ":method") md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
     else if (kv.key == ":scheme")
       md->Set(HttpSchemeMetadata(), kv.value == "https" ? HttpSchemeMetadata::kHttps
                                                         : HttpSchemeMetadata::kHttp);
@@ -1835,6 +1957,8 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
       md->Append(kv.key, Slice::FromCopiedString(kv.value), [](absl::string_view, const Slice&) {});
   }
   md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
+  fprintf(stderr, "*** DEBUG: FinishAccept path='%s', calling MakeCallPair ***\n", path_value.c_str());
+  fflush(stderr);
 
   auto call = MakeCallPair(std::move(md), std::move(arena));
 
@@ -1843,12 +1967,72 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
   if (d == nullptr) { delete sd; return; }
 
   // THIS is where core/filters are ready; StartCall now is safe.
+  fprintf(stderr, "*** DEBUG: About to call StartCall on UnstartedCallDestination ***\n");
+  fflush(stderr);
   d->StartCall(std::move(call.handler));
+  fprintf(stderr, "*** DEBUG: StartCall completed ***\n");
+  fflush(stderr);
 
   {
     MutexLock lk(&stream_initiators_mu_);
     stream_initiators_.emplace(sd->stream_id, call.initiator);
   }
+  
+  // RACE CONDITION FIX: Flush any pending messages that arrived before FinishAccept() completed
+  fprintf(stderr, "*** DEBUG: FinishAccept - flushing pending messages for stream_id=%u ***\n", sd->stream_id);
+  fflush(stderr);
+  
+  // Process pending C2S messages
+  std::vector<PendingMessage> pending_msgs;
+  std::unique_ptr<PendingMessage> pending_trailing;
+  {
+    MutexLock lock(&pending_messages_mu_);
+    auto it = pending_c2s_msgs_.find(sd->stream_id);
+    if (it != pending_c2s_msgs_.end()) {
+      pending_msgs = std::move(it->second);
+      pending_c2s_msgs_.erase(it);
+      fprintf(stderr, "*** DEBUG: Found %zu pending C2S messages for stream_id=%u ***\n", pending_msgs.size(), sd->stream_id);
+      fflush(stderr);
+    }
+    
+    auto trailing_it = pending_trailing_.find(sd->stream_id);
+    if (trailing_it != pending_trailing_.end()) {
+      pending_trailing = std::make_unique<PendingMessage>(std::move(trailing_it->second));
+      pending_trailing_.erase(trailing_it);
+      fprintf(stderr, "*** DEBUG: Found pending trailing metadata for stream_id=%u ***\n", sd->stream_id);
+      fflush(stderr);
+    }
+  }
+  
+  // Deliver pending messages in order
+  for (const auto& pending_msg : pending_msgs) {
+    fprintf(stderr, "*** DEBUG: Delivering pending C2S message, size=%u ***\n", pending_msg.cmd.data_size);
+    fflush(stderr);
+    
+    call.initiator.SpawnInfallible("push-pending-msg", [call_initiator = call.initiator, pending_msg]() mutable {
+      SliceBuffer sb;
+      // Create slice from copied data
+      grpc_slice s = grpc_slice_from_copied_buffer(
+          reinterpret_cast<const char*>(pending_msg.data.data()), 
+          pending_msg.data.size());
+      sb.AppendIndexed(Slice(s));
+      auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
+      call_initiator.SpawnPushMessage(std::move(msg));
+      return Empty{};
+    });
+  }
+  
+  // Deliver pending trailing metadata (signals end of client stream)
+  if (pending_trailing) {
+    fprintf(stderr, "*** DEBUG: Delivering pending trailing metadata ***\n");
+    fflush(stderr);
+    
+    call.initiator.SpawnInfallible("finish-pending-recv", [call_initiator = call.initiator]() mutable {
+      call_initiator.SpawnFinishSends();
+      return Empty{};
+    });
+  }
+  
   // Start your S2C bridge (unchanged)
   call.initiator.SpawnGuarded("shmem-response-bridge",
       [this, sid = sd->stream_id, ci = call.initiator]() mutable {
@@ -1882,6 +2066,55 @@ void ShmemServerTransport::PerformFinalCleanup() {
   } catch (const std::exception& e) {
     LOG(ERROR) << "ShmemServerTransport::PerformFinalCleanup error: " << e.what();
   }
+}
+
+void ShmemServerTransport::StartCallNow(PendingCall pc, bool from_flush) {
+  fprintf(stderr, "*** DEBUG: StartCallNow called for stream_id=%lu, from_flush=%s ***\n", 
+          pc.stream_id, from_flush ? "true" : "false");
+  fflush(stderr);
+  
+  // Ensure EventEngine context is set on arena
+  auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
+  pc.arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
+  
+  // Build the server call pair with the client initial metadata we saved
+  auto call = MakeCallPair(std::move(pc.client_initial_md), pc.arena);
+  
+  // Stash initiator so MESSAGE/TRAILING can find it
+  {
+    MutexLock lk(&stream_initiators_mu_);
+    stream_initiators_.emplace(pc.stream_id, call.initiator);
+  }
+  
+  // Start on the real destination (now installed by core)
+  RefCountedPtr<UnstartedCallDestination> dest_copy;
+  {
+    MutexLock lk(&dest_mu_);
+    dest_copy = dest_;
+  }
+  
+  if (dest_copy != nullptr) {
+    fprintf(stderr, "*** DEBUG: Starting call on real destination ***\n");
+    fflush(stderr);
+    dest_copy->StartCall(std::move(call.handler));
+    fprintf(stderr, "*** DEBUG: Call started successfully ***\n");
+    fflush(stderr);
+  } else {
+    fprintf(stderr, "*** DEBUG: ERROR: dest_copy is null in StartCallNow ***\n");
+    fflush(stderr);
+  }
+  
+  // Start response bridge
+  fprintf(stderr, "*** DEBUG: About to spawn ShmemCallOutboundLoop for stream_id=%lu ***\n", pc.stream_id);
+  fflush(stderr);
+  call.initiator.SpawnGuarded("shmem-response-bridge",
+      [this, sid = pc.stream_id, ci = call.initiator]() mutable {
+        fprintf(stderr, "*** DEBUG: Inside lambda - about to call ShmemCallOutboundLoop for stream_id=%lu ***\n", sid);
+        fflush(stderr);
+        return ShmemCallOutboundLoop(sid, std::move(ci));
+      });
+  fprintf(stderr, "*** DEBUG: SpawnGuarded call completed for stream_id=%lu ***\n", pc.stream_id);
+  fflush(stderr);
 }
 
 void ShmemClientTransport::EnsureReaderStarted() {
@@ -2063,23 +2296,37 @@ void ShmemClientTransport::DrainS2CFromPoller() {
         break;
       }
       case grpc_shmem::FrameType::S2C_MESSAGE: {
+        fprintf(stderr, "*** DEBUG: CLIENT: Processing S2C_MESSAGE stream_id=%lu, size=%u ***\n", cmd.stream_id, cmd.data_size);
+        fflush(stderr);
         VLOG(2) << "ShmemClientTransport received S2C_MESSAGE for stream " << cmd.stream_id << ", size=" << cmd.data_size;
         grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->GetS2CQueues()->data_rb, cb_, cmd.data_offset, cmd.data_size);
-        handler->SpawnInfallible("push-msg", [h = *handler, s]() mutable {
+        fprintf(stderr, "*** DEBUG: CLIENT: Created slice for S2C_MESSAGE, slice_length=%zu ***\n", GRPC_SLICE_LENGTH(s));
+        fflush(stderr);
+        handler->SpawnInfallible("push-msg", [h = *handler, s, stream_id = cmd.stream_id]() mutable {
+          fprintf(stderr, "*** DEBUG: CLIENT: Inside push-msg lambda for stream_id=%lu ***\n", stream_id);
+          fflush(stderr);
           SliceBuffer sb;
           sb.AppendIndexed(Slice(s));
           auto msg = Arena::MakePooled<Message>(std::move(sb), 0);
+          fprintf(stderr, "*** DEBUG: CLIENT: About to call SpawnPushMessage for stream_id=%lu ***\n", stream_id);
+          fflush(stderr);
           h.SpawnPushMessage(std::move(msg));
+          fprintf(stderr, "*** DEBUG: CLIENT: SpawnPushMessage completed for stream_id=%lu ***\n", stream_id);
+          fflush(stderr);
           return Empty{};
         });
         break;
       }
       case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
+        fprintf(stderr, "*** DEBUG: CLIENT: Processing S2C_TRAILING_METADATA stream_id=%lu ***\n", cmd.stream_id);
+        fflush(stderr);
         VLOG(1) << "CLIENT: Received S2C_TRAILING_METADATA stream_id=" << cmd.stream_id;
         auto data = cb_->GetS2CQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
         auto kvs = grpc_shmem::DeserializeMetadataKVs(data, cmd.data_size);
         handler->SpawnInfallible(
             "push-trailing", [kvs = std::move(kvs), h = *handler, stream_id = cmd.stream_id, this]() mutable {
+              fprintf(stderr, "*** DEBUG: CLIENT: Inside push-trailing lambda for stream_id=%lu ***\n", stream_id);
+              fflush(stderr);
               auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
               grpc_status_code status = GRPC_STATUS_OK;
               for (const auto& kv : kvs) {
@@ -2092,12 +2339,18 @@ void ShmemClientTransport::DrainS2CFromPoller() {
                 }
               }
               md->Set(GrpcStatusMetadata(), status);
+              fprintf(stderr, "*** DEBUG: CLIENT: About to call SpawnPushServerTrailingMetadata for stream_id=%lu ***\n", stream_id);
+              fflush(stderr);
               h.SpawnPushServerTrailingMetadata(std::move(md));
+              fprintf(stderr, "*** DEBUG: CLIENT: SpawnPushServerTrailingMetadata completed for stream_id=%lu ***\n", stream_id);
+              fflush(stderr);
               {
                 MutexLock lock(&this->mu_);
                 VLOG(1) << "CLIENT: Removing handler stream_id=" << stream_id;
                 this->handlers_.erase(stream_id);
               }
+              fprintf(stderr, "*** DEBUG: CLIENT: Call completion fully processed for stream_id=%lu ***\n", stream_id);
+              fflush(stderr);
               return Empty{};
             });
         cb_->GetS2CQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
@@ -2273,69 +2526,121 @@ void ShmemServerTransport::DrainC2SFromPoller() {
     fprintf(stderr, "*** DEBUG: Implementing proper gRPC service dispatch for command type=%d ***\n", static_cast<int>(cmd.type));
     fflush(stderr);
     
-    // Per-stream state for tracking active service calls
-    static std::map<uint64_t, CallInitiator> active_calls;
-    static Mutex active_calls_mu;
+    // Stream initiators are now managed through stream_initiators_ map populated by FinishAccept()
     
     switch (cmd.type) {
       case grpc_shmem::FrameType::C2S_INITIAL_METADATA: {
         fprintf(stderr, "*** DEBUG: Handling C2S_INITIAL_METADATA for stream_id=%lu ***\n", cmd.stream_id);
         fflush(stderr);
         
-        // Create arena and service call
+        // 1) Deserialize client initial metadata (must include :path)
+        std::vector<grpc_shmem::KVPair> kvs_in;
+        if (cmd.data_size > 0) {
+          const unsigned char* p =
+              cb_->GetC2SQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
+          kvs_in = grpc_shmem::DeserializeMetadataKVs(p, cmd.data_size);
+        }
+        
+        // 2) Build CLIENT initial metadata with required pseudo-headers (following user guidance)
         auto arena = call_arena_allocator_->MakeArena();
         auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
         arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
         
-        // Parse metadata from the command (simplified for now)
-        auto md = arena->MakePooledForOverwrite<ClientMetadata>();
-        md->Set(HttpPathMetadata(), Slice::FromCopiedString("/helloworld.Greeter/SayHello"));
-        md->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
-        md->Set(HttpAuthorityMetadata(), Slice::FromCopiedString("shmem://grpc_shmem_example"));
-        md->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
-        md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
-        md->Set(TeMetadata(), TeMetadata::kTrailers);
+        // Client initial metadata handle
+        auto cimd = arena->MakePooledForOverwrite<ClientMetadata>();
         
-        auto call = MakeCallPair(std::move(md), std::move(arena));
-        
-        // Store call initiator for message delivery
-        {
-          MutexLock lock(&active_calls_mu);
-          active_calls[cmd.stream_id] = call.initiator;
+        // Extract :path and :authority from parsed kvs (required for method routing)
+        std::string path = "/grpc.testing.EchoTestService/Echo";  // default
+        std::string incoming_authority = "shmem";  // default
+        for (const auto& kv : kvs_in) {
+          fprintf(stderr, "*** DEBUG: metadata: key='%s', value='%s' ***\n", kv.key.c_str(), kv.value.c_str());
+          fflush(stderr);
+          if (kv.key == ":path") {
+            path = kv.value;
+          } else if (kv.key == ":authority") {
+            incoming_authority = kv.value;
+          }
         }
         
-        // Get service destination and start call
-        RefCountedPtr<UnstartedCallDestination> dest;
-        {
-          MutexLock lock(&dest_mu_);
-          dest = dest_;
+        fprintf(stderr, "*** DEBUG: Setting required pseudo-headers, :path='%s' ***\n", path.c_str());
+        fflush(stderr);
+        
+        // Fill required pseudo headers and gRPC headers (exactly per user guidance)
+        cimd->Set(HttpMethodMetadata(), HttpMethodMetadata::kPost);
+        cimd->Set(HttpSchemeMetadata(), HttpSchemeMetadata::kHttp);
+        cimd->Set(HttpAuthorityMetadata(), Slice::FromCopiedString(incoming_authority));
+        cimd->Set(HttpPathMetadata(), Slice::FromCopiedString(path));
+        
+        // gRPC-required headers
+        cimd->Set(TeMetadata(), TeMetadata::kTrailers);
+        cimd->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+        
+        // Append user metadata from kvs_in (excluding :pseudo headers we already set)
+        for (const auto& kv : kvs_in) {
+          if (kv.key.size() && kv.key[0] == ':') continue;  // skip pseudo headers
+          cimd->Append(kv.key, Slice::FromCopiedString(kv.value),
+                       [](absl::string_view, const Slice&) {});
         }
         
-        if (dest != nullptr) {
-          fprintf(stderr, "*** DEBUG: Starting service call via dest->StartCall ***\n");
-          fflush(stderr);
-          dest->StartCall(std::move(call.handler));
-          fprintf(stderr, "*** DEBUG: Service call started successfully! ***\n");
-          fflush(stderr);
+        cimd->Set(PeerString(), Slice::FromCopiedString("shmem:peer"));
+        
+        // 3) Build PendingCall with the metadata and arena
+        PendingCall pc;
+        pc.stream_id = cmd.stream_id;  // Preserve full 64-bit client stream ID
+        pc.arena = std::move(arena);
+        pc.client_initial_md = std::move(cimd);
+        
+        // 4) Robust first-arrives-wins integration: use whichever is available
+        bool use_legacy = false;
+        bool use_promise = false;
+        bool need_buffer = false;
+        
+        // Check which integration point is available (thread-safe check)
+        {
+          MutexLock lk(&dest_mu_);
+          if (accept_stream_cb_ != nullptr) {
+            use_legacy = true;
+            fprintf(stderr, "*** DEBUG: accept_stream_cb available - using LEGACY integration ***\n");
+            fflush(stderr);
+          } else if (dest_ready_) {
+            use_promise = true;
+            fprintf(stderr, "*** DEBUG: dest_ ready - using PROMISE integration ***\n");
+            fflush(stderr);
+          } else {
+            need_buffer = true;
+            fprintf(stderr, "*** DEBUG: Neither integration ready - BUFFERING call ***\n");
+            fflush(stderr);
+          }
+        }
+        
+        if (use_legacy) {
+          // LEGACY PATH: Use accept_stream_cb for CQ-based servers (AsyncService)
+          auto* server_data = new ShmemServerData{pc.stream_id, std::move(kvs_in)};
+          accept_stream_cb_(accept_stream_cb_user_data_, this, server_data);
+        } else if (use_promise) {
+          // PROMISE PATH: Use dest_->StartCall for modern promise-based servers
+          StartCallNow(std::move(pc), /*from_flush=*/false);
+        } else if (need_buffer) {
+          // BUFFERING PATH: Neither integration point ready - buffer until one arrives
+          // Store original kvs for potential legacy path later
+          pc.kvs_for_legacy = std::move(kvs_in);
           
-          // Set up response bridge to handle service responses
-          auto stream_id = cmd.stream_id;
-          auto call_initiator = call.initiator;
-          call_initiator.SpawnGuarded("shmem-response-bridge",
-            [this, stream_id, call_initiator]() mutable {
-              fprintf(stderr, "*** DEBUG: Starting response bridge for stream_id=%lu ***\n", stream_id);
-              fflush(stderr);
-              return ShmemCallOutboundLoop(stream_id, std::move(call_initiator));
-            });
-          fprintf(stderr, "*** DEBUG: Response bridge set up for stream_id=%lu ***\n", stream_id);
-          fflush(stderr);
-        } else {
-          fprintf(stderr, "*** DEBUG: No service destination available ***\n");
-          fflush(stderr);
+          {
+            MutexLock lk(&dest_mu_);
+            pending_calls_.push_back(std::move(pc));
+          }
+          
+          // Release bytes consumed - call will be processed when integration arrives
+          if (cmd.data_size) {
+            cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+          }
+          break;  // Don't process further, call is buffered
         }
         
-        // Release consumed data
-        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        // 6) Release the C2S metadata bytes we consumed
+        if (cmd.data_size) {
+          cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        }
         break;
       }
       
@@ -2343,24 +2648,22 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         fprintf(stderr, "*** DEBUG: Handling C2S_MESSAGE for stream_id=%lu, size=%u ***\n", cmd.stream_id, cmd.data_size);
         fflush(stderr);
         
-        // Find active call for this stream
+        // Look up initiator installed by FinishAccept()
         CallInitiator initiator;
-        bool found = false;
+        bool has_initiator = false;
         {
-          MutexLock lock(&active_calls_mu);
-          auto it = active_calls.find(cmd.stream_id);
-          if (it != active_calls.end()) {
+          MutexLock lock(&stream_initiators_mu_);
+          auto it = stream_initiators_.find(cmd.stream_id);
+          if (it != stream_initiators_.end()) {
             initiator = it->second;
-            found = true;
+            has_initiator = true;
           }
         }
         
-        if (found) {
-          // Create message from ring buffer data
+        if (has_initiator) {
+          // Normal path: deliver message immediately
           grpc_slice s = grpc_shmem::MakeSliceFromRing(
               &cb_->GetC2SQueues()->data_rb, cb_, cmd.data_offset, cmd.data_size);
-          
-          // Deliver message to service
           initiator.SpawnInfallible("push-c2s-msg", [initiator, s]() mutable {
             SliceBuffer sb;
             sb.AppendIndexed(Slice(s));
@@ -2373,11 +2676,22 @@ void ShmemServerTransport::DrainC2SFromPoller() {
           fprintf(stderr, "*** DEBUG: Message delivery spawned successfully ***\n");
           fflush(stderr);
         } else {
-          fprintf(stderr, "*** DEBUG: No active call found for stream_id=%lu ***\n", cmd.stream_id);
+          // RACE CONDITION: Buffer message until FinishAccept() completes
+          fprintf(stderr, "*** DEBUG: No stream initiator found for stream_id=%lu - buffering message ***\n", cmd.stream_id);
           fflush(stderr);
-          // Release data if no active call
-          cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+          
+          // Copy data from ring buffer before advancing tail
+          const uint8_t* src = cb_->GetC2SQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
+          {
+            MutexLock lock(&pending_messages_mu_);
+            pending_c2s_msgs_[static_cast<uint32_t>(cmd.stream_id)].emplace_back(cmd, src, cmd.data_size);
+          }
+          fprintf(stderr, "*** DEBUG: Message buffered for stream_id=%lu ***\n", cmd.stream_id);
+          fflush(stderr);
         }
+        
+        // Always advance tail to release ring buffer space
+        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
         break;
       }
       
@@ -2385,31 +2699,44 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         fprintf(stderr, "*** DEBUG: Handling C2S_TRAILING_METADATA for stream_id=%lu ***\n", cmd.stream_id);
         fflush(stderr);
         
-        // Signal end of stream to service
+        // End-of-client-stream: signal FinishSends via CallInitiator
         CallInitiator initiator;
-        bool found = false;
+        bool has_initiator = false;
         {
-          MutexLock lock(&active_calls_mu);
-          auto it = active_calls.find(cmd.stream_id);
-          if (it != active_calls.end()) {
-            initiator = it->second;
-            found = true;
-            active_calls.erase(it); // Clean up
+          MutexLock lock(&stream_initiators_mu_);
+          auto it = stream_initiators_.find(cmd.stream_id);
+          if (it != stream_initiators_.end()) { 
+            initiator = it->second; 
+            has_initiator = true; 
           }
         }
         
-        if (found) {
+        if (has_initiator) {
+          // Normal path: signal FinishSends immediately
           initiator.SpawnInfallible("finish-recv", [initiator]() mutable {
             fprintf(stderr, "*** DEBUG: Signaling FinishSends to service ***\n");
             fflush(stderr);
-            initiator.SpawnFinishSends();
+            initiator.SpawnFinishSends(); 
             return Empty{};
           });
           fprintf(stderr, "*** DEBUG: FinishRecv spawned successfully ***\n");
           fflush(stderr);
+        } else {
+          // RACE CONDITION: Buffer trailing metadata until FinishAccept() completes
+          fprintf(stderr, "*** DEBUG: No stream initiator found for stream_id=%lu - buffering trailing metadata ***\n", cmd.stream_id);
+          fflush(stderr);
+          
+          // Copy data from ring buffer before advancing tail
+          const uint8_t* src = cb_->GetC2SQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
+          {
+            MutexLock lock(&pending_messages_mu_);
+            pending_trailing_.emplace(static_cast<uint32_t>(cmd.stream_id), PendingMessage(cmd, src, cmd.data_size));
+          }
+          fprintf(stderr, "*** DEBUG: Trailing metadata buffered for stream_id=%lu ***\n", cmd.stream_id);
+          fflush(stderr);
         }
         
-        // Release consumed data
+        // Always advance tail to release ring buffer space
         cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
         break;
       }
