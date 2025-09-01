@@ -36,6 +36,7 @@
 #include "src/core/client_channel/direct_channel.h"  // DirectChannel (promise stack)
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/shmem/shmem_transport.h"  // MakeShmemTransportPair
+#include "src/core/ext/transport/shmem/shmem_legacy_transport.h"  // MakeLegacyShmemChannel
 #include "src/core/ext/transport/inproc/inproc_transport.h"  // legacy inproc creator
 #include "src/core/lib/iomgr/error.h"
 #include "src/core/lib/promise/promise.h"
@@ -113,48 +114,7 @@ static RefCountedPtr<Channel> MakeLameChannelFromStatus(const absl::Status& st,
 
 }  // namespace
 
-// Legacy-compatible shmem channel creation (for AsyncService support)
-RefCountedPtr<Channel> MakeLegacyShmemChannel(
-    Server* server, ChannelArgs client_channel_args) {
-  // Legacy approach: similar to legacy_inproc but using shmem transport
-  VLOG(2) << "MakeLegacyShmemChannel starting - legacy server integration";
-  
-  auto auth_ctx = MakeShmemAuthContext();
-  auto server_args_with_auth = server->channel_args().SetObject(auth_ctx);
-  
-  auto transports = MakeShmemTransportPair(server_args_with_auth, client_channel_args);
-  auto client_transport = std::move(transports.first);
-  auto server_transport = std::move(transports.second);
-
-  // Legacy server integration - no promise-based setup
-  auto setup_args = server_args_with_auth
-      .Remove(GRPC_ARG_MAX_CONNECTION_IDLE_MS)
-      .Remove(GRPC_ARG_MAX_CONNECTION_AGE_MS);
-  
-  auto error = server->SetupTransport(
-      server_transport.get(),
-      /*accept_stream_fn=*/nullptr,
-      setup_args,
-      /*socket_node=*/nullptr);
-  
-  if (!error.ok()) {
-    return MakeLameChannelFromStatus(error, "server transport setup failed");
-  }
-  (void)server_transport.release();
-
-  // Create LEGACY channel - do NOT set GRPC_ARG_USE_V3_STACK
-  auto channel_result = ChannelCreate(
-      /*target=*/"shmem",
-      client_channel_args.Set(GRPC_ARG_DEFAULT_AUTHORITY, "shmem.authority"),
-      GRPC_CLIENT_DIRECT_CHANNEL,
-      /*optional_transport=*/client_transport.release());
-  
-  if (!channel_result.ok()) {
-    return MakeLameChannelFromStatus(channel_result.status(),
-                                     "legacy shmem channel creation failed");
-  }
-  return std::move(*channel_result);
-}
+// Note: legacy shmem channel creation is implemented in shmem_legacy_transport.cc
 
 // Promise-based shmem channel creation (for modern server stack)
 RefCountedPtr<Channel> MakeShmemChannel(

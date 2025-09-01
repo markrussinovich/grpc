@@ -20,7 +20,7 @@ namespace grpc_shmem {
 
 // Protocol constants
 constexpr uint64_t kMagic = 0x47525043534D454Dull;  // "GRPCSMEM"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 3;  // v3 protocol as required by project instructions
 
 // Default capacities/limits
 constexpr size_t kDefaultDataRingCapacityBytes = 4 * 1024 * 1024;  // 4 MiB

@@ -37,6 +37,10 @@
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/chttp2/transport/chttp2_transport.h"
 #include "src/core/ext/transport/shmem/shmem_transport.h" // from grpc_transport_shmem
+
+extern "C" grpc_channel* grpc_shmem_channel_create(grpc_server* server,
+                                                   const grpc_channel_args* args,
+                                                   void* reserved);
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/lib/iomgr/endpoint.h"
 #include "src/core/lib/iomgr/endpoint_pair.h"
@@ -167,21 +171,24 @@ class InProcess : public FullstackFixture {
   ~InProcess() override {}
 };
 
+// Shmem transport fixture using the resolver + endpoint transport via unique URI
 class ShmemTransport : public FullstackFixture {
  public:
   explicit ShmemTransport(Service* service,
-                         const FixtureConfiguration& fixture_configuration =
-                             FixtureConfiguration())
+                          const FixtureConfiguration& fixture_configuration =
+                              FixtureConfiguration())
       : FullstackFixture(service, fixture_configuration, GenerateUniqueServerAddress()) {}
   ~ShmemTransport() override {}
-  
+
  private:
   static std::string GenerateUniqueServerAddress() {
     static std::atomic<uint64_t> counter{0};
     uint64_t id = counter.fetch_add(1, std::memory_order_relaxed);
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
     std::ostringstream thread_id_stream;
     thread_id_stream << std::this_thread::get_id();
-    return absl::StrCat("shmem://benchmark_", thread_id_stream.str(), "_", id);
+    return absl::StrCat("shmem://benchmark_", thread_id_stream.str(), "_", id, "_", nanos);
   }
 };
 

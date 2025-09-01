@@ -11,6 +11,7 @@ grpc_cc_library(
     name = "shmem_transport",
     srcs = [
         "shmem_transport.cc",
+        "shmem_legacy_transport.cc",
         "shmem_framer.cc",
         "shmem_queue.cc",
         "shmem_segment.cc",
@@ -24,6 +25,7 @@ grpc_cc_library(
     }),
     hdrs = [
         "shmem_transport.h",
+        "shmem_legacy_transport.h",
         "shmem_framer.h",
         "shmem_queue.h",
         "shmem_segment.h",
