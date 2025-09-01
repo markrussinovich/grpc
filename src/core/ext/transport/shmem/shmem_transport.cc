@@ -342,6 +342,7 @@ class ShmemClientTransport final : public ClientTransport {
 
   void StartCall(CallHandler child_call_handler) override;
   void Orphan() override {
+    SHMEM_DBGF("*** DEBUG: Client transport Orphan() called - initiating shutdown ***\n");
     InitiateShutdown();
     Unref(DEBUG_LOCATION, "orphan");
   }
@@ -2067,9 +2068,8 @@ void ShmemServerTransport::PerformFinalCleanup() {
 }
 
 void ShmemServerTransport::StartCallNow(PendingCall pc, bool from_flush) {
-  fprintf(stderr, "*** DEBUG: StartCallNow called for stream_id=%lu, from_flush=%s ***\n", 
+  SHMEM_DBGF("StartCallNow called for stream_id=%lu, from_flush=%s\n", 
           pc.stream_id, from_flush ? "true" : "false");
-  fflush(stderr);
   
   // Ensure EventEngine context is set on arena
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
@@ -2092,53 +2092,42 @@ void ShmemServerTransport::StartCallNow(PendingCall pc, bool from_flush) {
   }
   
   if (dest_copy != nullptr) {
-    fprintf(stderr, "*** DEBUG: Starting call on real destination ***\n");
-    fflush(stderr);
+    SHMEM_DBGF("Starting call on real destination\n");
     dest_copy->StartCall(std::move(call.handler));
-    fprintf(stderr, "*** DEBUG: Call started successfully ***\n");
-    fflush(stderr);
+    SHMEM_DBGF("Call started successfully\n");
   } else {
-    fprintf(stderr, "*** DEBUG: ERROR: dest_copy is null in StartCallNow ***\n");
-    fflush(stderr);
+    SHMEM_DBGF("ERROR: dest_copy is null in StartCallNow\n");
   }
   
   // Start response bridge
-  fprintf(stderr, "*** DEBUG: About to spawn ShmemCallOutboundLoop for stream_id=%lu ***\n", pc.stream_id);
-  fflush(stderr);
+  SHMEM_DBGF("About to spawn ShmemCallOutboundLoop for stream_id=%lu\n", pc.stream_id);
   call.initiator.SpawnGuarded("shmem-response-bridge",
       [this, sid = pc.stream_id, ci = call.initiator]() mutable {
-        fprintf(stderr, "*** DEBUG: Inside lambda - about to call ShmemCallOutboundLoop for stream_id=%lu ***\n", sid);
-        fflush(stderr);
+        SHMEM_DBGF("Inside lambda - about to call ShmemCallOutboundLoop for stream_id=%lu\n", sid);
         return ShmemCallOutboundLoop(sid, std::move(ci));
       });
-  fprintf(stderr, "*** DEBUG: SpawnGuarded call completed for stream_id=%lu ***\n", pc.stream_id);
-  fflush(stderr);
+  SHMEM_DBGF("SpawnGuarded call completed for stream_id=%lu\n", pc.stream_id);
 }
 
 void ShmemClientTransport::EnsureReaderStarted() {
-  fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted CALLED ***\n");
-  fflush(stderr);
-  LOG(INFO) << "Client EnsureReaderStarted called, cb_=" << (void*)cb_;
+  SHMEM_DBGF("*** DEBUG: Client EnsureReaderStarted CALLED ***\n");
+  VLOG(1) << "Client EnsureReaderStarted called, cb_=" << (void*)cb_;
   if (cb_ == nullptr) {
-    fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted: cb_ is null, returning ***\n");
-    fflush(stderr);
-    LOG(INFO) << "Client EnsureReaderStarted: cb_ is null, returning";
+    SHMEM_DBGF("*** DEBUG: Client EnsureReaderStarted: cb_ is null, returning ***\n");
+    VLOG(1) << "Client EnsureReaderStarted: cb_ is null, returning";
     return;
   }
   bool was_started = reader_started_.load(std::memory_order_acquire);
-  fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted: reader_started_=%s ***\n", was_started ? "true" : "false");
-  fflush(stderr);
-  LOG(INFO) << "Client EnsureReaderStarted: reader_started_=" << was_started;
+  SHMEM_DBGF("*** DEBUG: Client EnsureReaderStarted: reader_started_=%s ***\n", was_started ? "true" : "false");
+  VLOG(1) << "Client EnsureReaderStarted: reader_started_=" << was_started;
   if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
-    fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted: starting doorbell init (FIRST TIME) ***\n");
-    fflush(stderr);
-    LOG(INFO) << "Client EnsureReaderStarted: starting doorbell init";
+    SHMEM_DBGF("*** DEBUG: Client EnsureReaderStarted: starting doorbell init (FIRST TIME) ***\n");
+    VLOG(1) << "Client EnsureReaderStarted: starting doorbell init";
     InitS2CDoorbell();
     reader_ready_.store(true, std::memory_order_release);
   } else {
-    fprintf(stderr, "*** DEBUG: Client EnsureReaderStarted: reader already started (DUPLICATE CALL) ***\n");
-    fflush(stderr);
-    LOG(INFO) << "Client EnsureReaderStarted: reader already started";
+    SHMEM_DBGF("*** DEBUG: Client EnsureReaderStarted: reader already started (DUPLICATE CALL) ***\n");
+    VLOG(1) << "Client EnsureReaderStarted: reader already started";
   }
 }
 
@@ -2187,9 +2176,8 @@ void ShmemClientTransport::InitS2CDoorbell() {
       futex_wait(reinterpret_cast<uint32_t*>(&this->cb_->s2c_db.seq), expected, nullptr);
       uint32_t current_seq = this->cb_->s2c_db.seq.load(std::memory_order_acquire);
       if (current_seq != last_seq) {
-        fprintf(stderr, "*** DEBUG: Client S2C sequence changed from %u to %u! Processing responses ***\n",
+        SHMEM_DBGF("Client S2C sequence changed from %u to %u! Processing responses\n",
                 last_seq, current_seq);
-        fflush(stderr);
         this->DrainS2CFromPoller();
         last_seq = current_seq;
       }
@@ -2354,9 +2342,8 @@ void ShmemServerTransport::InitC2SDoorbell() {
         futex_wait(reinterpret_cast<uint32_t*>(&server_self->cb_->c2s_db.seq), expected, nullptr);
         uint32_t current_seq = server_self->cb_->c2s_db.seq.load(std::memory_order_acquire);
         if (current_seq != last_seq) {
-          fprintf(stderr, "*** DEBUG: C2S sequence changed from %u to %u! Processing commands ***\n",
+          SHMEM_DBGF("C2S sequence changed from %u to %u! Processing commands\n",
                   last_seq, current_seq);
-          fflush(stderr);
           server_self->DrainC2SFromPoller();
           last_seq = current_seq;
         }
@@ -2572,8 +2559,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         if (has_initiator) {
           // Normal path: signal FinishSends immediately
           initiator.SpawnInfallible("finish-recv", [initiator]() mutable {
-            fprintf(stderr, "*** DEBUG: Signaling FinishSends to service ***\n");
-            fflush(stderr);
+            SHMEM_DBGF("Signaling FinishSends to service\n");
             initiator.SpawnFinishSends(); 
             return Empty{};
           });
