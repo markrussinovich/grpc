@@ -15,6 +15,7 @@
 // Shared-memory transport implemented using command queues and a data ring.
 #include "src/core/ext/transport/shmem/shmem_transport.h"
 // POSIX utilities
+#include <climits>
 #include <unistd.h>
 #include "src/core/lib/iomgr/closure.h"
 #include "src/core/lib/iomgr/ev_posix.h"
@@ -347,6 +348,8 @@ class ShmemClientTransport final : public ClientTransport {
     Unref(DEBUG_LOCATION, "orphan");
   }
   ~ShmemClientTransport() override {
+    fprintf(stderr, "*** DEBUG: ShmemClientTransport destructor called ***\n");
+    fflush(stderr);
     // Ensure clean shutdown and join futex wait thread if still running
     // This guards against std::terminate if a joinable thread remains at destruction.
     if (!cleanup_complete_.load(std::memory_order_acquire)) {
@@ -359,10 +362,14 @@ class ShmemClientTransport final : public ClientTransport {
         // Swallow any exceptions during destructor to avoid terminate
       }
     }
+    fprintf(stderr, "*** DEBUG: ShmemClientTransport destructor completed ***\n");
+    fflush(stderr);
   }
   
  private:
   void InitiateShutdown() {
+    fprintf(stderr, "*** DEBUG: ShmemClientTransport InitiateShutdown called ***\n");
+    fflush(stderr);
     ExecCtx exec_ctx;
     
     // Step 1: Signal shutdown to all threads
@@ -394,8 +401,8 @@ class ShmemClientTransport final : public ClientTransport {
       thread_stop_flag_->store(true, std::memory_order_release);
     }
     
-  // Wake futex waiters if a ring reader thread was started
-  if (reader_started_.load(std::memory_order_acquire)) {
+    // Wake futex waiters if a ring reader thread was started
+    if (reader_started_.load(std::memory_order_acquire)) {
       // RACE CONDITION FIX: Wake reader threads during shutdown
       // and add a small delay to allow reader thread to check stop flag
       if (cb_ != nullptr) {
@@ -403,10 +410,14 @@ class ShmemClientTransport final : public ClientTransport {
           // With futex doorbells, we need to actively wake any waiting reader threads
           // CLIENT: Wake S2C reader thread (client reads S2C responses)
           auto& db = cb_->s2c_db;
-          if (db.waiter.load(std::memory_order_acquire)) {
-            db.seq.fetch_add(1, std::memory_order_release);
-            futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
-          }
+          
+          // Always wake futex waiters during shutdown - don't check waiter flag
+          db.seq.fetch_add(1, std::memory_order_release);
+          futex_wake(reinterpret_cast<uint32_t*>(&db.seq), INT_MAX); // Wake all waiters
+          
+          // Give threads time to check stop flag and exit
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          
         } catch (const std::exception& e) {
           LOG(ERROR) << "Error waking futex doorbells: " << e.what();
         }
@@ -888,8 +899,14 @@ class ShmemServerTransport final : public ServerTransport {
     if (cb_ != nullptr) {
       try {
         auto& db = cb_->c2s_db;
+        
+        // Always wake futex waiters during shutdown - don't check waiter flag
         db.seq.fetch_add(1, std::memory_order_release);
-        futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
+        futex_wake(reinterpret_cast<uint32_t*>(&db.seq), INT_MAX); // Wake all waiters
+        
+        // Give threads time to check stop flag and exit
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
       } catch (const std::exception& e) {
         LOG(ERROR) << "Error waking futex doorbells: " << e.what();
       }
@@ -1057,6 +1074,8 @@ class ShmemServerTransport final : public ServerTransport {
 
  private:
   ~ShmemServerTransport() override {
+    fprintf(stderr, "*** DEBUG: ShmemServerTransport destructor called ***\n");
+    fflush(stderr);
     // Ensure shutdown has completed and join futex wait thread if still running
     if (!cleanup_complete_.load(std::memory_order_acquire)) {
       InitiateShutdown();
@@ -1068,6 +1087,8 @@ class ShmemServerTransport final : public ServerTransport {
         // Avoid throwing from destructor
       }
     }
+    fprintf(stderr, "*** DEBUG: ShmemServerTransport destructor completed ***\n");
+    fflush(stderr);
   }
 
   void PerformFinalCleanup();
@@ -2144,6 +2165,10 @@ void ShmemClientTransport::InitS2CDoorbell() {
   fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell: server_name=%.*s ***\n", (int)name->length(), name->data());
   fflush(stderr);
   LOG(INFO) << "Client InitS2CDoorbell: server_name=" << *name;
+  
+  // CRITICAL FIX: Ensure stop conditions are properly initialized for this thread
+  stop_.store(false, std::memory_order_release);
+  
   // Start a futex wait thread to react to s2c_db.seq changes; no eventfd/grpc_fd
   fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell: starting futex wait thread ***\n");
   fflush(stderr);
@@ -2163,21 +2188,30 @@ void ShmemClientTransport::InitS2CDoorbell() {
       return;
     }
     
-  uint32_t last_seq = this->cb_->s2c_db.seq.load(std::memory_order_acquire);
+    uint32_t last_seq = this->cb_->s2c_db.seq.load(std::memory_order_acquire);
     fprintf(stderr, "*** DEBUG: Client initial S2C sequence: %u ***\n", last_seq);
     fflush(stderr);
-  // Drain once on startup to handle frames posted before thread started
-  this->DrainS2CFromPoller();
+    // Drain once on startup to handle frames posted before thread started
+    this->DrainS2CFromPoller();
     
-    // Futex wait loop
-    while (!thread_stop_flag->load(std::memory_order_acquire) &&
-           !this->stop_.load(std::memory_order_acquire)) {
+    // Futex wait loop with proper signal handling  
+    fprintf(stderr, "*** DEBUG: Client about to enter futex wait loop ***\n");
+    fflush(stderr);
+    while (!thread_stop_flag->load(std::memory_order_acquire)) {
       uint32_t expected = last_seq;
-      futex_wait(reinterpret_cast<uint32_t*>(&this->cb_->s2c_db.seq), expected, nullptr);
+      
+      // Use timeout to avoid indefinite blocking and handle signals gracefully
+      struct timespec timeout;
+      timeout.tv_sec = 0;
+      timeout.tv_nsec = 100000000; // 100ms timeout
+      
+      int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&this->cb_->s2c_db.seq), expected, &timeout);
+      
       uint32_t current_seq = this->cb_->s2c_db.seq.load(std::memory_order_acquire);
       if (current_seq != last_seq) {
-        SHMEM_DBGF("Client S2C sequence changed from %u to %u! Processing responses\n",
+        fprintf(stderr, "*** DEBUG: Client S2C sequence changed from %u to %u! Processing responses ***\n",
                 last_seq, current_seq);
+        fflush(stderr);
         this->DrainS2CFromPoller();
         last_seq = current_seq;
       }
@@ -2322,6 +2356,10 @@ void ShmemServerTransport::InitC2SDoorbell() {
   fprintf(stderr, "*** DEBUG: ShmemServerTransport::InitC2SDoorbell ENTRY (futex-only) ***\n");
   fflush(stderr);
   LOG(INFO) << "Server InitC2SDoorbell: starting futex wait thread";
+  
+  // CRITICAL FIX: Ensure stop conditions are properly initialized for this thread
+  stop_.store(false, std::memory_order_release);
+  
   // Prevent multiple starts
   if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
     c2s_reading_started_ = true;
@@ -2336,14 +2374,23 @@ void ShmemServerTransport::InitC2SDoorbell() {
       fflush(stderr);
       // Drain once on startup to handle commands posted before thread started
       server_self->DrainC2SFromPoller();
-      while (!server_thread_stop_flag->load(std::memory_order_acquire) &&
-             !server_self->stop_.load(std::memory_order_acquire)) {
+      fprintf(stderr, "*** DEBUG: Server about to enter futex wait loop ***\n");
+      fflush(stderr);
+      while (!server_thread_stop_flag->load(std::memory_order_acquire)) {
         uint32_t expected = last_seq;
-        futex_wait(reinterpret_cast<uint32_t*>(&server_self->cb_->c2s_db.seq), expected, nullptr);
+        
+        // Use timeout to avoid indefinite blocking and handle signals gracefully  
+        struct timespec timeout;
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = 100000000; // 100ms timeout
+        
+        int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&server_self->cb_->c2s_db.seq), expected, &timeout);
+        
         uint32_t current_seq = server_self->cb_->c2s_db.seq.load(std::memory_order_acquire);
         if (current_seq != last_seq) {
-          SHMEM_DBGF("C2S sequence changed from %u to %u! Processing commands\n",
+          fprintf(stderr, "*** DEBUG: Server C2S sequence changed from %u to %u! Processing commands ***\n",
                   last_seq, current_seq);
+          fflush(stderr);
           server_self->DrainC2SFromPoller();
           last_seq = current_seq;
         }

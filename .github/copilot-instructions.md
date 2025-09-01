@@ -38,8 +38,11 @@ Requirements:
 
 ## Special Notes
 - **No polling** — all notifications must be via **futexes**.  
+- **No sleeps** — sleeps just mask race conditions, they don't fix them.
 - **No dedicated reader threads** — transport should be fully **event-driven** and integrated into the gRPC event notification system.  
 - **Do not deviate from user requests** without explicit approval.  
+- **Wait for builds to complete even if they take long time**
+- Create tempoary test files in a `/tmp` directory to avoid cluttering the repository.
 - Always provide a **list of planned steps** before starting implementation.  
   - Make **incremental changes** and validate them at each step.  
   - Ensure at each step you have not deviated from the project goals.  
