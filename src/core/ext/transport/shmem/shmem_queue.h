@@ -29,11 +29,39 @@ enum class Direction { kC2S, kS2C };
 
 // REVERTED: Remove SemaphoreManager forward declaration for baseline testing
 
+// Monotonic counters: head and tail only ever increase; used = head - tail.
+// If head < tail is ever observed, that's a bug elsewhere (e.g., mixing modulo math).
+// We still return 0 in that case to avoid underflow in non-debug builds.
+inline uint64_t RingUsedBytes(uint64_t head, uint64_t tail, uint64_t /*capacity*/) {
+  if (head < tail) {
+    return 0;
+  }
+  return head - tail;
+}
+
+// Calculate head advancement for contiguous allocation (no wrapping).
+inline uint64_t AdvanceHeadContiguous(uint64_t head, uint32_t size) {
+  return head + size;
+}
+
+// Calculate head advancement with padding when wrapping is needed.
+inline uint64_t AdvanceHeadWithPadding(uint64_t head, uint32_t size, uint64_t free_to_end) {
+  return head + free_to_end + size;
+}
+
+// Try to atomically advance head pointer with CAS operation.
+inline bool TryAdvanceHead(DataRingBuffer* rb, uint64_t expected_head, uint64_t new_head) {
+  uint64_t expected = expected_head;
+  return rb->head.compare_exchange_weak(expected, new_head,
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed);
+}
+
 // Compute free space in the ring (in bytes), using monotonic head/tail.
 inline uint64_t RingFreeBytes(const DataRingBuffer& rb) {
   const uint64_t head = rb.head.load(std::memory_order_acquire);
   const uint64_t tail = rb.tail.load(std::memory_order_acquire);
-  const uint64_t used = head - tail;  // monotonic counters
+  const uint64_t used = RingUsedBytes(head, tail, rb.capacity);
   if (used > rb.capacity) return 0;   // saturated -> treat as full
   return rb.capacity - used;
 }
@@ -77,15 +105,9 @@ inline bool ReserveForWriteBlocking(DataRingBuffer* rb,
 // Release 'size' bytes previously consumed starting from some offset; simply
 // advance tail (consumer side responsibility).
 inline void Release(DataRingBuffer* rb, uint32_t size) {
-  // Add protection against tail advancing beyond head
-  uint64_t current_head = rb->head.load(std::memory_order_acquire);
-  uint64_t current_tail = rb->tail.load(std::memory_order_relaxed);
-  uint64_t new_tail = current_tail + size;
-  
-  // Prevent tail from advancing beyond head which would corrupt the queue
-  if (new_tail <= current_head) {
-    rb->tail.store(new_tail, std::memory_order_release);
-  }
+  // SPSC: consumer always advances tail by the exact number of consumed bytes.
+  // Monotonic counters: never wrap tail; do not gate on RingUsedBytes().
+  rb->tail.fetch_add(size, std::memory_order_release);
 }
 
 // Forward declaration for semaphore adapter

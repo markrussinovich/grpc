@@ -129,7 +129,7 @@ static void WaitReserveWithEmptyWrap(grpc_shmem::ShmemQueues* q,
     const uint64_t cap = rb->capacity;
     uint64_t head = rb->head.load(std::memory_order_relaxed);
     uint64_t tail = rb->tail.load(std::memory_order_acquire);
-    uint64_t used = head - tail;
+    uint64_t used = grpc_shmem::RingUsedBytes(head, tail, rb->capacity);
     uint64_t end_off = head % cap;
     uint64_t free_to_end = cap - end_off;
 

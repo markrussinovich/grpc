@@ -35,7 +35,7 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
     const uint64_t head = rb->head.load(std::memory_order_relaxed);
     const uint64_t tail = rb->tail.load(std::memory_order_acquire);
-    const uint64_t used = head - tail;
+    const uint64_t used = grpc_shmem::RingUsedBytes(head, tail, rb->capacity);
     
     // Ensure we have enough total space
     if (used + size > rb->capacity) {
@@ -53,11 +53,8 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
     
     // Strategy 1: Try normal contiguous allocation first
     if (offset + size <= rb->capacity) {
-      const uint64_t new_head = head + size;
-      uint64_t expected = head;
-      if (rb->head.compare_exchange_weak(expected, new_head,
-                                         std::memory_order_release,
-                                         std::memory_order_relaxed)) {
+      const uint64_t new_head = grpc_shmem::AdvanceHeadContiguous(head, size);
+      if (grpc_shmem::TryAdvanceHead(rb, head, new_head)) {
         *out_offset = offset;
         return true;
       }
@@ -71,13 +68,10 @@ bool ReserveContiguous(DataRingBuffer* rb, uint32_t size,
     if (size <= space_at_start) {
       // Check if we can safely wrap to the beginning
       const uint64_t required_tail_advancement = rb->capacity - offset;
-      const uint64_t new_head = head + required_tail_advancement + size;
+      const uint64_t new_head = grpc_shmem::AdvanceHeadWithPadding(head, size, required_tail_advancement);
       
       if (new_head - tail <= rb->capacity) {
-        uint64_t expected = head;
-        if (rb->head.compare_exchange_weak(expected, new_head,
-                                           std::memory_order_release,
-                                           std::memory_order_relaxed)) {
+        if (grpc_shmem::TryAdvanceHead(rb, head, new_head)) {
           *out_offset = 0;
           return true;
         }
@@ -107,15 +101,12 @@ bool ReserveWrapping(DataRingBuffer* rb, uint32_t size, uint64_t* out_offset) {
   for (int spin = 0; spin < 50; ++spin) {  // More attempts for wrapping
     const uint64_t head = rb->head.load(std::memory_order_relaxed);
     const uint64_t tail = rb->tail.load(std::memory_order_acquire);
-    const uint64_t used = head - tail;
+    const uint64_t used = grpc_shmem::RingUsedBytes(head, tail, rb->capacity);
     
     if (used + size <= rb->capacity) {
       // We have enough space, reserve it (may wrap)
-      const uint64_t new_head = head + size;
-      uint64_t expected = head;
-      if (rb->head.compare_exchange_weak(expected, new_head,
-                                         std::memory_order_release,
-                                         std::memory_order_relaxed)) {
+      const uint64_t new_head = grpc_shmem::AdvanceHeadContiguous(head, size);
+      if (grpc_shmem::TryAdvanceHead(rb, head, new_head)) {
         *out_offset = head % rb->capacity;
         return true;
       }
@@ -296,7 +287,7 @@ bool ReserveForWrite(DataRingBuffer* rb, uint32_t size,
   for (;;) {
     uint64_t head = rb->head.load(std::memory_order_relaxed);
     uint64_t tail = rb->tail.load(std::memory_order_acquire);
-    uint64_t used = head - tail;
+    uint64_t used = grpc_shmem::RingUsedBytes(head, tail, rb->capacity);
     if (used + size > rb->capacity) {
       VLOG(1) << "ReserveForWrite FAIL size=" << size
               << " head=" << head << " tail=" << tail
@@ -314,7 +305,7 @@ bool ReserveForWrite(DataRingBuffer* rb, uint32_t size,
 
     if (size <= free_to_end) {
       // Fits to end; no pad needed.
-      new_head = head + size;
+      new_head = grpc_shmem::AdvanceHeadContiguous(head, size);
       offset = end_off;
       pad = 0;
     } else {
@@ -328,15 +319,12 @@ bool ReserveForWrite(DataRingBuffer* rb, uint32_t size,
                 << " cap=" << rb->capacity << " (not enough space including pad)";
         return false;  // not enough space including pad
       }
-      new_head = head + free_to_end + size;   // writer owns head, so OK to include pad
+      new_head = grpc_shmem::AdvanceHeadWithPadding(head, size, free_to_end);
       offset = 0;                              // write starts at beginning
       pad = static_cast<uint32_t>(free_to_end);
     }
 
-    uint64_t expected = head;
-    if (rb->head.compare_exchange_weak(expected, new_head,
-                                       std::memory_order_acq_rel,
-                                       std::memory_order_relaxed)) {
+    if (grpc_shmem::TryAdvanceHead(rb, head, new_head)) {
       *out_offset = offset;   // mod capacity
       *out_pad = pad;         // 0 if no wrap
       return true;
