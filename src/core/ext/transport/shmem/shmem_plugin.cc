@@ -73,8 +73,7 @@ class ShmemEndpointTransport final : public EndpointTransport {
  public:
   absl::StatusOr<grpc_channel*> ChannelCreate(
       std::string target, const ChannelArgs& args) override {
-    fprintf(stderr, "*** DEBUG: ChannelCreate called with target: %s ***\n", target.c_str());
-    fflush(stderr);
+    VLOG(1) << "ChannelCreate called with target: " << target;
     // Parse shmem:// URI to extract server name
     auto uri_result = URI::Parse(target);
     if (!uri_result.ok()) {
@@ -140,8 +139,7 @@ class ShmemEndpointTransport final : public EndpointTransport {
 
     // Register server and create transport (but reader thread won't start until SetCallDestination)
     std::string server_name = uri.authority();
-    fprintf(stderr, "*** DEBUG: AddPort called for shmem server: %s ***\n", server_name.c_str());
-    fflush(stderr);
+    VLOG(1) << "AddPort called for shmem server: " << server_name;
     LOG(INFO) << "AddPort: Registering shmem server: " << server_name;
     VLOG(2) << "AddPort: Registering shmem server: " << server_name;
     ShmemServerRegistry::Get().RegisterServer(server_name, server);
@@ -204,14 +202,12 @@ class ShmemEndpointTransport final : public EndpointTransport {
 }  // namespace
 
 void RegisterShmemTransport(CoreConfiguration::Builder* builder) {
-  fprintf(stderr, "*** DEBUG: RegisterShmemTransport called! ***\n");
-  fflush(stderr);
+  VLOG(1) << "RegisterShmemTransport called";
   LOG(INFO) << "RegisterShmemTransport called - registering shmem endpoint transport";
   builder->endpoint_transport_registry()->RegisterTransport(
       "shmem", std::make_unique<ShmemEndpointTransport>());
   LOG(INFO) << "RegisterShmemTransport completed - shmem transport registered";
-  fprintf(stderr, "*** DEBUG: RegisterShmemTransport completed! ***\n");
-  fflush(stderr);
+  VLOG(1) << "RegisterShmemTransport completed";
 }
 
 }  // namespace grpc_core

@@ -92,18 +92,39 @@ void ShmemSegment::Unmap() {
     }
     fd_ = -1; 
   }
+  
+  // Unlink the shared memory file to prevent resource leaks
+  if (!name_.empty()) {
+    int unlink_result = ::shm_unlink(name_.c_str());
+    if (unlink_result != 0) {
+      int saved_errno = errno;
+      // Don't log ENOENT as error - segment may have been already unlinked
+      if (saved_errno != ENOENT) {
+        LOG(WARNING) << "ShmemSegment::Unmap() shm_unlink failed: name=" << name_
+                     << ", errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
+      } else {
+        VLOG(2) << "ShmemSegment::Unmap() segment already unlinked: " << name_;
+      }
+    } else {
+      VLOG(1) << "ShmemSegment::Unmap() successfully unlinked: " << name_;
+    }
+  }
 }
 
 // -------- public API --------
 
 void ShmemSegment::RemoveIfExists(const std::string& name) {
-#ifndef __linux__
-  // Only shm_unlink() path needs explicit removal.
-  std::string shm_name = "/" + name;
-  ::shm_unlink(shm_name.c_str()); // ignore errors
-#else
-  (void)name; // memfd has no global name to remove
-#endif
+  // Always use shm_unlink since we use shm_open for cross-process segments
+  // (The old code incorrectly assumed Linux used memfd, but we use shm_open everywhere)
+  std::string shm_name = (!name.empty() && name[0] == '/') ? name : "/" + name;
+  int result = ::shm_unlink(shm_name.c_str());
+  if (result != 0 && errno != ENOENT) {
+    // Log warning but continue - ENOENT is expected if already removed
+    VLOG(2) << "RemoveIfExists: shm_unlink failed for " << shm_name 
+            << ", errno=" << errno << " (" << strerror(errno) << ")";
+  } else if (result == 0) {
+    VLOG(1) << "RemoveIfExists: successfully removed " << shm_name;
+  }
 }
 
 void ShmemSegment::RemoveNamedSemaphores(const std::string& server_name) {
