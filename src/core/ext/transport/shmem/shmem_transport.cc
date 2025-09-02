@@ -1676,19 +1676,12 @@ class ShmemServerTransport final : public ServerTransport {
           case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST: {
             auto* rb = &cb_->GetC2SQueues()->data_rb;
 
-            // Copy out of the ring (don't pin)
-            const unsigned char* p = rb->GetBuffer(cb_) + cmd.data_offset;
-            grpc_core::Slice copied = grpc_core::Slice::FromCopiedBuffer(reinterpret_cast<const char*>(p),
-                                               cmd.data_size);
-            st.c2s_copied_accumulator.Append(std::move(copied));
+            // Use zero-copy ring-backed slice (symmetric with S2C path)
+            grpc_slice s = grpc_shmem::MakeSliceFromRing(rb, cb_, cmd.data_offset, cmd.data_size);
+            st.c2s_copied_accumulator.Append(grpc_core::Slice(s));
 
-            // Free ring bytes NOW so next reserve can succeed
-            uint64_t tail0 = rb->tail.load(std::memory_order_relaxed);
-            grpc_shmem::Release(rb, cmd.data_size);
-            uint64_t tail1 = rb->tail.load(std::memory_order_relaxed);
-            VLOG(1) << "[C2S FREE VERIFY] freed=" << cmd.data_size
-                       << " tail_before=" << tail0
-                       << " tail_after=" << tail1;
+            // Ring buffer space will be automatically released by slice finalizer when message is consumed
+            VLOG(2) << "C2S MESSAGE CHUNK: added zero-copy slice of " << cmd.data_size << " bytes";
 
             // On LAST, deliver one Message from the copied slices
             if (cmd.type == grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST &&
@@ -2030,7 +2023,7 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
     
     call.initiator.SpawnInfallible("push-pending-msg", [call_initiator = call.initiator, pending_msg]() mutable {
       SliceBuffer sb;
-      // Create slice from copied data
+      // Create slice from copied data (TODO: eliminate this copy by using ring-backed message assembly)
       grpc_slice s = grpc_slice_from_copied_buffer(
           reinterpret_cast<const char*>(pending_msg.data.data()), 
           pending_msg.data.size());
