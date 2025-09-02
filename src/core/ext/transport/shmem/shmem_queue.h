@@ -117,7 +117,7 @@ class TransportSemaphoreAdapter {
   virtual void Post(ControlBlock* cb, bool is_c2s) = 0;
   virtual void Wait(bool is_c2s) = 0;
   // Batching support - returns true if should post after adding this command
-  virtual bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added) { return true; }
+  virtual bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added, bool was_empty) { return true; }
   
   // OPTIMIZATION: Return file descriptor for event loop integration
   // Returns -1 if FD-based polling not supported

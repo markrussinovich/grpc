@@ -272,7 +272,15 @@ class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
     // Always return after one wait - don't loop infinitely
   }
 
-  bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added) override {
+  bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added, bool was_empty) override {
+    // SIMPLE coalescing: only coalesce when we're absolutely certain it's safe
+    // For now, always post to ensure correctness - we can optimize later
+    // The race condition fix (waiter-bit handshake) is more important than coalescing
+    
+    VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
+            << " was_empty=" << was_empty 
+            << " decision=true (always post for safety)";
+    
     return true;
   }
 

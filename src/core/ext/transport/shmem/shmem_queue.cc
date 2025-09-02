@@ -182,16 +182,7 @@ bool PushCommand(ShmemQueues* q, ControlBlock* cb, Direction dir,
       bool should_post = true;
       if (sem_adapter) {
         should_post = sem_adapter->ShouldPost(dir == Direction::kC2S, 
-                                             sizeof(Command) + cmd.data_size, 1);
-        
-        // SAFETY: In futex-only mode, always post to avoid lost-wakeup race condition
-        // Until we implement proper PrepareToWait() handshake, be conservative
-        // and always wake potential sleepers to prevent deadlocks
-        if (!should_post) {
-          // TODO: Replace this with proper waiter-bit checking when PrepareToWait is implemented
-          should_post = true;  // Always post in futex-only mode for safety
-          VLOG(2) << "PushCommand: Overriding batching decision - posting to prevent lost wakeup";
-        }
+                                             sizeof(Command) + cmd.data_size, 1, was_empty);
       } else {
         // Legacy fallback: wake based on waiter flag or first-item heuristic
         should_post = was_empty;
