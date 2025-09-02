@@ -229,19 +229,15 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
   
   Command tmp;
   
-  // Adaptive spinning: more spins for high throughput scenarios  
-  const int effective_spins = std::max(spin_iters, 8);
-  for (int i = 0; i < effective_spins; ++i) {
+  // Respect spin_iters exactly - no forced minimum or yields
+  // Non-blocking drainers use spin_iters=0, futex threads handle blocking
+  for (int i = 0; i < spin_iters; ++i) {
     if (q->command_q.pop(tmp)) {
       *out = tmp;
       if (pop_call_count <= 10) {
         VLOG(3) << "PopCommandHybrid " << dir_name << " - found command in spin loop";
       }
       return true;
-    }
-    // Yield every few iterations to avoid excessive CPU usage
-    if (i > 0 && i % 4 == 0) {
-      std::this_thread::yield();
     }
   }
   
