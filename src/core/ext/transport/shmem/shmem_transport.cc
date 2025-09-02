@@ -2622,6 +2622,14 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         break;
       }
       
+      case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK:
+      case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST: {
+        // Handle message chunks - for now just release the data
+        // TODO: Implement proper message chunking assembly
+        grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
+        break;
+      }
+      
       default: {
         fprintf(stderr, "*** DEBUG: Unhandled command type=%d ***\n", static_cast<int>(cmd.type));
         fflush(stderr);
