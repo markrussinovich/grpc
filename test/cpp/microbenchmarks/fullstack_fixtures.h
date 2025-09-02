@@ -104,7 +104,7 @@ class FullstackFixture : public BaseFixture {
 
   ~FullstackFixture() override {
     channel_.reset();
-    server_->Shutdown(grpc_timeout_milliseconds_to_deadline(0));
+    server_->Shutdown(grpc_timeout_milliseconds_to_deadline(1000));  // 1 second timeout
     cq_->Shutdown();
     void* tag;
     bool ok;

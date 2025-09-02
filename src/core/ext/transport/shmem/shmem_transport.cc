@@ -150,19 +150,10 @@ static void WaitReserveWithEmptyWrap(grpc_shmem::ShmemQueues* q,
                 << " head_before=" << head;
         grpc_shmem::PushCommand(q, cb, dir, pad, sem);
 
-        // Wait until tail catches up (PAD applied) - with timeout to prevent hangs
+        // Wait until tail catches up (PAD applied) - use yield loop without timeout
         const uint64_t target = tail + free_to_end;
-        auto start_time = std::chrono::steady_clock::now();
-        const auto timeout_duration = std::chrono::seconds(5); // 5 second timeout
         while (rb->tail.load(std::memory_order_acquire) < target) {
           std::this_thread::yield();
-          // Check for timeout to prevent indefinite hanging
-          if (std::chrono::steady_clock::now() - start_time > timeout_duration) {
-            LOG(ERROR) << "Timeout waiting for tail to catch up: target=" << target 
-                      << " current_tail=" << rb->tail.load(std::memory_order_acquire)
-                      << " - breaking to prevent hang";
-            break;
-          }
         }
         // Now head%cap==0, used==0 -> try reserve again
         continue;
@@ -238,12 +229,13 @@ class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
     auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
     
     // Increment sequence to signal new data
-    db.seq.fetch_add(1, std::memory_order_release);
+    uint64_t new_seq = db.seq.fetch_add(1, std::memory_order_release) + 1;
     
     // Wake any waiting threads using pure futex signaling
-    futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
+    int woken = futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
     
-    VLOG(4) << "FutexDoorbellAdapter::Post - pure futex signaling completed";
+    VLOG(2) << "FutexDoorbellAdapter::Post " << (is_c2s ? "C2S" : "S2C") 
+            << " seq=" << new_seq << " woken=" << woken;
   }
 
   
@@ -271,9 +263,8 @@ class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
       return; // Data arrived while setting waiter
     }
     
-    // Use futex wait with timeout to avoid blocking indefinitely
-    struct timespec timeout = {0, 1000000}; // 1ms timeout
-    futex_wait(reinterpret_cast<uint32_t*>(&db.seq), final_seq, &timeout);
+    // Use blocking futex wait without timeout
+    futex_wait(reinterpret_cast<uint32_t*>(&db.seq), final_seq, nullptr);
     
     // Clear waiter flag when waking up
     db.waiter.store(0, std::memory_order_relaxed);
@@ -288,7 +279,6 @@ class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
 private:
   grpc_shmem::ControlBlock* cb_;
   std::atomic<uint64_t> avoided_wakes_{0};
-  std::atomic<uint64_t> timeout_wakes_{0};
 };
 
 // Helper function to handle ReserveContiguous with retry/backoff
@@ -377,10 +367,16 @@ class ShmemClientTransport final : public ClientTransport {
       return; // Already initiated
     }
     
-    // Step 2: Set stop flag and wake threads
+    // Step 1.5: Set stop flag FIRST to prevent new task scheduling
     stop_.store(true, std::memory_order_relaxed);
     
-    // Step 3: Wake any waiting reader threads
+    // Step 1.6: Clear call handlers to prevent Promise task execution
+    {
+      MutexLock lk(&mu_);
+      handlers_.clear();
+    }
+    
+    // Step 2: Wake any waiting reader threads
     WaitForThreadsToExit();
     
     // Step 4: Publish shutdown to connectivity watchers before cleanup
@@ -414,9 +410,6 @@ class ShmemClientTransport final : public ClientTransport {
           // Always wake futex waiters during shutdown - don't check waiter flag
           db.seq.fetch_add(1, std::memory_order_release);
           futex_wake(reinterpret_cast<uint32_t*>(&db.seq), INT_MAX); // Wake all waiters
-          
-          // Give threads time to check stop flag and exit
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
           
         } catch (const std::exception& e) {
           LOG(ERROR) << "Error waking futex doorbells: " << e.what();
@@ -768,7 +761,7 @@ class ShmemServerTransport final : public ServerTransport {
   }
   
   void SetCallDestination(RefCountedPtr<UnstartedCallDestination> h) override {
-  SHMEM_DBGF("*** DEBUG: SetCallDestination called - promise-based integration ready ***\n");
+    LOG(INFO) << "ShmemServerTransport: Integration mode latched to PROMISE";
     
     std::vector<PendingCall> pending_to_flush;
     {
@@ -780,9 +773,9 @@ class ShmemServerTransport final : public ServerTransport {
       if (accept_stream_cb_ == nullptr) {
         pending_to_flush = std::move(pending_calls_);
         pending_calls_.clear();
-  SHMEM_DBGF("*** DEBUG: Flushing %zu calls to PROMISE path ***\n", pending_to_flush.size());
+        LOG(INFO) << "ShmemServerTransport: Flushing " << pending_to_flush.size() << " buffered calls to PROMISE path";
       } else {
-  SHMEM_DBGF("*** DEBUG: Legacy callback already set, not flushing to promise path ***\n");
+        LOG(INFO) << "ShmemServerTransport: Legacy callback already active, PROMISE path secondary";
       }
     }
     
@@ -802,14 +795,18 @@ class ShmemServerTransport final : public ServerTransport {
   // have already installed its own callback via PerformOp during
   // Server::SetupTransport. We simply start consuming C2S traffic and call
   // that callback when new streams arrive, mirroring TCP behavior.
-  SHMEM_DBGF("*** DEBUG: SetCallDestination called - accept_stream_cb_=%p ***\n", (void*)accept_stream_cb_);
-  SHMEM_DBGF("*** DEBUG: SetCallDestination: accept_stream_cb_ = %p ***\n", (void*)accept_stream_cb_);
-  LOG(INFO) << "SetCallDestination called - server ready for clients (NO THREADS)";
+  LOG(INFO) << "SetCallDestination called - server ready for clients";
 
     // Initialize FD exchange for event-driven processing (pollsets are now ready)
-  SHMEM_DBGF("*** DEBUG: About to call InitC2SDoorbell ***\n");
+    LOG(INFO) << "InitC2SDoorbell: futex reader started (mode=promise)";
     InitC2SDoorbell();
-  SHMEM_DBGF("*** DEBUG: InitC2SDoorbell call completed ***\n");
+    
+    // Signal that server is ready for connections
+    {
+      MutexLock rl(&ready_mu_);
+      ready_ = true;
+      ready_cv_.SignalAll();
+    }
     
     // Commands will be processed via OnC2SReadable callbacks when clients send data
   }
@@ -904,8 +901,6 @@ class ShmemServerTransport final : public ServerTransport {
         db.seq.fetch_add(1, std::memory_order_release);
         futex_wake(reinterpret_cast<uint32_t*>(&db.seq), INT_MAX); // Wake all waiters
         
-        // Give threads time to check stop flag and exit
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         
       } catch (const std::exception& e) {
         LOG(ERROR) << "Error waking futex doorbells: " << e.what();
@@ -1005,8 +1000,7 @@ class ShmemServerTransport final : public ServerTransport {
     
     // Handle accept stream callback registration - following TCP transport pattern
     if (op->set_accept_stream) {
-  SHMEM_DBGF("*** DEBUG: PerformOp: set_accept_stream=true - REGISTERING CALLBACK ***\n");
-      LOG(INFO) << "ShmemServerTransport: Registering accept_stream_cb";
+      LOG(INFO) << "ShmemServerTransport: Integration mode latched to LEGACY";
       accept_stream_cb_ = op->set_accept_stream_fn;
       accept_stream_cb_user_data_ = op->set_accept_stream_user_data;
       
@@ -1018,9 +1012,9 @@ class ShmemServerTransport final : public ServerTransport {
         if (!dest_ready_) {
           pending_to_flush = std::move(pending_calls_);
           pending_calls_.clear();
-          SHMEM_DBGF("*** DEBUG: Flushing %zu calls to LEGACY accept_stream path ***\n", pending_to_flush.size());
+          LOG(INFO) << "ShmemServerTransport: Flushing " << pending_to_flush.size() << " buffered calls to LEGACY path";
         } else {
-          SHMEM_DBGF("*** DEBUG: Promise-based dest already set, not flushing to legacy path ***\n");
+          LOG(INFO) << "ShmemServerTransport: PROMISE path already active, LEGACY path secondary";
         }
       }
       
@@ -1029,9 +1023,19 @@ class ShmemServerTransport final : public ServerTransport {
         auto* server_data = new ShmemServerData{pc.stream_id, std::move(pc.kvs_for_legacy)};
         accept_stream_cb_(accept_stream_cb_user_data_, this, server_data);
       }
+      
+      // Start futex reader now that legacy integration is latched
+      LOG(INFO) << "InitC2SDoorbell: futex reader started (mode=legacy)";
+      InitC2SDoorbell();
+      
+      // Signal that server is ready for connections
+      {
+        MutexLock rl(&ready_mu_);
+        ready_ = true;
+        ready_cv_.SignalAll();
+      }
     } else {
-      fprintf(stderr, "*** DEBUG: PerformOp: set_accept_stream=false - NO CALLBACK ***\n");
-      fflush(stderr);
+      LOG(INFO) << "ShmemServerTransport: No accept_stream callback set (promise-only mode expected)";
     }
     
     // Server-initiated disconnect: finish all in-flight calls with UNAVAILABLE.
@@ -1097,13 +1101,10 @@ class ShmemServerTransport final : public ServerTransport {
   static void OnC2SReadable(void* arg, grpc_error_handle error);
 
   void EnsureReaderStarted() {
-    if (cb_ == nullptr) {
-      return;
-    }
-    if (!reader_started_.exchange(true, std::memory_order_acq_rel)) {
-      InitC2SDoorbell();
-      // reader_ready_.store(true, std::memory_order_release); // Server ready signaling not needed with EventEngine
-    }
+    // SERVER READER START REMOVED: InitC2SDoorbell is now called only after integration latches
+    // in SetCallDestination() or PerformOp() set_accept_stream path to prevent buffer-first races.
+    // This method is kept for API compatibility but no longer starts the reader.
+    LOG(INFO) << "Server EnsureReaderStarted: deferred until integration latches";
   }
 
   // Legacy stream-op completion helpers removed.
@@ -1445,8 +1446,7 @@ class ShmemServerTransport final : public ServerTransport {
           // No stream; just free the padded bytes.
           VLOG(1) << "APPLY PAD dir=C2S bytes=" << cmd.data_size
                   << " tail_before=" << cb_->GetC2SQueues()->data_rb.tail.load(std::memory_order_relaxed);
-          cb_->GetC2SQueues()->data_rb.tail.fetch_add(
-              cmd.data_size, std::memory_order_release);
+          grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
           continue;
         }
         
@@ -1560,7 +1560,7 @@ class ShmemServerTransport final : public ServerTransport {
                 
                 // 6) Release the C2S metadata bytes you consumed
                 if (cmd.data_size) {
-                  cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+                  grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
                 }
               } else {
                 // SYNTHETIC PATH (for test hooks like /cancel)
@@ -1633,7 +1633,7 @@ class ShmemServerTransport final : public ServerTransport {
                 streams.erase(cmd.stream_id);
                 
                 // Release consumed bytes from c2s
-                cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+                grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
               }
             }
             break;
@@ -1684,7 +1684,7 @@ class ShmemServerTransport final : public ServerTransport {
 
             // Free ring bytes NOW so next reserve can succeed
             uint64_t tail0 = rb->tail.load(std::memory_order_relaxed);
-            rb->tail.fetch_add(cmd.data_size, std::memory_order_release);
+            grpc_shmem::Release(rb, cmd.data_size);
             uint64_t tail1 = rb->tail.load(std::memory_order_relaxed);
             VLOG(1) << "[C2S FREE VERIFY] freed=" << cmd.data_size
                        << " tail_before=" << tail0
@@ -2092,6 +2092,12 @@ void ShmemServerTransport::StartCallNow(PendingCall pc, bool from_flush) {
   SHMEM_DBGF("StartCallNow called for stream_id=%lu, from_flush=%s\n", 
           pc.stream_id, from_flush ? "true" : "false");
   
+  // Early check for shutdown to prevent new call creation during shutdown
+  if (stop_.load(std::memory_order_relaxed)) {
+    SHMEM_DBGF("*** DEBUG: Server StartCallNow - transport is shutting down, rejecting call ***\n");
+    return; // Don't start new calls during shutdown
+  }
+  
   // Ensure EventEngine context is set on arena
   auto ee = grpc_event_engine::experimental::GetDefaultEventEngine();
   pc.arena->SetContext<grpc_event_engine::experimental::EventEngine>(ee.get());
@@ -2200,18 +2206,13 @@ void ShmemClientTransport::InitS2CDoorbell() {
     while (!thread_stop_flag->load(std::memory_order_acquire)) {
       uint32_t expected = last_seq;
       
-      // Use timeout to avoid indefinite blocking and handle signals gracefully
-      struct timespec timeout;
-      timeout.tv_sec = 0;
-      timeout.tv_nsec = 100000000; // 100ms timeout
-      
-      int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&this->cb_->s2c_db.seq), expected, &timeout);
+      // Use blocking futex wait without timeout to avoid unnecessary wake-ups
+      int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&this->cb_->s2c_db.seq), expected, nullptr);
       
       uint32_t current_seq = this->cb_->s2c_db.seq.load(std::memory_order_acquire);
       if (current_seq != last_seq) {
-        fprintf(stderr, "*** DEBUG: Client S2C sequence changed from %u to %u! Processing responses ***\n",
-                last_seq, current_seq);
-        fflush(stderr);
+        VLOG(3) << "Client S2C sequence changed from " << last_seq << " to " << current_seq 
+                << " - processing responses";
         this->DrainS2CFromPoller();
         last_seq = current_seq;
       }
@@ -2224,8 +2225,8 @@ void ShmemClientTransport::InitS2CDoorbell() {
 void ShmemClientTransport::DrainS2CFromPoller() {
   SHMEM_DBGF("*** DEBUG: Client DrainS2CFromPoller CALLED ***\n");
   
-  // CRITICAL: Set up execution context for spawned tasks
-  ExecCtx exec_ctx;
+  // CRITICAL: Set up execution context for spawned tasks with background thread flags
+  ExecCtx exec_ctx(GRPC_EXEC_CTX_FLAG_IS_FINISHED | GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP);
   
   // Process S2C commands (non-blocking)
   int commands_processed = 0;
@@ -2243,7 +2244,7 @@ void ShmemClientTransport::DrainS2CFromPoller() {
     
     // Handle DATA_PAD first (no handler needed)
     if (cmd.type == grpc_shmem::FrameType::DATA_PAD) {
-      cb_->GetS2CQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+      grpc_shmem::Release(&cb_->GetS2CQueues()->data_rb, cmd.data_size);
       continue;
     }
     
@@ -2286,7 +2287,7 @@ void ShmemClientTransport::DrainS2CFromPoller() {
               h.SpawnPushServerInitialMetadata(std::move(md));
               return Empty{};
             });
-        cb_->GetS2CQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        grpc_shmem::Release(&cb_->GetS2CQueues()->data_rb, cmd.data_size);
         break;
       }
       case grpc_shmem::FrameType::S2C_MESSAGE: {
@@ -2337,7 +2338,7 @@ void ShmemClientTransport::DrainS2CFromPoller() {
               SHMEM_DBGF("*** DEBUG: CLIENT: Call completion fully processed for stream_id=%lu ***\n", stream_id);
               return Empty{};
             });
-        cb_->GetS2CQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        grpc_shmem::Release(&cb_->GetS2CQueues()->data_rb, cmd.data_size);
         break;
       }
       default:
@@ -2353,8 +2354,6 @@ void ShmemClientTransport::OnS2CReadable(void* arg, grpc_error_handle error) { /
 
 // Server-side EventEngine integration
 void ShmemServerTransport::InitC2SDoorbell() {
-  fprintf(stderr, "*** DEBUG: ShmemServerTransport::InitC2SDoorbell ENTRY (futex-only) ***\n");
-  fflush(stderr);
   LOG(INFO) << "Server InitC2SDoorbell: starting futex wait thread";
   
   // CRITICAL FIX: Ensure stop conditions are properly initialized for this thread
@@ -2379,18 +2378,13 @@ void ShmemServerTransport::InitC2SDoorbell() {
       while (!server_thread_stop_flag->load(std::memory_order_acquire)) {
         uint32_t expected = last_seq;
         
-        // Use timeout to avoid indefinite blocking and handle signals gracefully  
-        struct timespec timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_nsec = 100000000; // 100ms timeout
-        
-        int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&server_self->cb_->c2s_db.seq), expected, &timeout);
+        // Use blocking futex wait without timeout to avoid unnecessary wake-ups  
+        int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&server_self->cb_->c2s_db.seq), expected, nullptr);
         
         uint32_t current_seq = server_self->cb_->c2s_db.seq.load(std::memory_order_acquire);
         if (current_seq != last_seq) {
-          fprintf(stderr, "*** DEBUG: Server C2S sequence changed from %u to %u! Processing commands ***\n",
-                  last_seq, current_seq);
-          fflush(stderr);
+          VLOG(3) << "Server C2S sequence changed from " << last_seq << " to " << current_seq 
+                  << " - processing commands";
           server_self->DrainC2SFromPoller();
           last_seq = current_seq;
         }
@@ -2404,8 +2398,8 @@ void ShmemServerTransport::InitC2SDoorbell() {
 void ShmemServerTransport::DrainC2SFromPoller() {
   SHMEM_DBGF("*** DEBUG: DrainC2SFromPoller CALLED ***\n");
   
-  // CRITICAL: Set up execution context for spawned tasks
-  ExecCtx exec_ctx;
+  // CRITICAL: Set up execution context for spawned tasks with background thread flags
+  ExecCtx exec_ctx(GRPC_EXEC_CTX_FLAG_IS_FINISHED | GRPC_EXEC_CTX_FLAG_THREAD_RESOURCE_LOOP);
   
   // Process C2S commands (non-blocking)  
   int commands_processed = 0;
@@ -2423,7 +2417,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
     
     // Handle DATA_PAD first (no special processing needed)
     if (cmd.type == grpc_shmem::FrameType::DATA_PAD) {
-      cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+      grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
       continue;
     }
     
@@ -2530,14 +2524,14 @@ void ShmemServerTransport::DrainC2SFromPoller() {
           
           // Release bytes consumed - call will be processed when integration arrives
           if (cmd.data_size) {
-            cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+            grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
           }
           break;  // Don't process further, call is buffered
         }
         
         // 6) Release the C2S metadata bytes we consumed
         if (cmd.data_size) {
-          cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+          grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
         }
         break;
       }
@@ -2584,7 +2578,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         }
         
         // Always advance tail to release ring buffer space
-        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
         break;
       }
       
@@ -2625,7 +2619,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         }
         
         // Always advance tail to release ring buffer space
-        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
         break;
       }
       
@@ -2633,7 +2627,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         fprintf(stderr, "*** DEBUG: Unhandled command type=%d ***\n", static_cast<int>(cmd.type));
         fflush(stderr);
         // Release data for unhandled commands
-        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
         break;
       }
     }
@@ -2650,7 +2644,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         response.grpc_status_code = 0;
         grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, response, sem_adapter_.get());
         // Release the metadata data
-        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
         break;
       }
       case grpc_shmem::FrameType::C2S_MESSAGE: {
@@ -2680,7 +2674,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         fprintf(stderr, "*** DEBUG: Server S2C_TRAILING_METADATA PushCommand completed ***\n");
         fflush(stderr);
         // Release the metadata data
-        cb_->GetC2SQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
         break;
       }
       default:
@@ -2699,6 +2693,16 @@ void ShmemServerTransport::OnC2SReadable(void* arg, grpc_error_handle error) { /
 
 void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
   SHMEM_DBGF("*** DEBUG: Client StartCall CALLED! ***\n");
+  
+  // Early check for shutdown to prevent new call creation during shutdown
+  if (stop_.load(std::memory_order_relaxed)) {
+    SHMEM_DBGF("*** DEBUG: Client StartCall - transport is shutting down, rejecting call ***\n");
+    child_call_handler.SpawnGuarded("shutdown_rejection", []() {
+      return Immediate(absl::UnavailableError("transport shutting down"));
+    });
+    return;
+  }
+  
   ExecCtx exec_ctx;  // CRITICAL: Ensure SpawnGuarded tasks actually execute
   VLOG(1) << "CLIENT: StartCall scheduling send pipelines";
   EnsureReaderStarted();  // Start S2C reader for all RPCs

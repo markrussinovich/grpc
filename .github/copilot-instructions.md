@@ -30,7 +30,7 @@ Requirements:
 
 ## Validation and CI
 - All changes must pass the **sync and async client/server examples** in `shmemtests/`.  
-- The **umary ping-ping test** with shmem must run cleanly with **no errors and no hangs**.  
+- The **umary ping-ping test** with shmem must run cleanly with full optimazions and no debug prints with **no errors and no hangs**.  
 - Add new test cases for any edge conditions introduced.  
 - Benchmark results should be collected and compared against both `inproc` and TCP transports to confirm performance goals.  
 
@@ -38,9 +38,11 @@ Requirements:
 
 ## Special Notes
 - **No polling** — all notifications must be via **futexes**.  
+- **v3 support** — the transport must correctly implement v3 promise support, but also support legacy for running the grpc benchmarks. It should detect which implementation to use based on the client/server configuration.
 - **No sleeps** — sleeps just mask race conditions, they don't fix them.
 - **No dedicated reader threads** — transport should be fully **event-driven** and integrated into the gRPC event notification system.  
 - **Do not deviate from user requests** without explicit approval.  
+- **Use logging instead of prints for debugging messages**
 - **Wait for builds to complete even if they take long time**
 - Create tempoary test files in a `/tmp` directory to avoid cluttering the repository.
 - Always provide a **list of planned steps** before starting implementation.  

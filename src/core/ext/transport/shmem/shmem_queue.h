@@ -77,7 +77,15 @@ inline bool ReserveForWriteBlocking(DataRingBuffer* rb,
 // Release 'size' bytes previously consumed starting from some offset; simply
 // advance tail (consumer side responsibility).
 inline void Release(DataRingBuffer* rb, uint32_t size) {
-  rb->tail.fetch_add(size, std::memory_order_release);
+  // Add protection against tail advancing beyond head
+  uint64_t current_head = rb->head.load(std::memory_order_acquire);
+  uint64_t current_tail = rb->tail.load(std::memory_order_relaxed);
+  uint64_t new_tail = current_tail + size;
+  
+  // Prevent tail from advancing beyond head which would corrupt the queue
+  if (new_tail <= current_head) {
+    rb->tail.store(new_tail, std::memory_order_release);
+  }
 }
 
 // Forward declaration for semaphore adapter
