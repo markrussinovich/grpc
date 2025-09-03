@@ -338,7 +338,9 @@ class ShmemClientTransport final : public ClientTransport {
       // Futex doorbells are initialized directly in ControlBlock, no additional setup needed
       
       // Create futex doorbell adapter for low-latency queue operations
+      LOG(INFO) << "Creating FutexDoorbellAdapter for CLIENT - cb_=" << cb_;
       sem_adapter_ = std::make_unique<FutexDoorbellAdapter>(cb_);
+      LOG(INFO) << "Created FutexDoorbellAdapter for CLIENT - sem_adapter_=" << sem_adapter_.get();
       
       // Register Event Engine callbacks for client command processing
       // EventEngine callbacks removed - simplified integration
@@ -715,7 +717,9 @@ class ShmemServerTransport final : public ServerTransport {
         // Futex doorbells are initialized directly in ControlBlock, no additional setup needed
         
         // Create futex doorbell adapter for low-latency queue operations  
+        LOG(INFO) << "Creating FutexDoorbellAdapter for SERVER - cb_=" << cb_;
         sem_adapter_ = std::make_unique<FutexDoorbellAdapter>(cb_);
+        LOG(INFO) << "Created FutexDoorbellAdapter for SERVER - sem_adapter_=" << sem_adapter_.get();
         
         // Register Event Engine callbacks for server command processing
         VLOG(2) << "About to get Event Engine for server";
@@ -985,22 +989,14 @@ class ShmemServerTransport final : public ServerTransport {
         // SERVER RULE: Only the main named server should perform final cleanup
         // Connection-specific server transports should not remove the segment
         bool is_named_server = channel_args_.GetBool("grpc.shmem.is_named_server").value_or(false);
-        fprintf(stderr, "[DEBUG] SERVER CLEANUP: PID=%d, is_named_server=%s, remaining=%d\n", 
-                getpid(), is_named_server ? "true" : "false", remaining);
-        fflush(stderr);
+        VLOG(1) << "SERVER CLEANUP: PID=" << getpid() << ", is_named_server=" << (is_named_server ? "true" : "false") << ", remaining=" << remaining;
         if (is_named_server && remaining == 0) {
-          fprintf(stderr, "[DEBUG] SERVER CLEANUP: Named server performing final cleanup\n");
-          fflush(stderr);
           LOG(INFO) << "SERVER CLEANUP: Named server shutting down with no remaining processes - performing final cleanup";
           PerformFinalCleanup();
         } else if (is_named_server) {
-          fprintf(stderr, "[DEBUG] SERVER CLEANUP: Named server keeping segment alive\n");
-          fflush(stderr);
           LOG(INFO) << "SERVER CLEANUP: Named server shutting down but " << remaining << " processes still attached - keeping segment alive";
         } else {
-          fprintf(stderr, "[DEBUG] SERVER CLEANUP: Connection server transport - no cleanup\n");
-          fflush(stderr);
-          LOG(INFO) << "SERVER CLEANUP: Connection server transport ending - segment managed by main server";
+          VLOG(1) << "SERVER CLEANUP: Connection server transport ending - segment managed by main server";
         }
       }
     } catch (const std::exception& e) {
@@ -2145,23 +2141,15 @@ void ShmemClientTransport::PerformFinalCleanup() {
 void ShmemServerTransport::PerformFinalCleanup() {
   if (cb_ == nullptr) return;
   
-  fprintf(stderr, "[DEBUG] PerformFinalCleanup() called for PID %d\n", getpid());
-  fflush(stderr);
   LOG(INFO) << "SERVER CLEANUP: Starting PerformFinalCleanup() for PID " << getpid();
   
   try {
     // Remove the segment from global registry on final cleanup
-    fprintf(stderr, "[DEBUG] About to call RemoveCrossProcessSegment()\n");
-    fflush(stderr);
     LOG(INFO) << "SERVER CLEANUP: About to call RemoveCrossProcessSegment()";
     RemoveCrossProcessSegment(cb_);
-    fprintf(stderr, "[DEBUG] RemoveCrossProcessSegment() completed\n");
-    fflush(stderr);
     LOG(INFO) << "SERVER CLEANUP: RemoveCrossProcessSegment() completed";
     LOG(INFO) << "SERVER CLEANUP: Final cleanup complete for PID " << getpid();
   } catch (const std::exception& e) {
-    fprintf(stderr, "[DEBUG] PerformFinalCleanup() error: %s\n", e.what());
-    fflush(stderr);
     LOG(ERROR) << "SERVER CLEANUP: ShmemServerTransport::PerformFinalCleanup error: " << e.what();
   }
 }
@@ -2484,6 +2472,17 @@ void ShmemClientTransport::OnS2CReadable(void* arg, grpc_error_handle error) { /
 // Server-side EventEngine integration
 void ShmemServerTransport::InitC2SDoorbell() {
   LOG(INFO) << "Server InitC2SDoorbell: starting futex wait thread";
+  
+  // Create futex doorbell adapter if not already created
+  if (!sem_adapter_ && cb_) {
+    LOG(INFO) << "Creating FutexDoorbellAdapter for SERVER (InitC2SDoorbell) - cb_=" << cb_;
+    sem_adapter_ = std::make_unique<FutexDoorbellAdapter>(cb_);
+    LOG(INFO) << "Created FutexDoorbellAdapter for SERVER (InitC2SDoorbell) - sem_adapter_=" << sem_adapter_.get();
+  } else if (!cb_) {
+    LOG(WARNING) << "InitC2SDoorbell called but cb_ is null - adapter not initialized";
+  } else if (sem_adapter_) {
+    LOG(INFO) << "FutexDoorbellAdapter already exists - sem_adapter_=" << sem_adapter_.get();
+  }
   
   // CRITICAL FIX: Ensure stop conditions are properly initialized for this thread
   stop_.store(false, std::memory_order_release);
