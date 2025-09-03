@@ -214,6 +214,28 @@ namespace grpc_shmem {
 }
 
 namespace grpc_core {
+
+// Encoder for serializing metadata to KV pairs for shmem transport
+struct ShmemMetadataEncoder {
+  std::vector<grpc_shmem::KVPair>* kvs;
+  
+  // Handle typed metadata - called by EncodeTo with (Which(), value)
+  template <typename TraitsType>
+  void Encode(TraitsType, const typename TraitsType::ValueType& value) {
+    auto encoded_value = TraitsType::Encode(value);
+    std::string key_str = std::string(TraitsType::key());
+    
+    // Convert encoded value to string via as_string_view() which all slice types support
+    absl::string_view value_view = encoded_value.as_string_view();
+    kvs->push_back({key_str, std::string(value_view)});
+  }
+  
+  // Handle unknown/user-defined metadata (including *-bin fields)
+  // This is called for unknown_ metadata entries with (key_slice, value_slice)
+  void Encode(const Slice& key, const Slice& value) {
+    kvs->push_back({std::string(key.as_string_view()), std::string(value.as_string_view())});
+  }
+};
 namespace {
 
 // Data structure for announcing streams to core via accept callback
@@ -1186,7 +1208,9 @@ after_accept_stream:
               SHMEM_DBGF("*** DEBUG: SERVER: Sending S2C_INITIAL_METADATA stream_id=%lu ***\n", stream_id);
               VLOG(1) << "SERVER: Sending S2C_INITIAL_METADATA stream_id=" << stream_id;
               std::vector<grpc_shmem::KVPair> kvs;
-              kvs.push_back({"content-type", "application/grpc"});
+              // Serialize ALL initial metadata including binary fields
+              ShmemMetadataEncoder encoder{&kvs};
+              md.value()->Encode(&encoder);
               auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
               uint64_t off = 0; uint32_t pad = 0;
               WaitReserveWithWatchdog(&cb_->GetS2CQueues()->data_rb, buf.size(), &off, &pad, "S2C_INITIAL_METADATA");
@@ -1339,14 +1363,9 @@ after_accept_stream:
             SHMEM_DBGF("*** DEBUG: ShmemCallOutboundLoop: PullServerTrailingMetadata returned for stream_id=%lu ***\n", stream_id);
             VLOG(1) << "SERVER: Sending S2C_TRAILING_METADATA stream_id=" << stream_id;
             std::vector<grpc_shmem::KVPair> kvs;
-            grpc_status_code status = GRPC_STATUS_OK;
-            if (auto* s = md->get_pointer(GrpcStatusMetadata()); s) {
-              status = *s;
-            }
-            if (auto* m = md->get_pointer(GrpcMessageMetadata()); m) {
-              kvs.push_back({"grpc-message", std::string(m->as_string_view())});
-            }
-            kvs.push_back({"grpc-status", std::to_string(status)});
+            // Serialize ALL trailing metadata including binary fields
+            ShmemMetadataEncoder encoder{&kvs};
+            md->Encode(&encoder);
             auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
             uint64_t off = 0; uint32_t pad = 0;
             WaitReserveWithWatchdog(&cb_->GetS2CQueues()->data_rb, buf.size(), &off, &pad, "S2C_TRAILING_METADATA");
@@ -1786,9 +1805,13 @@ after_accept_stream:
             break;
           }
           case grpc_shmem::FrameType::C2S_CANCEL: {
+            LOG(INFO) << "SERVER: Received C2S_CANCEL for stream " << cmd.stream_id;
             st.cancelled = true;
             if (st.initiator.has_value()) {
+              LOG(INFO) << "SERVER: Spawning cancel for stream " << cmd.stream_id;
               st.initiator->SpawnCancel();
+            } else {
+              LOG(INFO) << "SERVER: No initiator found for stream " << cmd.stream_id << " to cancel";
             }
             break;
           }
@@ -2299,7 +2322,7 @@ void ShmemClientTransport::DrainS2CFromPoller() {
   for (;;) {
     grpc_shmem::Command cmd;
     if (!grpc_shmem::PopCommandHybrid(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C,
-                                     0, &cmd, /*sem_adapter=*/nullptr)) {
+                                     0, &cmd, sem_adapter_.get())) {
       break; // No more commands
     }
     
@@ -2334,13 +2357,15 @@ void ShmemClientTransport::DrainS2CFromPoller() {
     switch (cmd.type) {
       case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
         RecvOp op; op.type = RecvOp::kInit;
+        // Copy metadata bytes from ring buffer instead of discarding them
+        grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->GetS2CQueues()->data_rb, cb_, cmd.data_offset, cmd.data_size);
+        op.buf.AppendIndexed(Slice(s));
         {
           MutexLock ql(&s2c_recv_mu_);
           auto& rs = s2c_recv_[cmd.stream_id];
           rs.q.push_back(std::move(op));
           if (!rs.draining) { rs.draining = true; should_start_drain = true; }
         }
-        grpc_shmem::Release(&cb_->GetS2CQueues()->data_rb, cmd.data_size);
         break;
       }
       case grpc_shmem::FrameType::S2C_MESSAGE: {
@@ -2388,13 +2413,15 @@ void ShmemClientTransport::DrainS2CFromPoller() {
       }
       case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
         RecvOp op; op.type = RecvOp::kTrailing;
+        // Copy metadata bytes from ring buffer instead of discarding them
+        grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->GetS2CQueues()->data_rb, cb_, cmd.data_offset, cmd.data_size);
+        op.buf.AppendIndexed(Slice(s));
         {
           MutexLock ql(&s2c_recv_mu_);
           auto& rs = s2c_recv_[cmd.stream_id];
           rs.q.push_back(std::move(op));
           if (!rs.draining) { rs.draining = true; should_start_drain = true; }
         }
-        grpc_shmem::Release(&cb_->GetS2CQueues()->data_rb, cmd.data_size);
         break;
       }
       default:
@@ -2438,6 +2465,31 @@ void ShmemClientTransport::StartRecvDrain(uint64_t sid) {
       case RecvOp::kInit: {
         auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
         md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
+        
+        // Parse the actual initial metadata bytes instead of just using defaults
+        if (op.buf.Length() > 0) {
+          if (op.buf.Count() > 0) {
+            auto slice = op.buf.RefSlice(0);
+            const uint8_t* bytes = slice.begin();
+            size_t len = slice.length();
+            auto kvs = grpc_shmem::DeserializeMetadataKVs(bytes, len);
+            
+            // Set all initial metadata keys (including *-bin fields)
+            for (const auto& kv : kvs) {
+              absl::string_view key = kv.key;
+              absl::string_view value = kv.value;
+              
+              // Skip content-type as it's already set, add other fields
+              if (key != "content-type") {
+                md->Append(key, Slice::FromCopiedBuffer(value.data(), value.size()),
+                          [](absl::string_view key_str, const Slice&) {
+                            return key_str;
+                          });
+              }
+            }
+          }
+        }
+        
         h->SpawnPushServerInitialMetadata(std::move(md));
         break;
       }
@@ -2448,7 +2500,38 @@ void ShmemClientTransport::StartRecvDrain(uint64_t sid) {
       }
       case RecvOp::kTrailing: {
         auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
-        md->Set(GrpcStatusMetadata(), GRPC_STATUS_OK);
+        // Parse the actual metadata bytes instead of synthesizing generic metadata
+        if (op.buf.Length() > 0) {
+          // Get the first slice from the buffer
+          if (op.buf.Count() > 0) {
+            auto slice = op.buf.RefSlice(0);
+            const uint8_t* bytes = slice.begin();
+            size_t len = slice.length();
+            auto kvs = grpc_shmem::DeserializeMetadataKVs(bytes, len);
+            
+            // Set all metadata keys (including *-bin fields)
+            for (const auto& kv : kvs) {
+              absl::string_view key = kv.key;
+              absl::string_view value = kv.value;
+              
+              if (key == "grpc-status") {
+                int status = atoi(std::string(value).c_str());
+                md->Set(GrpcStatusMetadata(), static_cast<grpc_status_code>(status));
+              } else if (key == "grpc-message") {
+                md->Set(GrpcMessageMetadata(), Slice::FromCopiedString(value));
+              } else {
+                // Set all other metadata including binary (*-bin) fields
+                md->Append(key, Slice::FromCopiedBuffer(value.data(), value.size()),
+                          [](absl::string_view key_str, const Slice&) {
+                            return key_str;
+                          });
+              }
+            }
+          }
+        } else {
+          // Fallback to OK status if no metadata bytes
+          md->Set(GrpcStatusMetadata(), GRPC_STATUS_OK);
+        }
         h->SpawnPushServerTrailingMetadata(std::move(md));
         // Only erase handler inside the trailing op
         {
@@ -2535,7 +2618,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
   for (;;) {
     grpc_shmem::Command cmd;
     if (!grpc_shmem::PopCommandHybrid(cb_->GetC2SQueues(), cb_, grpc_shmem::Direction::kC2S,
-                                     0, &cmd, /*sem_adapter=*/nullptr)) {
+                                     0, &cmd, sem_adapter_.get())) {
       break; // No more commands
     }
     
@@ -3085,23 +3168,38 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
   VLOG(2) << "CLIENT: About to spawn message pipeline";
   child_call_handler.SpawnGuarded(
       "c2s_messages_and_eos",
-      TrySeq(
-        ForEach(MessagesFrom(child_call_handler), std::move(send_message)),
-        [cb, stream_id, this]() -> StatusFlag {
-          // Explicit client half-close (no payload)
-          VLOG(2) << "CLIENT: Sending trailing metadata for stream=" << stream_id;
-          grpc_shmem::Command eos{};
-          eos.stream_id = stream_id;
-          eos.type = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
-          eos.data_offset = 0;
-          eos.data_size = 0;
-          VLOG(1) << "CLIENT: Sending C2S_TRAILING_METADATA stream_id=" << stream_id;
-          bool success = grpc_shmem::PushCommand(cb->GetC2SQueues(), cb,
-                                                 grpc_shmem::Direction::kC2S,
-                                                 eos, sem_adapter_.get());
-          return StatusFlag(success);
-        }
-      ));
+      Seq(
+        // 1) Stream client messages; capture both success and failure cases
+        Map(ForEach(MessagesFrom(child_call_handler), std::move(send_message)),
+            [cb, stream_id, this](StatusFlag sent_all) -> StatusFlag {
+              VLOG(1) << "CLIENT: ForEach completed for stream=" << stream_id << " sent_all.ok()=" << sent_all.ok();
+              if (!sent_all.ok()) {
+                // User canceled (or send stream failed): notify server immediately.
+                VLOG(1) << "CLIENT: call canceled; sending C2S_CANCEL for stream=" << stream_id;
+                grpc_shmem::Command cancel{};
+                cancel.stream_id  = stream_id;
+                cancel.type       = grpc_shmem::FrameType::C2S_CANCEL;
+                cancel.data_offset = 0;
+                cancel.data_size   = 0;
+                (void)grpc_shmem::PushCommand(cb->GetC2SQueues(), cb,
+                                              grpc_shmem::Direction::kC2S,
+                                              cancel, sem_adapter_.get());
+                // Do NOT send C2S_TRAILING_METADATA on cancel.
+                return sent_all;  // propagate canceled status
+              }
+              // Normal half-close (no payload)
+              VLOG(2) << "CLIENT: Sending trailing metadata for stream=" << stream_id;
+              grpc_shmem::Command eos{};
+              eos.stream_id  = stream_id;
+              eos.type       = grpc_shmem::FrameType::C2S_TRAILING_METADATA;
+              eos.data_offset = 0;
+              eos.data_size   = 0;
+              VLOG(1) << "CLIENT: Sending C2S_TRAILING_METADATA stream_id=" << stream_id;
+              bool success = grpc_shmem::PushCommand(cb->GetC2SQueues(), cb,
+                                                     grpc_shmem::Direction::kC2S,
+                                                     eos, sem_adapter_.get());
+              return StatusFlag(success);
+            })));
 }
 
 // Global storage for cross-process segments (keyed by control block pointer)
