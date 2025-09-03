@@ -268,8 +268,7 @@ bool PopCommandHybrid(ShmemQueues* q, ControlBlock* cb, Direction dir,
 }
 
 bool ReserveForWrite(DataRingBuffer* rb, uint32_t size,
-                     uint64_t* out_offset, uint32_t* out_pad) {
-  if (size > rb->capacity) return false;
+                     uint64_t* out_offset, uint32_t* out_pad) {  if (size > rb->capacity) return false;
 
   for (;;) {
     uint64_t head = rb->head.load(std::memory_order_relaxed);
