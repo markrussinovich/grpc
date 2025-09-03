@@ -66,6 +66,12 @@ class ShmemSegment {
 
   // Pointer into shared segment; valid while this ShmemSegment is alive.
   ControlBlock* control() const { return control_; }
+  
+  // Get the segment name for debugging
+  const std::string& name() const { return name_; }
+  
+  // Control whether this segment should unlink on destruction
+  void SetUnlinkOnDestroy(bool should_unlink) { should_unlink_on_destroy_ = should_unlink; }
 
  private:
   ShmemSegment(std::string name, void* base, size_t size, ControlBlock* cb, int fd)
@@ -77,6 +83,7 @@ class ShmemSegment {
     size_ = other.size_; other.size_ = 0;        // FIX: Clear size_ for consistency  
     control_ = other.control_; other.control_ = nullptr;
     fd_ = other.fd_; other.fd_ = -1;
+    should_unlink_on_destroy_ = other.should_unlink_on_destroy_;
   }
 
   static void InitQueues(void* base, size_t size, ControlBlock* cb,
@@ -93,6 +100,7 @@ class ShmemSegment {
   size_t size_ = 0;
   ControlBlock* control_ = nullptr;  // points into segment_
   int fd_ = -1;
+  bool should_unlink_on_destroy_ = true;  // Controls whether destructor calls shm_unlink
 };
 
 }  // namespace grpc_shmem

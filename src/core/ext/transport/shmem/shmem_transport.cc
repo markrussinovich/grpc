@@ -318,8 +318,10 @@ void RemoveCrossProcessSegment(grpc_shmem::ControlBlock* cb);
 class ShmemClientTransport final : public ClientTransport {
  public:
   ShmemClientTransport(ShmemServerTransport* server,
-                       grpc_shmem::ControlBlock* cb, const ChannelArgs& args)
-      : server_(server), cb_(cb), 
+                       grpc_shmem::ControlBlock* cb, 
+                       std::unique_ptr<grpc_shmem::ShmemSegment> client_segment,
+                       const ChannelArgs& args)
+      : server_(server), cb_(cb), client_segment_(std::move(client_segment)),
         channel_args_(args.Set(GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH, -1)
                          .Set(GRPC_ARG_MAX_SEND_MESSAGE_LENGTH, -1)) {
     VLOG(2) << "ShmemClientTransport constructor starting";
@@ -472,18 +474,15 @@ class ShmemClientTransport final : public ClientTransport {
       //   handlers_.clear();
       // }
       
-      // Handle atomic reference counting and cleanup coordination
+      // Handle atomic reference counting - CLIENT NEVER CLEANS UP SEGMENT
       if (cb_ != nullptr) {
-        // Atomic decrement - only the process that decrements to 0 does cleanup
+        // Atomic decrement - but client never performs segment cleanup
         int32_t previous_count = cb_->process_count.fetch_sub(1, std::memory_order_acq_rel);
         int32_t remaining = previous_count - 1;
-        LOG(INFO) << "ShmemClientTransport [PID " << getpid() << "] detaching, remaining processes: " << remaining;
+        LOG(INFO) << "CLIENT CLEANUP: ShmemClientTransport [PID " << getpid() << "] detaching, remaining processes: " << remaining;
         
-        // The process that decrements the reference count to 0 is responsible for cleanup
-        if (remaining == 0) {
-          LOG(INFO) << "ShmemClientTransport [PID " << getpid() << "]: Last process, cleaning up shared resources";
-          PerformFinalCleanup();
-        }
+        // CLIENT RULE: Never clean up the shared segment - only the server manages segment lifetime
+        LOG(INFO) << "CLIENT CLEANUP: Client detached but leaving segment for server to manage";
       }
     } catch (const std::exception& e) {
       LOG(ERROR) << "ShmemClientTransport cleanup error: " << e.what();
@@ -976,17 +975,32 @@ class ShmemServerTransport final : public ServerTransport {
       // Cleanup semaphore manager
       // Cleanup semaphore manager if needed
       
-      // Handle atomic reference counting and cleanup coordination
+      // SERVER RULE: Server manages its own segment lifecycle, not based on client count
       if (cb_ != nullptr) {
-        // Atomic decrement - only the process that decrements to 0 does cleanup
+        // Decrement for tracking but server only cleans up on explicit shutdown
         int32_t previous_count = cb_->process_count.fetch_sub(1, std::memory_order_acq_rel);
         int32_t remaining = previous_count - 1;
-        LOG(INFO) << "ShmemServerTransport [PID " << getpid() << "] detaching, remaining processes: " << remaining;
+        LOG(INFO) << "SERVER CLEANUP: ShmemServerTransport [PID " << getpid() << "] detaching, remaining processes: " << remaining;
         
-        // The process that decrements the reference count to 0 is responsible for cleanup
-        if (remaining == 0) {
-          LOG(INFO) << "ShmemServerTransport [PID " << getpid() << "]: Last process, cleaning up shared resources";
+        // SERVER RULE: Only the main named server should perform final cleanup
+        // Connection-specific server transports should not remove the segment
+        bool is_named_server = channel_args_.GetBool("grpc.shmem.is_named_server").value_or(false);
+        fprintf(stderr, "[DEBUG] SERVER CLEANUP: PID=%d, is_named_server=%s, remaining=%d\n", 
+                getpid(), is_named_server ? "true" : "false", remaining);
+        fflush(stderr);
+        if (is_named_server && remaining == 0) {
+          fprintf(stderr, "[DEBUG] SERVER CLEANUP: Named server performing final cleanup\n");
+          fflush(stderr);
+          LOG(INFO) << "SERVER CLEANUP: Named server shutting down with no remaining processes - performing final cleanup";
           PerformFinalCleanup();
+        } else if (is_named_server) {
+          fprintf(stderr, "[DEBUG] SERVER CLEANUP: Named server keeping segment alive\n");
+          fflush(stderr);
+          LOG(INFO) << "SERVER CLEANUP: Named server shutting down but " << remaining << " processes still attached - keeping segment alive";
+        } else {
+          fprintf(stderr, "[DEBUG] SERVER CLEANUP: Connection server transport - no cleanup\n");
+          fflush(stderr);
+          LOG(INFO) << "SERVER CLEANUP: Connection server transport ending - segment managed by main server";
         }
       }
     } catch (const std::exception& e) {
@@ -2122,30 +2136,33 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
   delete sd;
 }
 
-// Shared cleanup implementation for atomic reference counting
+// CLIENT NEVER PERFORMS SEGMENT CLEANUP - only server manages segment lifetime
 void ShmemClientTransport::PerformFinalCleanup() {
-  if (cb_ == nullptr) return;
-  
-  try {
-    // With futex doorbells, no named semaphore cleanup needed
-    
-    // Clean up from global cross-process segments map
-    RemoveCrossProcessSegment(cb_);
-    LOG(INFO) << "ShmemClientTransport: Final cleanup complete";
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "ShmemClientTransport::PerformFinalCleanup error: " << e.what();
-  }
+  LOG(ERROR) << "CLIENT CLEANUP ERROR: PerformFinalCleanup() should never be called for client! PID " << getpid();
+  // This method should not be called - clients don't clean up the shared segment
 }
 
 void ShmemServerTransport::PerformFinalCleanup() {
   if (cb_ == nullptr) return;
   
+  fprintf(stderr, "[DEBUG] PerformFinalCleanup() called for PID %d\n", getpid());
+  fflush(stderr);
+  LOG(INFO) << "SERVER CLEANUP: Starting PerformFinalCleanup() for PID " << getpid();
+  
   try {
     // Remove the segment from global registry on final cleanup
+    fprintf(stderr, "[DEBUG] About to call RemoveCrossProcessSegment()\n");
+    fflush(stderr);
+    LOG(INFO) << "SERVER CLEANUP: About to call RemoveCrossProcessSegment()";
     RemoveCrossProcessSegment(cb_);
-    LOG(INFO) << "ShmemServerTransport: Final cleanup complete";
+    fprintf(stderr, "[DEBUG] RemoveCrossProcessSegment() completed\n");
+    fflush(stderr);
+    LOG(INFO) << "SERVER CLEANUP: RemoveCrossProcessSegment() completed";
+    LOG(INFO) << "SERVER CLEANUP: Final cleanup complete for PID " << getpid();
   } catch (const std::exception& e) {
-    LOG(ERROR) << "ShmemServerTransport::PerformFinalCleanup error: " << e.what();
+    fprintf(stderr, "[DEBUG] PerformFinalCleanup() error: %s\n", e.what());
+    fflush(stderr);
+    LOG(ERROR) << "SERVER CLEANUP: ShmemServerTransport::PerformFinalCleanup error: " << e.what();
   }
 }
 
@@ -3102,19 +3119,35 @@ void StoreCrossProcessSegment(grpc_shmem::ControlBlock* cb,
 
 // Helper to remove cross-process segment 
 void RemoveCrossProcessSegment(grpc_shmem::ControlBlock* cb) {
+  LOG(INFO) << "SEGMENT CLEANUP: RemoveCrossProcessSegment() called with cb=" << cb << " by PID " << getpid();
+  
   std::lock_guard<std::mutex> lock(g_cross_process_segments_mu);
+  LOG(INFO) << "SEGMENT CLEANUP: Acquired lock, total segments in map: " << g_cross_process_segments.size();
+  
   auto it = g_cross_process_segments.find(cb);
   if (it != g_cross_process_segments.end()) {
-    LOG(INFO) << "RemoveCrossProcessSegment: Found segment for cb=" << cb;
+    LOG(INFO) << "SEGMENT CLEANUP: Found segment for cb=" << cb;
+    
+    // Log segment name if available
+    if (it->second) {
+      LOG(INFO) << "SEGMENT CLEANUP: Segment name: " << it->second->name();
+      LOG(INFO) << "SEGMENT CLEANUP: About to call ShmemSegment destructor (which calls Unmap)";
+    }
     
     // With futex doorbells, no named semaphore cleanup needed
     
     // Destroy the ShmemSegment object (this will call Unmap() in its destructor)
     it->second.reset();
     g_cross_process_segments.erase(it);
-    LOG(INFO) << "RemoveCrossProcessSegment: Removed segment for cb=" << cb;
+    LOG(INFO) << "SEGMENT CLEANUP: Successfully removed segment for cb=" << cb;
+    LOG(INFO) << "SEGMENT CLEANUP: Remaining segments in map: " << g_cross_process_segments.size();
   } else {
-    LOG(WARNING) << "RemoveCrossProcessSegment: No segment found for cb=" << cb;
+    LOG(WARNING) << "SEGMENT CLEANUP: No segment found for cb=" << cb << " in map with " << g_cross_process_segments.size() << " entries";
+    
+    // Log what segments DO exist in the map
+    for (const auto& pair : g_cross_process_segments) {
+      LOG(WARNING) << "SEGMENT CLEANUP: Map contains cb=" << pair.first << " with segment name=" << (pair.second ? pair.second->name() : "null");
+    }
   }
 }
 
@@ -3174,7 +3207,7 @@ MakeShmemTransportPairImpl(const ChannelArgs& server_channel_args,
   auto server_transport = MakeOrphanable<ShmemServerTransport>(
       sargs, std::move(segment));
   auto client_transport = MakeOrphanable<ShmemClientTransport>(
-      server_transport.get(), cb, cargs);
+      server_transport.get(), cb, nullptr, cargs);
   return {OrphanablePtr<Transport>(client_transport.release()), 
           OrphanablePtr<Transport>(server_transport.release())};
 }
@@ -3228,6 +3261,11 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
     return nullptr;
   }
   
+  // CRITICAL FIX: Prevent the server segment from being unlinked when transport is destroyed
+  // This allows the segment to persist for multiple client connections
+  s.SetUnlinkOnDestroy(false);
+  LOG(INFO) << "Server segment set to NOT unlink on destroy - will persist for multiple clients";
+  
   LOG(INFO) << "Control block created successfully at: " << s.control();
   LOG(INFO) << "Control block c2s_queues: " << s.control()->GetC2SQueues();
   LOG(INFO) << "Control block s2c_queues: " << s.control()->GetS2CQueues();
@@ -3257,16 +3295,40 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   }
 
   std::string segment_name = absl::StrCat("grpc_shmem_", server_name);
+  LOG(INFO) << "CLIENT CONNECTION: Attempting to connect to server '" << server_name << "'";
+  LOG(INFO) << "CLIENT CONNECTION: Looking for segment: " << segment_name;
+  
+  // Check if segment exists in filesystem first
+  std::string segment_path = "/dev/shm/" + segment_name;
+  if (access(segment_path.c_str(), F_OK) != 0) {
+    LOG(ERROR) << "CLIENT CONNECTION: Segment file does not exist: " << segment_path << " (errno=" << errno << ": " << strerror(errno) << ")";
+  } else {
+    LOG(INFO) << "CLIENT CONNECTION: Segment file exists: " << segment_path;
+  }
+  
   VLOG(1) << "Opening segment: " << segment_name;
   fflush(stderr);
   VLOG(2) << "Opening segment: " << segment_name;
   
   auto segment = grpc_shmem::ShmemSegment::Open(segment_name);
   
+  // CRITICAL FIX: Client should never unlink the server's segment!
+  // The server manages the segment lifetime, client just attaches to it
+  segment.SetUnlinkOnDestroy(false);
+  LOG(INFO) << "Client segment set to NOT unlink on destroy - server manages segment lifetime";
+  
   VLOG(1) << "Segment opened, control block: " << segment.control();
   fflush(stderr);
   VLOG(2) << "Segment opened, control block: " << segment.control();
   if (segment.control() == nullptr) {
+    LOG(ERROR) << "CLIENT CONNECTION FAILED: ShmemSegment::Open() returned null control block";
+    LOG(ERROR) << "CLIENT CONNECTION FAILED: Server name: " << server_name;
+    LOG(ERROR) << "CLIENT CONNECTION FAILED: Segment name: " << segment_name;
+    LOG(ERROR) << "CLIENT CONNECTION FAILED: Segment path: " << segment_path;
+    
+    // List what segments DO exist
+    system("ls -la /dev/shm/grpc_shmem_* 2>/dev/null | head -10");
+    
     LOG(ERROR) << "Failed to connect to shmem server: " << server_name;
     return nullptr;
   }
@@ -3277,18 +3339,19 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   
   auto segment_ptr = std::make_unique<grpc_shmem::ShmemSegment>(std::move(segment));
   
-  VLOG(1) << "About to store segment and create client transport";
+  VLOG(1) << "About to create client transport";
   fflush(stderr);
-  VLOG(2) << "About to store segment and create client transport";
+  VLOG(2) << "About to create client transport";
   
-  // Store segment for cleanup
-  StoreCrossProcessSegment(cb, std::move(segment_ptr));
+  // CLIENT RULE: Client keeps segment alive locally but doesn't register for global cleanup
+  // Only the server manages the segment in the global cleanup map
+  LOG(INFO) << "CLIENT CONNECTION: Client connected, keeping segment alive locally (server manages global cleanup)";
   
   VLOG(1) << "Creating client transport with cb: " << cb;
   fflush(stderr);
   VLOG(2) << "Creating client transport with cb: " << cb;
   
-  auto result = OrphanablePtr<Transport>(MakeOrphanable<ShmemClientTransport>(nullptr, cb, client_channel_args).release());
+  auto result = OrphanablePtr<Transport>(MakeOrphanable<ShmemClientTransport>(nullptr, cb, std::move(segment_ptr), client_channel_args).release());
   VLOG(1) << "Client transport created successfully";
   fflush(stderr);
   return result;

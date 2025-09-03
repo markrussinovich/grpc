@@ -93,21 +93,35 @@ void ShmemSegment::Unmap() {
     fd_ = -1; 
   }
   
-  // Unlink the shared memory file to prevent resource leaks
-  if (!name_.empty()) {
+  // Unlink the shared memory file to prevent resource leaks (only if enabled)
+  if (!name_.empty() && should_unlink_on_destroy_) {
+    fprintf(stderr, "[DEBUG] ShmemSegment::Unmap() UNLINKING segment: %s (PID=%d)\n", name_.c_str(), getpid());
+    fflush(stderr);
     int unlink_result = ::shm_unlink(name_.c_str());
     if (unlink_result != 0) {
       int saved_errno = errno;
       // Don't log ENOENT as error - segment may have been already unlinked
       if (saved_errno != ENOENT) {
+        fprintf(stderr, "[DEBUG] ShmemSegment::Unmap() shm_unlink FAILED: name=%s, errno=%d (%s)\n", 
+                name_.c_str(), saved_errno, strerror(saved_errno));
+        fflush(stderr);
         LOG(WARNING) << "ShmemSegment::Unmap() shm_unlink failed: name=" << name_
                      << ", errno=" << saved_errno << " (" << strerror(saved_errno) << ")";
       } else {
+        fprintf(stderr, "[DEBUG] ShmemSegment::Unmap() segment already unlinked: %s\n", name_.c_str());
+        fflush(stderr);
         VLOG(2) << "ShmemSegment::Unmap() segment already unlinked: " << name_;
       }
     } else {
+      fprintf(stderr, "[DEBUG] ShmemSegment::Unmap() SUCCESSFULLY UNLINKED: %s\n", name_.c_str());
+      fflush(stderr);
       VLOG(1) << "ShmemSegment::Unmap() successfully unlinked: " << name_;
     }
+  } else if (!name_.empty()) {
+    fprintf(stderr, "[DEBUG] ShmemSegment::Unmap() SKIPPING unlink for: %s (should_unlink=%s)\n", 
+            name_.c_str(), should_unlink_on_destroy_ ? "true" : "false");
+    fflush(stderr);
+    VLOG(2) << "ShmemSegment::Unmap() skipping unlink for: " << name_;
   }
 }
 
