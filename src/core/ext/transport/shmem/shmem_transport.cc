@@ -234,11 +234,17 @@ class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
     // Increment sequence to signal new data
     uint32_t new_seq = db.seq.fetch_add(1, std::memory_order_release) + 1;
     
-    // Wake any waiting threads using pure futex signaling
-    int woken = futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
-    
-    VLOG(2) << "FutexDoorbellAdapter::Post " << (is_c2s ? "C2S" : "S2C") 
-            << " seq=" << new_seq << " woken=" << woken;
+    // Check waiter flag before calling futex_wake to skip syscalls when no waiters exist
+    if (db.waiter.load(std::memory_order_acquire) != 0) {
+      // Wake any waiting threads using pure futex signaling
+      int woken = futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
+      
+      VLOG(2) << "FutexDoorbellAdapter::Post " << (is_c2s ? "C2S" : "S2C") 
+              << " seq=" << new_seq << " woken=" << woken << " (waiter present)";
+    } else {
+      VLOG(2) << "FutexDoorbellAdapter::Post " << (is_c2s ? "C2S" : "S2C") 
+              << " seq=" << new_seq << " (no waiters, skipped syscall)";
+    }
   }
 
   
@@ -268,51 +274,9 @@ class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
     db.waiter.store(0, std::memory_order_relaxed);
   }
 
-  bool ShouldPost(bool is_c2s, size_t /*bytes_added*/, int frames_added, bool was_empty) override {
-    auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
-
-    // 1) Always on empty->nonempty (required for correctness)
-    if (was_empty) {
-      auto& last = is_c2s ? c2s_last_batch_ns_ : s2c_last_batch_ns_;
-      last.store(GetCurrentTimeNanos(), std::memory_order_relaxed);
-      VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
-              << " was_empty=true -> WAKE (empty->nonempty)";
-      return true;
-    }
-
-    // 2) If the consumer advertised it's going to sleep, wake it
-    if (db.waiter.load(std::memory_order_acquire) != 0) {
-      VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
-              << " waiter_waiting -> WAKE (avoid deadlock)";
-      return true;
-    }
-
-    // 3) First frame of a producer burst should ring the bell.
-    //    This prevents "single enqueue" deadlocks if nothing else follows.
-    if (frames_added == 1) {
-      auto& last = is_c2s ? c2s_last_batch_ns_ : s2c_last_batch_ns_;
-      last.store(GetCurrentTimeNanos(), std::memory_order_relaxed);
-      VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
-              << " first_frame -> WAKE (burst start)";
-      return true;
-    }
-
-    // 4) Otherwise, optional coalescing via a small batching window
-    auto& last = is_c2s ? c2s_last_batch_ns_ : s2c_last_batch_ns_;
-    uint64_t now = GetCurrentTimeNanos();
-    const uint64_t BATCH_NS = 50'000;  // 50 µs
-
-    if (now - last.load(std::memory_order_relaxed) >= BATCH_NS) {
-      last.store(now, std::memory_order_relaxed);
-      VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
-              << " batch_window_expired -> WAKE";
-      return true;
-    }
-
-    avoided_wakes_.fetch_add(1, std::memory_order_relaxed);
-    VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
-            << " within_batch_window -> COALESCE";
-    return false;
+  bool ShouldPost(bool /*is_c2s*/, size_t /*bytes_added*/, int /*frames_added*/, bool /*was_empty*/) override {
+    // Always call Post() to ensure seq bump and proper waiter handling
+    return true;
   }
 
 private:
@@ -2311,17 +2275,34 @@ void ShmemClientTransport::InitS2CDoorbell() {
     VLOG(2) << "Client about to enter futex wait loop";
     fflush(stderr);
     while (!thread_stop_flag->load(std::memory_order_acquire)) {
+      auto& db = this->cb_->s2c_db;
+      
+      // 1) Take the expected value
       uint32_t expected = last_seq;
       
-      // Use blocking futex wait without timeout to avoid unnecessary wake-ups
-      int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&this->cb_->s2c_db.seq), expected, nullptr);
+      // 2) Advertise we may sleep (so producers won't coalesce a needed wake)
+      db.waiter.store(1, std::memory_order_release);
       
-      uint32_t current_seq = this->cb_->s2c_db.seq.load(std::memory_order_acquire);
-      if (current_seq != last_seq) {
-        VLOG(3) << "Client S2C sequence changed from " << last_seq << " to " << current_seq 
+      // 3) Recheck after publishing waiter to close the race
+      uint32_t cur = db.seq.load(std::memory_order_acquire);
+      if (cur != expected) {
+        db.waiter.store(0, std::memory_order_relaxed);
+        this->DrainS2CFromPoller();
+        last_seq = cur;
+        continue;
+      }
+      
+      // 4) Sleep; we MUST be woken by futex_wake if work arrives now
+      int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&db.seq), expected, nullptr);
+      
+      // 5) Clear waiter, then drain if anything changed
+      db.waiter.store(0, std::memory_order_relaxed);
+      uint32_t new_seq = db.seq.load(std::memory_order_acquire);
+      if (new_seq != last_seq) {
+        VLOG(3) << "Client S2C sequence changed from " << last_seq << " to " << new_seq 
                 << " - processing responses";
         this->DrainS2CFromPoller();
-        last_seq = current_seq;
+        last_seq = new_seq;
       }
     }
     VLOG(2) << "Client futex wait thread finished";
@@ -2545,17 +2526,34 @@ void ShmemServerTransport::InitC2SDoorbell() {
       VLOG(2) << "Server about to enter futex wait loop";
       fflush(stderr);
       while (!server_thread_stop_flag->load(std::memory_order_acquire)) {
+        auto& db = server_self->cb_->c2s_db;
+        
+        // 1) Take the expected value
         uint32_t expected = last_seq;
         
-        // Use blocking futex wait without timeout to avoid unnecessary wake-ups  
-        int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&server_self->cb_->c2s_db.seq), expected, nullptr);
+        // 2) Advertise we may sleep (so producers won't coalesce a needed wake)
+        db.waiter.store(1, std::memory_order_release);
         
-        uint32_t current_seq = server_self->cb_->c2s_db.seq.load(std::memory_order_acquire);
-        if (current_seq != last_seq) {
-          VLOG(3) << "Server C2S sequence changed from " << last_seq << " to " << current_seq 
+        // 3) Recheck after publishing waiter to close the race
+        uint32_t cur = db.seq.load(std::memory_order_acquire);
+        if (cur != expected) {
+          db.waiter.store(0, std::memory_order_relaxed);
+          server_self->DrainC2SFromPoller();
+          last_seq = cur;
+          continue;
+        }
+        
+        // 4) Sleep; we MUST be woken by futex_wake if work arrives now
+        int futex_result = futex_wait(reinterpret_cast<uint32_t*>(&db.seq), expected, nullptr);
+        
+        // 5) Clear waiter, then drain if anything changed
+        db.waiter.store(0, std::memory_order_relaxed);
+        uint32_t new_seq = db.seq.load(std::memory_order_acquire);
+        if (new_seq != last_seq) {
+          VLOG(3) << "Server C2S sequence changed from " << last_seq << " to " << new_seq 
                   << " - processing commands";
           server_self->DrainC2SFromPoller();
-          last_seq = current_seq;
+          last_seq = new_seq;
         }
       }
       VLOG(2) << "Server futex wait thread finished";
