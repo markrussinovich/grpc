@@ -221,7 +221,11 @@ struct ShmemServerData {
 // Correct futex doorbell adapter - fixed deadlock issues
 class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
  public:
-  explicit FutexDoorbellAdapter(grpc_shmem::ControlBlock* cb) : cb_(cb) {}
+  explicit FutexDoorbellAdapter(grpc_shmem::ControlBlock* cb) : cb_(cb) {
+    // Initialize batching timestamps
+    c2s_last_batch_ns_.store(0, std::memory_order_relaxed);
+    s2c_last_batch_ns_.store(0, std::memory_order_relaxed);
+  }
 
   
   void Post(grpc_shmem::ControlBlock* cb, bool is_c2s) override {
@@ -240,52 +244,90 @@ class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
   
   void Wait(bool is_c2s) override {
     auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
-    
-    // Get current sequence
-    uint32_t current_seq = db.seq.load(std::memory_order_acquire);
-    
-    // Short spin to avoid futex syscall in fast path
-    for (int i = 0; i < 2000; ++i) {
-      if (db.seq.load(std::memory_order_acquire) != current_seq) {
-        return; // Data arrived during spin
+
+    // Capture the current seq
+    uint32_t expected = db.seq.load(std::memory_order_acquire);
+
+    // Mark ourselves as a potential sleeper *before* any spin,
+    // so a producer won't coalesce a wake that we need.
+    db.waiter.store(1, std::memory_order_release);
+
+    // Short spin to avoid a syscall if data arrives immediately
+    for (int i = 0; i < 200; ++i) {  // smaller spin = less window for the race
+      if (db.seq.load(std::memory_order_acquire) != expected) {
+        db.waiter.store(0, std::memory_order_relaxed);
+        return;  // progress detected
       }
       __builtin_ia32_pause();
     }
-    
-    // Set waiter flag
-    db.waiter.store(1, std::memory_order_release);
-    
-    // Final check after setting waiter flag
-    uint32_t final_seq = db.seq.load(std::memory_order_acquire);
-    if (final_seq != current_seq) {
-      db.waiter.store(0, std::memory_order_relaxed);
-      return; // Data arrived while setting waiter
-    }
-    
-    // Use blocking futex wait without timeout
-    futex_wait(reinterpret_cast<uint32_t*>(&db.seq), final_seq, nullptr);
-    
-    // Clear waiter flag when waking up
+
+    // Sleep until seq changes; any producer that sees waiter==1 must wake us
+    futex_wait(reinterpret_cast<uint32_t*>(&db.seq), expected, nullptr);
+
+    // We woke; clear the waiter bit
     db.waiter.store(0, std::memory_order_relaxed);
-    
-    // Always return after one wait - don't loop infinitely
   }
 
-  bool ShouldPost(bool is_c2s, size_t bytes_added, int frames_added, bool was_empty) override {
-    // SIMPLE coalescing: only coalesce when we're absolutely certain it's safe
-    // For now, always post to ensure correctness - we can optimize later
-    // The race condition fix (waiter-bit handshake) is more important than coalescing
-    
+  bool ShouldPost(bool is_c2s, size_t /*bytes_added*/, int frames_added, bool was_empty) override {
+    auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
+
+    // 1) Always on empty->nonempty (required for correctness)
+    if (was_empty) {
+      auto& last = is_c2s ? c2s_last_batch_ns_ : s2c_last_batch_ns_;
+      last.store(GetCurrentTimeNanos(), std::memory_order_relaxed);
+      VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
+              << " was_empty=true -> WAKE (empty->nonempty)";
+      return true;
+    }
+
+    // 2) If the consumer advertised it's going to sleep, wake it
+    if (db.waiter.load(std::memory_order_acquire) != 0) {
+      VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
+              << " waiter_waiting -> WAKE (avoid deadlock)";
+      return true;
+    }
+
+    // 3) First frame of a producer burst should ring the bell.
+    //    This prevents "single enqueue" deadlocks if nothing else follows.
+    if (frames_added == 1) {
+      auto& last = is_c2s ? c2s_last_batch_ns_ : s2c_last_batch_ns_;
+      last.store(GetCurrentTimeNanos(), std::memory_order_relaxed);
+      VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
+              << " first_frame -> WAKE (burst start)";
+      return true;
+    }
+
+    // 4) Otherwise, optional coalescing via a small batching window
+    auto& last = is_c2s ? c2s_last_batch_ns_ : s2c_last_batch_ns_;
+    uint64_t now = GetCurrentTimeNanos();
+    const uint64_t BATCH_NS = 50'000;  // 50 µs
+
+    if (now - last.load(std::memory_order_relaxed) >= BATCH_NS) {
+      last.store(now, std::memory_order_relaxed);
+      VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
+              << " batch_window_expired -> WAKE";
+      return true;
+    }
+
+    avoided_wakes_.fetch_add(1, std::memory_order_relaxed);
     VLOG(3) << "ShouldPost " << (is_c2s ? "C2S" : "S2C") 
-            << " was_empty=" << was_empty 
-            << " decision=true (always post for safety)";
-    
-    return true;
+            << " within_batch_window -> COALESCE";
+    return false;
   }
 
 private:
+  // Helper function to get current time in nanoseconds
+  uint64_t GetCurrentTimeNanos() {
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+  }
+
   grpc_shmem::ControlBlock* cb_;
   std::atomic<uint64_t> avoided_wakes_{0};
+  
+  // Batching timestamps to implement coalescing windows
+  std::atomic<uint64_t> c2s_last_batch_ns_{0};
+  std::atomic<uint64_t> s2c_last_batch_ns_{0};
 };
 
 // Helper function to handle ReserveContiguous with retry/backoff
