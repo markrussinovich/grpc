@@ -48,15 +48,11 @@ public:
   }
   
   void UnregisterServer(const std::string& name) {
-    fprintf(stderr, "*** DEBUG: UnregisterServer called for: %s ***\n", name.c_str());
-    fflush(stderr);
     std::lock_guard<std::mutex> lock(mutex_);
     servers_.erase(name);
     // Segment cleanup happens automatically when server transport is destroyed
     grpc_shmem::ShmemSegment::RemoveIfExists(absl::StrCat("grpc_shmem_", name));
     grpc_shmem::ShmemSegment::RemoveNamedSemaphores(name);
-    fprintf(stderr, "*** DEBUG: UnregisterServer completed for: %s ***\n", name.c_str());
-    fflush(stderr);
   }
   
   bool HasServer(const std::string& name) {

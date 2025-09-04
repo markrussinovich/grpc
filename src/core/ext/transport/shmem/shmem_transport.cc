@@ -93,11 +93,7 @@ enum class ServerState : uint32_t {
 
 // Lightweight debug gate: enable verbose fprintf logging only if GRPC_SHMEM_DEBUG=1
 static inline bool ShmemDebugEnabled() {
-  static bool enabled = []() {
-    const char* e = getenv("GRPC_SHMEM_DEBUG");
-    return e != nullptr && e[0] == '1';
-  }();
-  return enabled;
+  return false;
 }
 #define SHMEM_DBGF(...) do { if (ShmemDebugEnabled()) { fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
 
@@ -1076,10 +1072,8 @@ class ShmemServerTransport final : public ServerTransport {
       
       // Process pending calls using legacy accept_stream callback
       for (auto& pc : pending_to_flush) {
-        fprintf(stderr, "*** DEBUG: LEGACY ACCEPT_STREAM CALLBACK - stream_id=%lu ***\n", pc.stream_id); fflush(stderr);
         auto* server_data = new ShmemServerData{pc.stream_id, std::move(pc.kvs_for_legacy)};
         accept_stream_cb_(accept_stream_cb_user_data_, this, server_data);
-        fprintf(stderr, "*** DEBUG: LEGACY ACCEPT_STREAM CALLBACK COMPLETED - stream_id=%lu ***\n", pc.stream_id); fflush(stderr);
       }
       
       // Start futex reader now that legacy integration is latched
@@ -1267,7 +1261,6 @@ after_accept_stream:
               VLOG(3) << "ShmemCallOutboundLoop: S2C_MESSAGE sent for stream " << stream_id;
             } else {
               // Chunking path: message exceeds ring capacity
-              fprintf(stderr, "=== CRITICAL: CHUNKING S2C response size=%zu > capacity=%lu ===\n", n, rb->capacity); fflush(stderr);
               VLOG(1) << "ShmemCallOutboundLoop: chunking S2C_MESSAGE for stream " << stream_id 
                       << ", size=" << n << " > capacity=" << rb->capacity;
               
@@ -1318,8 +1311,6 @@ after_accept_stream:
                                                : grpc_shmem::FrameType::S2C_MESSAGE_CHUNK;
                 chunk_cmd.data_offset = off;
                 chunk_cmd.data_size = static_cast<uint32_t>(this_chunk);
-                fprintf(stderr, "=== CRITICAL: Sending S2C chunk type=%s size=%u remaining=%zu ===\n", 
-                        is_last_chunk ? "LAST" : "CHUNK", chunk_cmd.data_size, remaining); fflush(stderr);
                 grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_,
                                         grpc_shmem::Direction::kS2C,
                                         chunk_cmd, sem_adapter_.get());
@@ -1750,7 +1741,6 @@ after_accept_stream:
             // IMPORTANT: free ring space now so client can send next chunk
             rb->tail.fetch_add(cmd.data_size, std::memory_order_release);
 
-            fprintf(stderr, "*** DEBUG: MAIN LOOP chunk type=%d size=%u freed_ring=true ***\n", static_cast<int>(cmd.type), cmd.data_size); fflush(stderr);
             VLOG(2) << "C2S MESSAGE CHUNK: copied (not ring-backed) " << cmd.data_size << " bytes; freed ring";
 
             // On LAST, deliver one Message from the copied slices
@@ -1760,9 +1750,7 @@ after_accept_stream:
               auto init = *st.initiator;
               auto msg = Arena::MakePooled<Message>(std::move(st.c2s_copied_accumulator), 0);
               init.SpawnInfallible("push-c2s-assembled-chunks", [init, m = std::move(msg)]() mutable {
-                fprintf(stderr, "*** DEBUG: MAIN LOOP delivering assembled 128MB message to service ***\n"); fflush(stderr);
                 init.SpawnPushMessage(std::move(m));
-                fprintf(stderr, "*** DEBUG: MAIN LOOP SpawnPushMessage completed ***\n"); fflush(stderr);
                 return Empty{};
               });
             }
@@ -2057,10 +2045,8 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
   if (d == nullptr) { delete sd; return; }
 
   // THIS is where core/filters are ready; StartCall now is safe.
-  fprintf(stderr, "*** DEBUG: About to call StartCall on UnstartedCallDestination ***\n");
   fflush(stderr);
   d->StartCall(std::move(call.handler));
-  fprintf(stderr, "*** DEBUG: StartCall completed ***\n");
   fflush(stderr);
 
   {
@@ -2069,7 +2055,6 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
   }
   
   // RACE CONDITION FIX: Flush any pending messages that arrived before FinishAccept() completed
-  fprintf(stderr, "*** DEBUG: FinishAccept - flushing pending messages for stream_id=%lu ***\n", sd->stream_id);
   fflush(stderr);
   
   // Process pending C2S messages
@@ -2081,7 +2066,6 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
     if (it != pending_c2s_msgs_.end()) {
       pending_msgs = std::move(it->second);
       pending_c2s_msgs_.erase(it);
-      fprintf(stderr, "*** DEBUG: Found %zu pending C2S messages for stream_id=%lu ***\n", pending_msgs.size(), sd->stream_id);
       fflush(stderr);
     }
     
@@ -2089,14 +2073,12 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
     if (trailing_it != pending_trailing_.end()) {
       pending_trailing = std::make_unique<PendingMessage>(std::move(trailing_it->second));
       pending_trailing_.erase(trailing_it);
-      fprintf(stderr, "*** DEBUG: Found pending trailing metadata for stream_id=%lu ***\n", sd->stream_id);
       fflush(stderr);
     }
   }
   
   // Deliver pending messages in order
   for (const auto& pending_msg : pending_msgs) {
-    fprintf(stderr, "*** DEBUG: Delivering pending C2S message, size=%u ***\n", pending_msg.cmd.data_size);
     fflush(stderr);
     
     call.initiator.SpawnInfallible("push-pending-msg", [call_initiator = call.initiator, pending_msg]() mutable {
@@ -2114,7 +2096,6 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
   
   // Deliver pending trailing metadata (signals end of client stream)
   if (pending_trailing) {
-    fprintf(stderr, "*** DEBUG: Delivering pending trailing metadata ***\n");
     fflush(stderr);
     
     call.initiator.SpawnInfallible("finish-pending-recv", [call_initiator = call.initiator]() mutable {
@@ -2230,7 +2211,6 @@ void ShmemClientTransport::InitS2CDoorbell() {
   fflush(stderr);
   auto name = channel_args_.GetString("grpc.shmem.server_name");
   if (!name.has_value()) {
-    fprintf(stderr, "*** DEBUG: Client InitS2CDoorbell: no server name, skipping ***\n");
     fflush(stderr);
     LOG(INFO) << "Client InitS2CDoorbell: no server name, skipping";
     return;
@@ -2255,7 +2235,6 @@ void ShmemClientTransport::InitS2CDoorbell() {
     fflush(stderr);
     
     if (this->cb_ == nullptr) {
-      fprintf(stderr, "*** DEBUG: Client futex thread: cb_ is null! ***\n");
       fflush(stderr);
       return;
     }
@@ -2636,10 +2615,8 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         
         if (use_legacy) {
           // LEGACY PATH: Use accept_stream_cb for CQ-based servers (AsyncService)
-          fprintf(stderr, "*** DEBUG: NEW CALL LEGACY ACCEPT_STREAM CALLBACK - stream_id=%lu ***\n", pc.stream_id); fflush(stderr);
           auto* server_data = new ShmemServerData{pc.stream_id, std::move(kvs_in)};
           accept_stream_cb_(accept_stream_cb_user_data_, this, server_data);
-          fprintf(stderr, "*** DEBUG: NEW CALL LEGACY ACCEPT_STREAM CALLBACK COMPLETED - stream_id=%lu ***\n", pc.stream_id); fflush(stderr);
         } else if (use_promise) {
           // PROMISE PATH: Use dest_->StartCall for modern promise-based servers
           StartCallNow(std::move(pc), /*from_flush=*/false);
@@ -2769,7 +2746,6 @@ void ShmemServerTransport::DrainC2SFromPoller() {
       
       // C2S chunk reassembly: copy out each chunk and free ring space immediately.
       case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK: {
-        fprintf(stderr, "*** DEBUG: DRAINER C2S_MESSAGE_CHUNK - stream_id=%lu, size=%u ***\n", cmd.stream_id, cmd.data_size); fflush(stderr);
         auto& st = c2s_chunks_[cmd.stream_id];
         auto* rb = &cb_->GetC2SQueues()->data_rb;
         const uint8_t* src = rb->GetBuffer(cb_) + cmd.data_offset;
@@ -2778,13 +2754,11 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         st.accumulating = true;
         // IMPORTANT: free ring space now so the client can send the next chunk
         rb->tail.fetch_add(cmd.data_size, std::memory_order_release);
-        fprintf(stderr, "*** DEBUG: DRAINER freed ring space, total_length=%zu ***\n", st.acc.Length()); fflush(stderr);
         VLOG(2) << "C2S CHUNK copied " << cmd.data_size << "B; freed ring bytes";
         break;
       }
 
       case grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST: {
-        fprintf(stderr, "*** DEBUG: DRAINER C2S_MESSAGE_CHUNK_LAST - stream_id=%lu, size=%u ***\n", cmd.stream_id, cmd.data_size); fflush(stderr);
         auto& st = c2s_chunks_[cmd.stream_id];
         auto* rb = &cb_->GetC2SQueues()->data_rb;
         const uint8_t* src = rb->GetBuffer(cb_) + cmd.data_offset;
@@ -2801,12 +2775,10 @@ void ShmemServerTransport::DrainC2SFromPoller() {
           auto it = stream_initiators_.find(cmd.stream_id);
           if (it != stream_initiators_.end()) { initiator = it->second; has_initiator = true; }
         }
-        fprintf(stderr, "*** DEBUG: DRAINER CHUNK_LAST has_initiator=%s, total_length=%zu ***\n", has_initiator ? "true" : "false", st.acc.Length()); fflush(stderr);
         if (has_initiator) {
           auto msg = Arena::MakePooled<Message>(std::move(st.acc), 0);
           initiator.SpawnInfallible("push-c2s-assembled",
               [init = initiator, m = std::move(msg)]() mutable {
-                fprintf(stderr, "*** DEBUG: DRAINER delivering assembled message to service ***\n"); fflush(stderr);
                 init.SpawnPushMessage(std::move(m));
                 return Empty{};
               });
@@ -2816,7 +2788,6 @@ void ShmemServerTransport::DrainC2SFromPoller() {
       }
       
       default: {
-        fprintf(stderr, "*** DEBUG: Unhandled command type=%d ***\n", static_cast<int>(cmd.type));
         fflush(stderr);
         // Release data for unhandled commands
         grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
@@ -2859,11 +2830,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         response.data_offset = 0;
         response.data_size = 0;
         response.grpc_status_code = 0; // GRPC_STATUS_OK
-        fprintf(stderr, "*** DEBUG: Server sending S2C_TRAILING_METADATA response: stream_id=%lu ***\n", 
-                response.stream_id);
-        fflush(stderr);
         grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, response, sem_adapter_.get());
-        fprintf(stderr, "*** DEBUG: Server S2C_TRAILING_METADATA PushCommand completed ***\n");
         fflush(stderr);
         // Release the metadata data
         grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
@@ -3017,19 +2984,15 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                               cmd, sem_adapter_.get());
     } else {
       // Large message: use chunking
-      fprintf(stderr, "=== CLIENT: CHUNKING 128MB message len=%zu > cap=%lu ===\n", n, rb->capacity); fflush(stderr);
       VLOG(1) << "C2S CHUNKING path: len=" << n << " > cap=" << rb->capacity;
       VLOG(1) << "C2S_MESSAGE chunking: total=" << n
               << " max_chunk=" << (rb->capacity - 65536);
       
       // Allocate temporary buffer and copy payload once
-      fprintf(stderr, "=== CLIENT: Allocating 128MB temp buffer ===\n"); fflush(stderr);
       VLOG(1) << "C2S CHUNKING: Allocating temp buffer size=" << n;
       std::unique_ptr<unsigned char[]> tmp(new unsigned char[n]);
-      fprintf(stderr, "=== CLIENT: Copying payload to temp buffer ===\n"); fflush(stderr);
       VLOG(1) << "C2S CHUNKING: Copying payload to temp buffer";
       payload->CopyToBuffer(tmp.get());
-      fprintf(stderr, "=== CLIENT: Starting chunking loop ===\n"); fflush(stderr);
       VLOG(1) << "C2S CHUNKING: Payload copied, starting chunk loop";
       
       VLOG(1) << "[CLIENT C2S RB] rb=" << rb
@@ -3043,7 +3006,6 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
       while (offset < n) {
         const size_t chunk = std::min(n - offset, max_chunk);
         const bool is_last = (offset + chunk == n);
-        fprintf(stderr, "=== CLIENT: CHUNK LOOP offset=%zu, chunk=%zu, is_last=%s ===\n", offset, chunk, is_last ? "true" : "false"); fflush(stderr);
         
         uint64_t chunk_off = 0;
         uint32_t pad = 0;
@@ -3066,8 +3028,6 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
         grpc_shmem::FrameType frame_type = is_last ? grpc_shmem::FrameType::C2S_MESSAGE_CHUNK_LAST 
                                                    : grpc_shmem::FrameType::C2S_MESSAGE_CHUNK;
         grpc_shmem::Command cmd{stream_id, frame_type, chunk_off, static_cast<uint32_t>(chunk), 0, 0};
-        fprintf(stderr, "=== CLIENT: Sending chunk type=%s size=%u offset=%zu ===\n", 
-                is_last ? "LAST" : "CHUNK", static_cast<uint32_t>(chunk), offset); fflush(stderr);
         grpc_shmem::PushCommand(cb->GetC2SQueues(), cb, grpc_shmem::Direction::kC2S,
                                 cmd, sem_adapter_.get());
         
@@ -3075,7 +3035,6 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                 << " off=" << chunk_off
                 << " size=" << chunk
                 << " last=" << is_last;
-        fprintf(stderr, "=== CLIENT: Chunk sent successfully, advancing offset %zu -> %zu ===\n", offset, offset + chunk); fflush(stderr);
         offset += chunk;
       }
     }
@@ -3191,7 +3150,6 @@ MakeShmemTransportPairImpl(const ChannelArgs& server_channel_args,
     // Larger buffers reduce fragmentation and improve contiguous allocation success
     cfg.data_ring_capacity = 64 * 1024 * 1024;   // 64MB per direction for better large message handling  
     cfg.size = 192 * 1024 * 1024;                // 192MB total segment
-    fprintf(stderr, "=== SEGMENT: Creating segment size=%zu, ring_cap=%zu ===\n", cfg.size, cfg.data_ring_capacity); fflush(stderr);
     grpc_shmem::ShmemSegment::RemoveIfExists(cfg.name);
     auto s = grpc_shmem::ShmemSegment::Create(cfg);
     segment = std::make_unique<grpc_shmem::ShmemSegment>(std::move(s));
