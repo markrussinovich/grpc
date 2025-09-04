@@ -1264,13 +1264,10 @@ after_accept_stream:
               VLOG(1) << "ShmemCallOutboundLoop: chunking S2C_MESSAGE for stream " << stream_id 
                       << ", size=" << n << " > capacity=" << rb->capacity;
               
-              // Copy entire payload to temporary buffer once
-              std::vector<uint8_t> temp_buf(n);
-              payload->CopyToBuffer(temp_buf.data());
-              
+              // Direct slice-by-slice copying without temporary buffer
               const uint64_t chunk_size = rb->capacity - 65536; // 64KB headroom for PAD
               uint64_t remaining = n;
-              uint64_t src_offset = 0;
+              uint64_t payload_offset = 0;
               
               while (remaining > 0) {
                 const uint64_t this_chunk = std::min(remaining, chunk_size);
@@ -1289,8 +1286,31 @@ after_accept_stream:
                         << " size=" << this_chunk << " pad=" << pad;
                 unsigned char* base = rb->GetBuffer(cb_);
                 
-                // Copy chunk data
-                std::memcpy(base + off, temp_buf.data() + src_offset, this_chunk);
+                // Copy chunk data directly from slices
+                uint64_t chunk_bytes_copied = 0;
+                uint64_t current_payload_offset = payload_offset;
+                
+                for (size_t slice_idx = 0; slice_idx < payload->Count() && chunk_bytes_copied < this_chunk; slice_idx++) {
+                  const auto& slice = (*payload)[slice_idx];
+                  const uint8_t* slice_data = slice.data();
+                  const size_t slice_size = slice.size();
+                  
+                  // Skip slices that are entirely before our current offset
+                  if (current_payload_offset >= slice_size) {
+                    current_payload_offset -= slice_size;
+                    continue;
+                  }
+                  
+                  // Calculate how much of this slice to copy
+                  const size_t slice_start_offset = current_payload_offset;
+                  const size_t available_in_slice = slice_size - slice_start_offset;
+                  const size_t bytes_to_copy = std::min(available_in_slice, this_chunk - chunk_bytes_copied);
+                  
+                  std::memcpy(base + off + chunk_bytes_copied, slice_data + slice_start_offset, bytes_to_copy);
+                  chunk_bytes_copied += bytes_to_copy;
+                  current_payload_offset = 0; // Next slices start from beginning
+                }
+                
                 std::atomic_thread_fence(std::memory_order_release);
                 
                 if (pad) {
@@ -1315,7 +1335,7 @@ after_accept_stream:
                                         grpc_shmem::Direction::kS2C,
                                         chunk_cmd, sem_adapter_.get());
                 
-                src_offset += this_chunk;
+                payload_offset += this_chunk;
                 remaining -= this_chunk;
               }
               
@@ -2988,12 +3008,8 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
       VLOG(1) << "C2S_MESSAGE chunking: total=" << n
               << " max_chunk=" << (rb->capacity - 65536);
       
-      // Allocate temporary buffer and copy payload once
-      VLOG(1) << "C2S CHUNKING: Allocating temp buffer size=" << n;
-      std::unique_ptr<unsigned char[]> tmp(new unsigned char[n]);
-      VLOG(1) << "C2S CHUNKING: Copying payload to temp buffer";
-      payload->CopyToBuffer(tmp.get());
-      VLOG(1) << "C2S CHUNKING: Payload copied, starting chunk loop";
+      // Direct slice-by-slice copying without temporary buffer
+      VLOG(1) << "C2S CHUNKING: Starting direct slice copying, payload size=" << n;
       
       VLOG(1) << "[CLIENT C2S RB] rb=" << rb
               << " head=" << rb->head.load(std::memory_order_relaxed)
@@ -3001,11 +3017,11 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
       
       // Leave headroom for padding
       const size_t max_chunk = rb->capacity - 65536;
-      size_t offset = 0;
+      size_t payload_offset = 0;
       
-      while (offset < n) {
-        const size_t chunk = std::min(n - offset, max_chunk);
-        const bool is_last = (offset + chunk == n);
+      while (payload_offset < n) {
+        const size_t chunk = std::min(n - payload_offset, max_chunk);
+        const bool is_last = (payload_offset + chunk == n);
         
         uint64_t chunk_off = 0;
         uint32_t pad = 0;
@@ -3015,7 +3031,30 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
         VLOG(1) << "[RESERVE OK] C2S_MESSAGE_CHUNK off=" << chunk_off
                 << " size=" << chunk << " pad=" << pad;
         
-        std::memcpy(rb->GetBuffer(cb) + chunk_off, tmp.get() + offset, chunk);
+        // Copy chunk data directly from slices
+        size_t chunk_bytes_copied = 0;
+        size_t current_payload_offset = payload_offset;
+        
+        for (size_t slice_idx = 0; slice_idx < payload->Count() && chunk_bytes_copied < chunk; slice_idx++) {
+          const auto& slice = (*payload)[slice_idx];
+          const uint8_t* slice_data = slice.data();
+          const size_t slice_size = slice.size();
+          
+          // Skip slices that are entirely before our current offset
+          if (current_payload_offset >= slice_size) {
+            current_payload_offset -= slice_size;
+            continue;
+          }
+          
+          // Calculate how much of this slice to copy
+          const size_t slice_start_offset = current_payload_offset;
+          const size_t available_in_slice = slice_size - slice_start_offset;
+          const size_t bytes_to_copy = std::min(available_in_slice, chunk - chunk_bytes_copied);
+          
+          std::memcpy(rb->GetBuffer(cb) + chunk_off + chunk_bytes_copied, slice_data + slice_start_offset, bytes_to_copy);
+          chunk_bytes_copied += bytes_to_copy;
+          current_payload_offset = 0; // Next slices start from beginning
+        }
         std::atomic_thread_fence(std::memory_order_release);
         
         if (pad) {
@@ -3035,7 +3074,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                 << " off=" << chunk_off
                 << " size=" << chunk
                 << " last=" << is_last;
-        offset += chunk;
+        payload_offset += chunk;
       }
     }
     return Success{};
