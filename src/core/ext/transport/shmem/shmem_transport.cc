@@ -359,7 +359,7 @@ class ShmemClientTransport final : public ClientTransport {
   }
   ~ShmemClientTransport() override {
     VLOG(1) << "ShmemClientTransport destructor called";
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     // Ensure clean shutdown and join futex wait thread if still running
     // This guards against std::terminate if a joinable thread remains at destruction.
     if (!cleanup_complete_.load(std::memory_order_acquire)) {
@@ -373,13 +373,13 @@ class ShmemClientTransport final : public ClientTransport {
       }
     }
     VLOG(1) << "ShmemClientTransport destructor completed";
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
   }
   
  private:
   void InitiateShutdown() {
     VLOG(1) << "ShmemClientTransport InitiateShutdown called";
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     ExecCtx exec_ctx;
     
     // Step 1: Signal shutdown to all threads
@@ -1141,7 +1141,7 @@ after_accept_stream:
   
   ~ShmemServerTransport() override {
     VLOG(1) << "ShmemServerTransport destructor called";
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     // Ensure shutdown has completed and join futex wait thread if still running
     if (!cleanup_complete_.load(std::memory_order_acquire)) {
       InitiateShutdown();
@@ -1154,7 +1154,7 @@ after_accept_stream:
       }
     }
     VLOG(1) << "ShmemServerTransport destructor completed";
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
   }
 
   void PerformFinalCleanup();
@@ -2071,9 +2071,9 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
   if (d == nullptr) { delete sd; return; }
 
   // THIS is where core/filters are ready; StartCall now is safe.
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   d->StartCall(std::move(call.handler));
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
 
   {
     MutexLock lk(&stream_initiators_mu_);
@@ -2081,7 +2081,7 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
   }
   
   // RACE CONDITION FIX: Flush any pending messages that arrived before FinishAccept() completed
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   
   // Process pending C2S messages
   std::vector<PendingMessage> pending_msgs;
@@ -2092,20 +2092,20 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
     if (it != pending_c2s_msgs_.end()) {
       pending_msgs = std::move(it->second);
       pending_c2s_msgs_.erase(it);
-      fflush(stderr);
+      if (ShmemDebugEnabled()) fflush(stderr);
     }
     
     auto trailing_it = pending_trailing_.find(sd->stream_id);
     if (trailing_it != pending_trailing_.end()) {
       pending_trailing = std::make_unique<PendingMessage>(std::move(trailing_it->second));
       pending_trailing_.erase(trailing_it);
-      fflush(stderr);
+      if (ShmemDebugEnabled()) fflush(stderr);
     }
   }
   
   // Deliver pending messages in order
   for (const auto& pending_msg : pending_msgs) {
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     
     call.initiator.SpawnInfallible("push-pending-msg", [call_initiator = call.initiator, pending_msg]() mutable {
       SliceBuffer sb;
@@ -2122,7 +2122,7 @@ void ShmemServerTransport::FinishAccept(const void* server_data) {
   
   // Deliver pending trailing metadata (signals end of client stream)
   if (pending_trailing) {
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     
     call.initiator.SpawnInfallible("finish-pending-recv", [call_initiator = call.initiator]() mutable {
       call_initiator.SpawnFinishSends();
@@ -2234,10 +2234,10 @@ void ShmemClientTransport::EnsureReaderStarted() {
 
 void ShmemClientTransport::InitS2CDoorbell() {
   VLOG(2) << "Client InitS2CDoorbell (futex-only) CALLED";
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   auto name = channel_args_.GetString("grpc.shmem.server_name");
   if (!name.has_value()) {
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     LOG(INFO) << "Client InitS2CDoorbell: no server name, skipping";
     return;
   }
@@ -2249,7 +2249,7 @@ void ShmemClientTransport::InitS2CDoorbell() {
   
   // Start a futex wait thread to react to s2c_db.seq changes; no eventfd/grpc_fd
   VLOG(2) << "Client InitS2CDoorbell: starting futex wait thread";
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   
   // Use a shared atomic flag for thread communication
   auto thread_stop_flag = std::make_shared<std::atomic<bool>>(false);
@@ -2258,22 +2258,22 @@ void ShmemClientTransport::InitS2CDoorbell() {
   // Create futex wait thread
   polling_thread_ = std::thread([this, thread_stop_flag]() {
     VLOG(2) << "Client futex wait thread started";
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     
     if (this->cb_ == nullptr) {
-      fflush(stderr);
+      if (ShmemDebugEnabled()) fflush(stderr);
       return;
     }
     
     uint32_t last_seq = this->cb_->s2c_db.seq.load(std::memory_order_acquire);
     VLOG(2) << "Client initial S2C sequence: " << last_seq;
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     // Drain once on startup to handle frames posted before thread started
     this->DrainS2CFromPoller();
     
     // Futex wait loop with proper signal handling  
     VLOG(2) << "Client about to enter futex wait loop";
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
     while (!thread_stop_flag->load(std::memory_order_acquire)) {
       auto& db = this->cb_->s2c_db;
       
@@ -2306,7 +2306,7 @@ void ShmemClientTransport::InitS2CDoorbell() {
       }
     }
     VLOG(2) << "Client futex wait thread finished";
-    fflush(stderr);
+    if (ShmemDebugEnabled()) fflush(stderr);
   });
 }
 
@@ -2517,14 +2517,14 @@ void ShmemServerTransport::InitC2SDoorbell() {
     auto* server_self = this;
     server_polling_thread_ = std::thread([server_self, server_thread_stop_flag]() {
       VLOG(2) << "Server futex wait thread started";
-      fflush(stderr);
+      if (ShmemDebugEnabled()) fflush(stderr);
       uint32_t last_seq = server_self->cb_->c2s_db.seq.load(std::memory_order_acquire);
       VLOG(2) << "Initial C2S sequence: " << last_seq;
-      fflush(stderr);
+      if (ShmemDebugEnabled()) fflush(stderr);
       // Drain once on startup to handle commands posted before thread started
       server_self->DrainC2SFromPoller();
       VLOG(2) << "Server about to enter futex wait loop";
-      fflush(stderr);
+      if (ShmemDebugEnabled()) fflush(stderr);
       while (!server_thread_stop_flag->load(std::memory_order_acquire)) {
         auto& db = server_self->cb_->c2s_db;
         
@@ -2557,7 +2557,7 @@ void ShmemServerTransport::InitC2SDoorbell() {
         }
       }
       VLOG(2) << "Server futex wait thread finished";
-      fflush(stderr);
+      if (ShmemDebugEnabled()) fflush(stderr);
     });
   }
 }
@@ -2848,7 +2848,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
       }
       
       default: {
-        fflush(stderr);
+        if (ShmemDebugEnabled()) fflush(stderr);
         // Release data for unhandled commands
         grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
         break;
@@ -2891,7 +2891,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         response.data_size = 0;
         response.grpc_status_code = 0; // GRPC_STATUS_OK
         grpc_shmem::PushCommand(cb_->GetS2CQueues(), cb_, grpc_shmem::Direction::kS2C, response, sem_adapter_.get());
-        fflush(stderr);
+        if (ShmemDebugEnabled()) fflush(stderr);
         // Release the metadata data
         grpc_shmem::Release(&cb_->GetC2SQueues()->data_rb, cmd.data_size);
         break;
@@ -3285,12 +3285,12 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
   grpc_shmem::ShmemSegment::RemoveIfExists(cfg.name);
   
   VLOG(1) << "Creating new segment: " << cfg.name;
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   VLOG(2) << "Creating new segment...";
   auto s = grpc_shmem::ShmemSegment::Create(cfg);
   
   VLOG(1) << "Created segment, control block: " << s.control();
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   VLOG(2) << "Created segment, checking control block...";
   if (s.control() == nullptr) {
     LOG(ERROR) << "Failed to create named shmem segment: " << cfg.name;
@@ -3319,7 +3319,7 @@ OrphanablePtr<Transport> MakeNamedShmemServerTransport(
 OrphanablePtr<Transport> ConnectToShmemServerTransport(
     const std::string& server_name, const ChannelArgs& client_channel_args) {
   VLOG(1) << "ConnectToShmemServerTransport called with server_name: " << server_name;
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   VLOG(2) << "ConnectToShmemServerTransport called with server_name: " << server_name;
   
   const bool dispatch_only =
@@ -3343,7 +3343,7 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   }
   
   VLOG(1) << "Opening segment: " << segment_name;
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   VLOG(2) << "Opening segment: " << segment_name;
   
   auto segment = grpc_shmem::ShmemSegment::Open(segment_name);
@@ -3354,7 +3354,7 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   LOG(INFO) << "Client segment set to NOT unlink on destroy - server manages segment lifetime";
   
   VLOG(1) << "Segment opened, control block: " << segment.control();
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   VLOG(2) << "Segment opened, control block: " << segment.control();
   if (segment.control() == nullptr) {
     LOG(ERROR) << "CLIENT CONNECTION FAILED: ShmemSegment::Open() returned null control block";
@@ -3376,7 +3376,7 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   auto segment_ptr = std::make_unique<grpc_shmem::ShmemSegment>(std::move(segment));
   
   VLOG(1) << "About to create client transport";
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   VLOG(2) << "About to create client transport";
   
   // CLIENT RULE: Client keeps segment alive locally but doesn't register for global cleanup
@@ -3384,12 +3384,12 @@ OrphanablePtr<Transport> ConnectToShmemServerTransport(
   LOG(INFO) << "CLIENT CONNECTION: Client connected, keeping segment alive locally (server manages global cleanup)";
   
   VLOG(1) << "Creating client transport with cb: " << cb;
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   VLOG(2) << "Creating client transport with cb: " << cb;
   
   auto result = OrphanablePtr<Transport>(MakeOrphanable<ShmemClientTransport>(nullptr, cb, std::move(segment_ptr), client_channel_args).release());
   VLOG(1) << "Client transport created successfully";
-  fflush(stderr);
+  if (ShmemDebugEnabled()) fflush(stderr);
   return result;
 }
 
