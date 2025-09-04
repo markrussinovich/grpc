@@ -228,7 +228,7 @@ class FutexDoorbellAdapter : public grpc_shmem::TransportSemaphoreAdapter {
     auto& db = is_c2s ? cb_->c2s_db : cb_->s2c_db;
     
     // Increment sequence to signal new data
-    uint64_t new_seq = db.seq.fetch_add(1, std::memory_order_release) + 1;
+    uint32_t new_seq = db.seq.fetch_add(1, std::memory_order_release) + 1;
     
     // Wake any waiting threads using pure futex signaling
     int woken = futex_wake(reinterpret_cast<uint32_t*>(&db.seq), 1);
