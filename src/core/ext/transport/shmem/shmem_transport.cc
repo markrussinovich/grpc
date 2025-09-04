@@ -1189,6 +1189,9 @@ after_accept_stream:
               VLOG(1) << "SERVER: Sending S2C_INITIAL_METADATA stream_id=" << stream_id;
               std::vector<grpc_shmem::KVPair> kvs;
               kvs.push_back({"content-type", "application/grpc"});
+              
+              // TODO: Add binary metadata fields from initial metadata
+              // For now, just basic content-type
               auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
               uint64_t off = 0; uint32_t pad = 0;
               WaitReserveWithWatchdog(&cb_->GetS2CQueues()->data_rb, buf.size(), &off, &pad, "S2C_INITIAL_METADATA");
@@ -1339,6 +1342,7 @@ after_accept_stream:
           call_initiator.PullServerTrailingMetadata(),
           [this, stream_id](ServerMetadataHandle md) {
             SHMEM_DBGF("*** DEBUG: ShmemCallOutboundLoop: PullServerTrailingMetadata returned for stream_id=%lu ***\n", stream_id);
+            fprintf(stderr, "=== CANCEL DEBUG: Server pulling trailing metadata for stream_id=%lu ===\n", stream_id); fflush(stderr);
             VLOG(1) << "SERVER: Sending S2C_TRAILING_METADATA stream_id=" << stream_id;
             std::vector<grpc_shmem::KVPair> kvs;
             grpc_status_code status = GRPC_STATUS_OK;
@@ -1349,6 +1353,9 @@ after_accept_stream:
               kvs.push_back({"grpc-message", std::string(m->as_string_view())});
             }
             kvs.push_back({"grpc-status", std::to_string(status)});
+            
+            // TODO: Add binary metadata fields from trailing metadata
+            // For now, just basic status and message
             auto buf = grpc_shmem::SerializeMetadataKVs(kvs);
             uint64_t off = 0; uint32_t pad = 0;
             WaitReserveWithWatchdog(&cb_->GetS2CQueues()->data_rb, buf.size(), &off, &pad, "S2C_TRAILING_METADATA");
@@ -1788,12 +1795,15 @@ after_accept_stream:
             break;
           }
           case grpc_shmem::FrameType::C2S_CANCEL: {
+            fprintf(stderr, "=== CANCEL DEBUG: SERVER received C2S_CANCEL for stream %lu ===\n", cmd.stream_id); fflush(stderr);
             LOG(INFO) << "SERVER: Received C2S_CANCEL for stream " << cmd.stream_id;
             st.cancelled = true;
             if (st.initiator.has_value()) {
+              fprintf(stderr, "=== CANCEL DEBUG: SERVER spawning cancel for stream %lu ===\n", cmd.stream_id); fflush(stderr);
               LOG(INFO) << "SERVER: Spawning cancel for stream " << cmd.stream_id;
               st.initiator->SpawnCancel();
             } else {
+              fprintf(stderr, "=== CANCEL DEBUG: SERVER no initiator found for stream %lu ===\n", cmd.stream_id); fflush(stderr);
               LOG(INFO) << "SERVER: No initiator found for stream " << cmd.stream_id << " to cancel";
             }
             break;
@@ -2340,7 +2350,7 @@ void ShmemClientTransport::DrainS2CFromPoller() {
     switch (cmd.type) {
       case grpc_shmem::FrameType::S2C_INITIAL_METADATA: {
         RecvOp op; op.type = RecvOp::kInit;
-        // Currently ignoring initial metadata bytes - future: parse metadata
+        // Discard metadata bytes to prevent hanging - basic functionality preserved
         cb_->GetS2CQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
         {
           MutexLock ql(&s2c_recv_mu_);
@@ -2395,8 +2405,9 @@ void ShmemClientTransport::DrainS2CFromPoller() {
       }
       case grpc_shmem::FrameType::S2C_TRAILING_METADATA: {
         RecvOp op; op.type = RecvOp::kTrailing;
-        // Currently ignoring trailing metadata bytes - future: parse metadata
-        cb_->GetS2CQueues()->data_rb.tail.fetch_add(cmd.data_size, std::memory_order_release);
+        // Copy metadata bytes only for parsing status/message - minimal approach
+        grpc_slice s = grpc_shmem::MakeSliceFromRing(&cb_->GetS2CQueues()->data_rb, cb_, cmd.data_offset, cmd.data_size);
+        op.buf.AppendIndexed(Slice(s));
         {
           MutexLock ql(&s2c_recv_mu_);
           auto& rs = s2c_recv_[cmd.stream_id];
@@ -2446,13 +2457,7 @@ void ShmemClientTransport::StartRecvDrain(uint64_t sid) {
       case RecvOp::kInit: {
         auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
         md->Set(ContentTypeMetadata(), ContentTypeMetadata::kApplicationGrpc);
-        
-        // TODO: Parse actual initial metadata bytes (disabled for now to fix basic functionality)
-        // For now just log that we have metadata bytes to debug
-        if (op.buf.Length() > 0) {
-          VLOG(1) << "CLIENT: Received " << op.buf.Length() << " bytes of initial metadata";
-        }
-        
+        // Skip parsing initial metadata to avoid hanging - focus only on trailing metadata
         h->SpawnPushServerInitialMetadata(std::move(md));
         break;
       }
@@ -2463,8 +2468,29 @@ void ShmemClientTransport::StartRecvDrain(uint64_t sid) {
       }
       case RecvOp::kTrailing: {
         auto md = Arena::MakePooledForOverwrite<ServerMetadata>();
-        // TODO: Parse actual trailing metadata; for now, default to OK
-        md->Set(GrpcStatusMetadata(), GRPC_STATUS_OK);
+        
+        // Parse trailing metadata bytes - focus on status/message only
+        if (op.buf.Length() > 0 && op.buf.Count() > 0) {
+          auto slice = op.buf.RefSlice(0);
+          const uint8_t* bytes = slice.begin();
+          size_t len = slice.length();
+          auto kvs = grpc_shmem::DeserializeMetadataKVs(bytes, len);
+          
+          // Extract ONLY status and message - skip binary metadata to avoid parsing issues
+          grpc_status_code status = GRPC_STATUS_OK;
+          for (const auto& kv : kvs) {
+            if (kv.key == "grpc-status") {
+              status = static_cast<grpc_status_code>(atoi(kv.value.c_str()));
+            } else if (kv.key == "grpc-message") {
+              md->Set(GrpcMessageMetadata(), Slice::FromCopiedString(kv.value));
+            }
+            // Skip binary metadata parsing to prevent hanging issues
+          }
+          md->Set(GrpcStatusMetadata(), status);
+        } else {
+          // Fallback to OK status if no metadata bytes
+          md->Set(GrpcStatusMetadata(), GRPC_STATUS_OK);
+        }
         h->SpawnPushServerTrailingMetadata(std::move(md));
         // Only erase handler inside the trailing op
         {
@@ -2830,6 +2856,30 @@ void ShmemServerTransport::DrainC2SFromPoller() {
         } // else: keep st.acc; we'll deliver at TRAILING
         break;
       }
+
+      case grpc_shmem::FrameType::C2S_CANCEL: {
+        fprintf(stderr, "=== CANCEL DEBUG: DRAINER received C2S_CANCEL for stream %lu ===\n", cmd.stream_id); fflush(stderr);
+        // Find the initiator for this stream and spawn cancellation
+        CallInitiator initiator;
+        bool has_initiator = false;
+        {
+          MutexLock lock(&stream_initiators_mu_);
+          auto it = stream_initiators_.find(cmd.stream_id);
+          if (it != stream_initiators_.end()) { 
+            initiator = it->second; 
+            has_initiator = true;
+          }
+        }
+        if (has_initiator) {
+          fprintf(stderr, "=== CANCEL DEBUG: DRAINER spawning cancel for stream %lu ===\n", cmd.stream_id); fflush(stderr);
+          initiator.SpawnCancel();
+        } else {
+          fprintf(stderr, "=== CANCEL DEBUG: DRAINER no initiator found for stream %lu ===\n", cmd.stream_id); fflush(stderr);
+        }
+        // Clean up any accumulated data for this stream
+        c2s_chunks_.erase(cmd.stream_id);
+        break;
+      }
       
       default: {
         fprintf(stderr, "*** DEBUG: Unhandled command type=%d ***\n", static_cast<int>(cmd.type));
@@ -3108,6 +3158,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
               VLOG(1) << "CLIENT: ForEach completed for stream=" << stream_id << " sent_all.ok()=" << sent_all.ok();
               if (!sent_all.ok()) {
                 // User canceled (or send stream failed): notify server immediately.
+                fprintf(stderr, "=== CANCEL DEBUG: CLIENT sending C2S_CANCEL for stream %lu ===\n", stream_id); fflush(stderr);
                 VLOG(1) << "CLIENT: call canceled; sending C2S_CANCEL for stream=" << stream_id;
                 grpc_shmem::Command cancel{};
                 cancel.stream_id  = stream_id;
@@ -3117,6 +3168,7 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                 (void)grpc_shmem::PushCommand(cb->GetC2SQueues(), cb,
                                               grpc_shmem::Direction::kC2S,
                                               cancel, sem_adapter_.get());
+                fprintf(stderr, "=== CANCEL DEBUG: CLIENT sent C2S_CANCEL for stream %lu ===\n", stream_id); fflush(stderr);
                 // Do NOT send C2S_TRAILING_METADATA on cancel.
                 return sent_all;  // propagate canceled status
               }
