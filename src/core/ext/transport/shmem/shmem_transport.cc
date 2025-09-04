@@ -901,7 +901,7 @@ class ShmemServerTransport final : public ServerTransport {
     
     // Step 2: Finish any remaining active calls with UNAVAILABLE (not CANCELLED).
     {
-      absl::flat_hash_map<uint32_t, CallInitiator> snapshot;
+      absl::flat_hash_map<uint64_t, CallInitiator> snapshot;
       {
         MutexLock lk(&active_mu_);
         snapshot = active_calls_;
@@ -1104,7 +1104,7 @@ after_accept_stream:
       absl::Status st = op->disconnect_with_error;
       if (st.ok()) st = absl::UnavailableError("server shutdown");
       Disconnect(st);
-      absl::flat_hash_map<uint32_t, CallInitiator> snapshot;
+      absl::flat_hash_map<uint64_t, CallInitiator> snapshot;
       {
         MutexLock lk(&active_mu_);
         snapshot = active_calls_;
@@ -1129,7 +1129,7 @@ after_accept_stream:
 
   // Fast in-proc bootstrap: create server half and return initiator
   // immediately.
-  CallInitiator AnnounceAndGetInitiator(uint32_t /*stream_id*/,
+  CallInitiator AnnounceAndGetInitiator(uint64_t /*stream_id*/,
                                         ClientMetadataHandle md);
 
   // FinishAccept - called by core to complete the stream accept lifecycle
@@ -1477,7 +1477,7 @@ after_accept_stream:
     };
 
     // Simplified ring-based approach - no complex dispatched call logic needed
-    absl::flat_hash_map<uint32_t, StreamState> streams;
+    absl::flat_hash_map<uint64_t, StreamState> streams;
     int loop_count = 0;
     VLOG(2) << "ServerLoop: Starting command processing loop";
     
@@ -1633,7 +1633,7 @@ after_accept_stream:
                 
                 // 5) Start your existing S2C response bridge
                 call.initiator.SpawnGuarded("shmem-response-bridge",
-                    [this, sid = static_cast<uint32_t>(cmd.stream_id), ci = call.initiator]() mutable {
+                    [this, sid = cmd.stream_id, ci = call.initiator]() mutable {
                       return ShmemCallOutboundLoop(sid, std::move(ci));
                     });
                 } else {
@@ -1817,7 +1817,7 @@ after_accept_stream:
       }
 
       // Clean up completed streams to prevent stale state accumulation
-      std::vector<uint32_t> completed_stream_ids;
+      std::vector<uint64_t> completed_stream_ids;
 
       // Check local completed flags (for synchronous completion)
       for (const auto& [stream_id, stream_state] : streams) {
@@ -1829,7 +1829,7 @@ after_accept_stream:
       // Check async completed streams (for promise-based completion)
       {
         std::lock_guard<std::mutex> lock(completed_streams_mu_);
-        for (uint32_t stream_id : completed_streams_) {
+        for (uint64_t stream_id : completed_streams_) {
           if (streams.find(stream_id) != streams.end()) {
             completed_stream_ids.push_back(stream_id);
           }
@@ -1845,7 +1845,7 @@ after_accept_stream:
           std::unique(completed_stream_ids.begin(), completed_stream_ids.end()),
           completed_stream_ids.end());
 
-      for (uint32_t stream_id : completed_stream_ids) {
+      for (uint64_t stream_id : completed_stream_ids) {
         streams.erase(stream_id);
 
         // Clean up associated CallInitiator and sync structures
@@ -1892,9 +1892,9 @@ after_accept_stream:
   
   // Stream mapping: grpc_stream -> shmem stream_id
   Mutex stream_map_mu_;
-  absl::flat_hash_map<grpc_stream*, uint32_t> grpc_to_shmem_stream_
+  absl::flat_hash_map<grpc_stream*, uint64_t> grpc_to_shmem_stream_
       ABSL_GUARDED_BY(stream_map_mu_);
-  absl::flat_hash_map<uint32_t, grpc_stream*> shmem_to_grpc_stream_
+  absl::flat_hash_map<uint64_t, grpc_stream*> shmem_to_grpc_stream_
       ABSL_GUARDED_BY(stream_map_mu_);
   // Signal when SetCallDestination() has installed the acceptor.
   Mutex ready_mu_;
@@ -1902,7 +1902,7 @@ after_accept_stream:
   bool ready_ ABSL_GUARDED_BY(ready_mu_) = false;
   // Track active dispatched calls for teardown/cancellation.
   Mutex active_mu_;
-  absl::flat_hash_map<uint32_t, CallInitiator> active_calls_
+  absl::flat_hash_map<uint64_t, CallInitiator> active_calls_
       ABSL_GUARDED_BY(active_mu_);
   Mutex stream_mu_;  // protects streams hash map
   // std::thread reader_; // Removed - using EventEngine callbacks
@@ -1928,7 +1928,7 @@ after_accept_stream:
   Mutex s2c_mu_;
   // Thread-safe tracking of completed streams for cleanup
   std::mutex completed_streams_mu_;
-  std::unordered_set<uint32_t> completed_streams_;
+  std::unordered_set<uint64_t> completed_streams_;
   // ForwardCall support: store CallInitiators for client access
   Mutex stream_initiators_mu_;
   absl::flat_hash_map<uint64_t, CallInitiator> stream_initiators_
@@ -1942,9 +1942,9 @@ after_accept_stream:
         : cmd(c), data(buf, buf + len) {}
   };
   Mutex pending_messages_mu_;
-  absl::flat_hash_map<uint32_t, std::vector<PendingMessage>> pending_c2s_msgs_
+  absl::flat_hash_map<uint64_t, std::vector<PendingMessage>> pending_c2s_msgs_
       ABSL_GUARDED_BY(pending_messages_mu_);
-  absl::flat_hash_map<uint32_t, PendingMessage> pending_trailing_
+  absl::flat_hash_map<uint64_t, PendingMessage> pending_trailing_
       ABSL_GUARDED_BY(pending_messages_mu_);
 
   // Efficient signaling mechanism - per-stream synchronization
@@ -1954,7 +1954,7 @@ after_accept_stream:
     bool initiator_ready = false;
   };
   Mutex stream_sync_mu_;
-  absl::flat_hash_map<uint32_t, std::unique_ptr<StreamSync>> stream_sync_
+  absl::flat_hash_map<uint64_t, std::unique_ptr<StreamSync>> stream_sync_
       ABSL_GUARDED_BY(stream_sync_mu_);
 
   // Server-side C2S chunk reassembly (by stream id)
@@ -1990,7 +1990,7 @@ after_accept_stream:
 };
 
 CallInitiator ShmemServerTransport::AnnounceAndGetInitiator(
-    uint32_t stream_id, ClientMetadataHandle md) {
+    uint64_t stream_id, ClientMetadataHandle md) {
   // Ensure the server has installed a call destination before announcing.
   // Without this, early client calls can race and d==nullptr, dropping the call.
   {
@@ -2740,7 +2740,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
           const uint8_t* src = cb_->GetC2SQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
           {
             MutexLock lock(&pending_messages_mu_);
-            pending_c2s_msgs_[static_cast<uint32_t>(cmd.stream_id)].emplace_back(cmd, src, cmd.data_size);
+            pending_c2s_msgs_[cmd.stream_id].emplace_back(cmd, src, cmd.data_size);
           }
           SHMEM_DBGF("*** DEBUG: Message buffered for stream_id=%lu ***\n", cmd.stream_id);
         }
@@ -2794,7 +2794,7 @@ void ShmemServerTransport::DrainC2SFromPoller() {
           const uint8_t* src = cb_->GetC2SQueues()->data_rb.GetBuffer(cb_) + cmd.data_offset;
           {
             MutexLock lock(&pending_messages_mu_);
-            pending_trailing_.emplace(static_cast<uint32_t>(cmd.stream_id), PendingMessage(cmd, src, cmd.data_size));
+            pending_trailing_.emplace(cmd.stream_id, PendingMessage(cmd, src, cmd.data_size));
           }
           SHMEM_DBGF("*** DEBUG: Trailing metadata buffered for stream_id=%lu ***\n", cmd.stream_id);
         }

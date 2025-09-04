@@ -43,7 +43,7 @@ struct ControlBlock {
   std::atomic<uint32_t> client_state{0};
   
   // Global stream ID counter to prevent conflicts between multiple clients
-  std::atomic<uint32_t> next_stream_id{1};
+  std::atomic<uint64_t> next_stream_id{1};
 
   // --- Futex-based Doorbell Synchronization ---
   // Replaces semaphores with lower-overhead futex doorbells
@@ -61,7 +61,7 @@ struct ControlBlock {
   // OPTIMIZATION: Direct communication for 0-byte messages (bypass ring buffers)
   struct DirectCall {
     std::atomic<uint32_t> pending{0};  // 0=none, 1=call pending, 2=response ready
-    std::atomic<uint32_t> stream_id{0};
+    std::atomic<uint64_t> stream_id{0};
     std::atomic<uint32_t> status{0};    // gRPC status code
     char method_name[256];              // :path metadata
     char status_message[128];           // status message if needed
