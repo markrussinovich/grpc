@@ -3034,6 +3034,29 @@ void ShmemClientTransport::StartCall(CallHandler child_call_handler) {
                return absl::OkStatus();
              }));
   
+  // Add a per-call cancellation watcher (covers "cancel after client done")
+  // This watcher is independent of the send pipeline and fires whenever the app calls Cancel().
+  // It will send a C2S_CANCEL best-effort, even if EOS was already sent.
+  {
+    auto cb_watcher = cb;
+    const uint64_t sid = stream_id;
+    child_call_handler.SpawnGuarded("watch-client-cancel",
+        Map(child_call_handler.WasCancelled(),
+            [cb_watcher, sid, this](bool cancelled) -> StatusFlag {
+              if (!cancelled) return Success{};  // nothing to do
+              VLOG(1) << "CLIENT: cancel watcher firing; sending C2S_CANCEL for stream=" << sid;
+              grpc_shmem::Command cancel{};
+              cancel.stream_id  = sid;
+              cancel.type       = grpc_shmem::FrameType::C2S_CANCEL;
+              cancel.data_offset = 0;
+              cancel.data_size   = 0;
+              (void)grpc_shmem::PushCommand(cb_watcher->GetC2SQueues(), cb_watcher,
+                                            grpc_shmem::Direction::kC2S,
+                                            cancel, sem_adapter_.get());
+              return Success{};
+            }));
+  }
+  
   // Send client messages as C2S_MESSAGE frames
   auto send_message = [cb, stream_id, this](MessageHandle m) -> StatusFlag {
     VLOG(2) << "CLIENT send_message lambda called for stream=" << stream_id;
